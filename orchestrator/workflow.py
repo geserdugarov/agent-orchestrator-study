@@ -310,7 +310,7 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
     if result.timed_out:
         gh.comment(
             issue,
-            f"@{config.HITL_HANDLE} agent timed out after {config.AGENT_TIMEOUT}s, "
+            f"{config.HITL_MENTIONS} agent timed out after {config.AGENT_TIMEOUT}s, "
             "manual intervention needed.",
         )
         # Park the issue on awaiting_human so the next tick doesn't restart
@@ -347,7 +347,7 @@ def _on_commits(
         # re-enter _on_commits() and re-comment indefinitely until a human acts.
         gh.comment(
             issue,
-            f"@{config.HITL_HANDLE} git push failed; see orchestrator logs.",
+            f"{config.HITL_MENTIONS} git push failed; see orchestrator logs.",
         )
         state.set("awaiting_human", True)
         latest = gh.latest_comment_id(issue)
@@ -385,7 +385,7 @@ def _on_question(
     quoted = "> " + question.replace("\n", "\n> ")
     gh.comment(
         issue,
-        f"@{config.HITL_HANDLE} agent needs your input to proceed:\n\n{quoted}",
+        f"{config.HITL_MENTIONS} agent needs your input to proceed:\n\n{quoted}",
     )
     state.set("awaiting_human", True)
     latest = gh.latest_comment_id(issue)
@@ -418,7 +418,7 @@ def _on_dirty_worktree(
         tail = f"\n\n_Last agent message:_\n\n{quoted}"
     gh.comment(
         issue,
-        f"@{config.HITL_HANDLE} agent committed but left {len(dirty)} "
+        f"{config.HITL_MENTIONS} agent committed but left {len(dirty)} "
         f"uncommitted change(s); refusing to push an incomplete branch. "
         f"Reply with guidance and the orchestrator will resume the session.\n\n"
         f"{files_md}{tail}",
