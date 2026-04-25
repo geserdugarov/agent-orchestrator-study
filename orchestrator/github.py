@@ -58,7 +58,12 @@ class GitHubClient:
         token = token or config.GITHUB_TOKEN
         if not token:
             raise RuntimeError(
-                "GITHUB_TOKEN is empty. Set it in .env (see .env.example)."
+                "GITHUB_TOKEN is empty. Export it in the orchestrator's "
+                "environment or write it to "
+                "~/.config/agent-orchestrator-study/token "
+                "(override path with ORCHESTRATOR_TOKEN_FILE). "
+                "Do NOT put it in REPO_ROOT/.env -- the implementer agent "
+                "can read that file."
             )
         self._gh = Github(auth=Auth.Token(token))
         self.repo: Repository = self._gh.get_repo(repo_slug or config.REPO)

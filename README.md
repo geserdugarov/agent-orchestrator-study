@@ -63,9 +63,23 @@ Pinned in [`pyproject.toml`](pyproject.toml):
    ```
 
    Edit `.env` and set at minimum:
-   - `GITHUB_TOKEN` — paste the fine-grained PAT
    - `HITL_HANDLE` — your GitHub login (the user the orchestrator @-mentions on questions)
    - `REPO` — leave default unless pointing at a different repo
+
+   Then store the PAT **outside** the repo so the implementer agent (which runs
+   in a sibling worktree with sandbox bypass) cannot read it via a relative
+   path:
+
+   ```sh
+   install -d -m 700 ~/.config/agent-orchestrator-study
+   printf %s "$YOUR_PAT" > ~/.config/agent-orchestrator-study/token
+   chmod 600 ~/.config/agent-orchestrator-study/token
+   ```
+
+   Or export `GITHUB_TOKEN` in the orchestrator's launch environment. Putting
+   the PAT in `.env` is rejected at startup. Override the file path with
+   `ORCHESTRATOR_TOKEN_FILE` if you want a different location — pick one the
+   agent worktree cannot reach via known relatives.
 
 4. **Verify the agents are authenticated**
 
@@ -103,17 +117,18 @@ Pinned in [`pyproject.toml`](pyproject.toml):
 
 All settings load from `.env` (or process environment). See [`.env.example`](.env.example) for the full list with defaults. Key knobs:
 
-| Variable        | Default                                | Purpose                                                |
-| --------------- | -------------------------------------- | ------------------------------------------------------ |
-| `GITHUB_TOKEN`  | _(required)_                           | fine-grained PAT                                       |
-| `REPO`          | `geserdugarov/agent-orchestrator-study`| `owner/name` of the repo to manage                     |
-| `POLL_INTERVAL` | `60`                                   | seconds between polling ticks                          |
-| `AGENT_TIMEOUT` | `1800`                                 | wall-clock cap per agent invocation, seconds           |
-| `HITL_HANDLE`   | `geserdugarov`                         | GitHub login to @-mention when a human is needed       |
-| `WORKTREES_DIR` | `../wt-orchestrator`                   | where per-issue git worktrees are created              |
-| `CODEX_BIN`     | `codex`                                | override only if `codex` is not on `$PATH`             |
-| `CLAUDE_BIN`    | `claude`                               | override only if `claude` is not on `$PATH`            |
-| `BASE_BRANCH`   | `main`                                 | branch PRs target                                      |
+| Variable                  | Default                                       | Purpose                                                   |
+| ------------------------- | --------------------------------------------- | --------------------------------------------------------- |
+| `GITHUB_TOKEN`            | _(required, env-only — not read from `.env`)_ | fine-grained PAT                                          |
+| `ORCHESTRATOR_TOKEN_FILE` | `~/.config/agent-orchestrator-study/token`    | path to PAT file (used when `GITHUB_TOKEN` is not in env) |
+| `REPO`                    | `geserdugarov/agent-orchestrator-study`       | `owner/name` of the repo to manage                        |
+| `POLL_INTERVAL`           | `60`                                          | seconds between polling ticks                             |
+| `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
+| `HITL_HANDLE`             | `geserdugarov`                                | GitHub login to @-mention when a human is needed          |
+| `WORKTREES_DIR`           | `../wt-orchestrator`                          | where per-issue git worktrees are created                 |
+| `CODEX_BIN`               | `codex`                                       | override only if `codex` is not on `$PATH`                |
+| `CLAUDE_BIN`              | `claude`                                      | override only if `claude` is not on `$PATH`               |
+| `BASE_BRANCH`             | `main`                                        | branch PRs target                                         |
 
 ## v0 scope
 

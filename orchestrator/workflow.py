@@ -91,6 +91,32 @@ def _has_new_commits(worktree: Path) -> bool:
     return int((r.stdout or "0").strip() or "0") > 0
 
 
+def _worktree_dirty_files(worktree: Path) -> list[str]:
+    """Paths git considers modified or untracked in the worktree.
+
+    Used to refuse opening a PR when codex committed only part of its work and
+    left other modifications behind -- the push would publish an incomplete
+    branch. Ignored files are excluded by default in porcelain mode, so the
+    orchestrator scratch (`.codex-last-message.txt`, matched by `.codex-*` in
+    .gitignore) does not surface here.
+    """
+    r = _git("status", "--porcelain", cwd=worktree)
+    if r.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in (r.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        # porcelain v1: "XY <path>" with optional " -> dest" for renames.
+        rest = line[3:]
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+        path = rest.strip().strip('"')
+        if path:
+            paths.append(path)
+    return paths
+
+
 def _push_branch(worktree: Path, branch: str) -> bool:
     """Push via GIT_ASKPASS so the token never appears in argv.
 
@@ -101,15 +127,21 @@ def _push_branch(worktree: Path, branch: str) -> bool:
     refspec so no upstream is set and no remote URL is stored in .git/config.
 
     The worktree is shared with the codex agent, so anything in `.git/hooks/`
-    or `.git/config` is attacker-controlled. We harden the push so a planted
-    pre-push hook, credential helper, fsmonitor, or url-rewrite rule cannot
-    observe GIT_TOKEN or redirect the push to an attacker-controlled host:
+    or `.git/config` is attacker-controlled. The agent also writes as the same
+    OS user, so it can plant `~/.gitconfig` (or anything pointed at by
+    XDG_CONFIG_HOME) before we push. We harden the push so a planted pre-push
+    hook, credential helper, fsmonitor, or url-rewrite rule cannot observe
+    GIT_TOKEN or redirect the push to an attacker-controlled host:
       * `core.hooksPath=/dev/null` disables `.git/hooks/*` and any hooksPath
         override the agent set in the local config.
       * `credential.helper=` (empty) clears all inherited credential helpers
         so a repo-local helper script never executes with GIT_TOKEN in env.
       * `core.fsmonitor=` disables any fsmonitor program git would otherwise
         spawn for index-touching operations.
+      * `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null` block
+        global/system config entirely, so url.<host>.insteadOf or
+        pushInsteadOf rules planted in `~/.gitconfig` (or `/etc/gitconfig`)
+        cannot rewrite our auth URL and exfiltrate the askpass token.
       * We also refuse to push if the local config contains any url
         insteadOf/pushInsteadOf rewrite, since those rewrite our auth URL
         and would deliver the token to whatever host the agent picked.
@@ -138,6 +170,12 @@ def _push_branch(worktree: Path, branch: str) -> bool:
             **_GIT_NO_PROMPT_ENV,
             "GIT_ASKPASS": str(askpass),
             "GIT_TOKEN": config.GITHUB_TOKEN,
+            # Detach from any agent-writable global/system git config; the
+            # only config that applies is the local worktree config (already
+            # checked above) plus our explicit -c overrides below.
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
         }
         r = subprocess.run(
             [
@@ -285,8 +323,13 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
         gh.write_pinned_state(issue, state)
         return
 
-    if _has_new_commits(_worktree_path(issue.number)):
-        _on_commits(gh, issue, state, result)
+    wt = _worktree_path(issue.number)
+    if _has_new_commits(wt):
+        dirty = _worktree_dirty_files(wt)
+        if dirty:
+            _on_dirty_worktree(gh, issue, state, result, dirty)
+        else:
+            _on_commits(gh, issue, state, result)
     else:
         _on_question(gh, issue, state, result)
 
@@ -343,6 +386,42 @@ def _on_question(
     gh.comment(
         issue,
         f"@{config.HITL_HANDLE} agent needs your input to proceed:\n\n{quoted}",
+    )
+    state.set("awaiting_human", True)
+    latest = gh.latest_comment_id(issue)
+    if latest is not None:
+        state.set("last_action_comment_id", latest)
+
+
+def _on_dirty_worktree(
+    gh: GitHubClient,
+    issue: Issue,
+    state: PinnedState,
+    result: CodexResult,
+    dirty: list[str],
+) -> None:
+    """Park instead of pushing when codex left uncommitted changes.
+
+    Pushing here would publish a branch that omits the dirty files, so the PR
+    would not match what the agent actually produced. We surface the situation
+    to the human and resume the codex session on their reply, identical to the
+    question path.
+    """
+    shown = dirty[:10]
+    files_md = "\n".join(f"- `{p}`" for p in shown)
+    if len(dirty) > len(shown):
+        files_md += f"\n- … ({len(dirty) - len(shown)} more)"
+    last_msg = result.last_message.strip()
+    tail = ""
+    if last_msg:
+        quoted = "> " + last_msg.replace("\n", "\n> ")
+        tail = f"\n\n_Last agent message:_\n\n{quoted}"
+    gh.comment(
+        issue,
+        f"@{config.HITL_HANDLE} agent committed but left {len(dirty)} "
+        f"uncommitted change(s); refusing to push an incomplete branch. "
+        f"Reply with guidance and the orchestrator will resume the session.\n\n"
+        f"{files_md}{tail}",
     )
     state.set("awaiting_human", True)
     latest = gh.latest_comment_id(issue)
