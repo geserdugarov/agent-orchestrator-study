@@ -6,6 +6,7 @@ Other labels are observed and logged as not-yet-implemented.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,9 @@ from .agents import CodexResult, run_codex
 from .github import GitHubClient, PinnedState
 
 log = logging.getLogger(__name__)
+
+# Disable git's /dev/tty fallback prompts in any subprocess we spawn.
+_GIT_NO_PROMPT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
 
 
 def _now_iso() -> str:
@@ -37,15 +41,25 @@ def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        env={**os.environ, **_GIT_NO_PROMPT_ENV},
     )
 
 
 def _ensure_worktree(issue_number: int) -> Path:
+    """Return a worktree on a per-issue branch, reusing one with unpushed work.
+
+    The reuse is what lets the orchestrator survive a crash between codex
+    committing and the orchestrator pushing -- without it, the next tick would
+    wipe the worktree and we'd burn another codex run on the same prompt.
+    """
     config.WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
     wt = _worktree_path(issue_number)
     branch = _branch_name(issue_number)
 
     if wt.exists():
+        if _has_new_commits(wt):
+            log.info("issue=#%d worktree has unpushed commits; reusing", issue_number)
+            return wt
         _git("worktree", "remove", "--force", str(wt), cwd=config.REPO_ROOT)
 
     _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.REPO_ROOT)
@@ -77,9 +91,27 @@ def _has_new_commits(worktree: Path) -> bool:
 
 
 def _push_branch(worktree: Path, branch: str) -> bool:
-    r = _git("push", "--set-upstream", "origin", branch, cwd=worktree)
+    """Push via a token-authenticated URL so HTTPS push doesn't prompt.
+
+    The URL with the embedded token is never written to .git/config: we pass
+    it as the explicit push target and use a `HEAD:refs/heads/<branch>`
+    refspec, so no upstream is set and no remote URL is stored.
+    """
+    if not config.GITHUB_TOKEN:
+        log.error("GITHUB_TOKEN missing; cannot push")
+        return False
+    auth_url = f"https://x-access-token:{config.GITHUB_TOKEN}@github.com/{config.REPO}.git"
+    r = subprocess.run(
+        ["git", "push", auth_url, f"HEAD:refs/heads/{branch}"],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        env={**os.environ, **_GIT_NO_PROMPT_ENV},
+    )
     if r.returncode != 0:
-        log.error("git push failed for %s: %s", branch, r.stderr)
+        # Scrub the token out of any error output before logging.
+        scrubbed = (r.stderr or "").replace(config.GITHUB_TOKEN, "***")
+        log.error("git push failed for %s: %s", branch, scrubbed)
         return False
     return True
 
@@ -169,10 +201,26 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
         state.set("awaiting_human", False)
     else:
         wt = _ensure_worktree(issue.number)
-        prompt = _build_implement_prompt(issue, _recent_comments_text(issue))
-        result = run_codex(prompt, wt)
-        if result.session_id:
-            state.set("codex_session_id", result.session_id)
+        if _has_new_commits(wt):
+            # Recovered worktree: codex already committed on a previous tick;
+            # skip a fresh run and go straight to push to save tokens.
+            log.info(
+                "issue=#%d skipping codex; worktree already has commits",
+                issue.number,
+            )
+            result = CodexResult(
+                session_id=state.get("codex_session_id"),
+                last_message="(orchestrator restart: pushing previously committed work)",
+                exit_code=0,
+                timed_out=False,
+                stdout="",
+                stderr="",
+            )
+        else:
+            prompt = _build_implement_prompt(issue, _recent_comments_text(issue))
+            result = run_codex(prompt, wt)
+            if result.session_id:
+                state.set("codex_session_id", result.session_id)
         state.set("branch", _branch_name(issue.number))
 
     state.set("last_agent_action_at", _now_iso())
