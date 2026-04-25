@@ -63,7 +63,7 @@ Pinned in [`pyproject.toml`](pyproject.toml):
    ```
 
    Edit `.env` and set at minimum:
-   - `HITL_HANDLE` — your GitHub login (the user the orchestrator @-mentions on questions)
+   - `HITL_HANDLE` — comma-separated GitHub logins (the users the orchestrator @-mentions on questions)
    - `REPO` — leave default unless pointing at a different repo
 
    Then store the PAT **outside** the repo so the implementer agent (which runs
@@ -124,7 +124,7 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | `REPO`                    | `geserdugarov/agent-orchestrator-study`       | `owner/name` of the repo to manage                        |
 | `POLL_INTERVAL`           | `60`                                          | seconds between polling ticks                             |
 | `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
-| `HITL_HANDLE`             | `geserdugarov`                                | GitHub login to @-mention when a human is needed          |
+| `HITL_HANDLE`             | `geserdugarov`                                | comma-separated GitHub logins to @-mention when a human is needed |
 | `WORKTREES_DIR`           | `../wt-orchestrator`                          | where per-issue git worktrees are created                 |
 | `CODEX_BIN`               | `codex`                                       | override only if `codex` is not on `$PATH`                |
 | `CLAUDE_BIN`              | `claude`                                      | override only if `claude` is not on `$PATH`               |

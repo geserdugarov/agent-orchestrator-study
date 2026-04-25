@@ -76,11 +76,28 @@ def _resolve_github_token() -> str:
 
 _load_dotenv()
 
+
+def _parse_hitl_handles(raw: str) -> tuple[str, ...]:
+    handles: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        handle = part.strip().lstrip("@").strip()
+        if not handle or handle in seen:
+            continue
+        handles.append(handle)
+        seen.add(handle)
+    return tuple(handles)
+
 GITHUB_TOKEN: str = _resolve_github_token()
 REPO: str = os.environ.get("REPO", "geserdugarov/agent-orchestrator-study")
 POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "60"))
 AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))
-HITL_HANDLE: str = os.environ.get("HITL_HANDLE", "geserdugarov")
+HITL_HANDLES: tuple[str, ...] = (
+    _parse_hitl_handles(os.environ.get("HITL_HANDLE", "geserdugarov"))
+    or ("geserdugarov",)
+)
+HITL_HANDLE: str = ",".join(HITL_HANDLES)
+HITL_MENTIONS: str = " ".join(f"@{handle}" for handle in HITL_HANDLES)
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 CLAUDE_BIN: str = os.environ.get("CLAUDE_BIN", "claude")
 
