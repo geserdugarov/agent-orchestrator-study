@@ -1,5 +1,6 @@
 # agents related
 .codex
+.codex-*
 .claude/
 
 # sensitive data
