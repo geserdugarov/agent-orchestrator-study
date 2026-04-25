@@ -1,0 +1,42 @@
+# agents related
+.codex
+.claude/
+
+# sensitive data
+.env
+.env.local
+
+# editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# build output
+build/
+dist/
+out/
+target/
+bin/
+obj/
+
+# logs and temp
+*.log
+*.tmp
+*.bak
+.cache/
+tmp/
+
+# Python
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+
+# Rust
+target/
+
