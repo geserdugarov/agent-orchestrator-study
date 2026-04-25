@@ -268,10 +268,18 @@ def _on_commits(
     wt = _worktree_path(issue.number)
     branch = _branch_name(issue.number)
     if not _push_branch(wt, branch):
+        # Park on awaiting_human like the timeout/question paths. Otherwise the
+        # worktree's commits keep _has_new_commits() true, so every poll would
+        # re-enter _on_commits() and re-comment indefinitely until a human acts.
         gh.comment(
             issue,
             f"@{config.HITL_HANDLE} git push failed; see orchestrator logs.",
         )
+        state.set("awaiting_human", True)
+        latest = gh.latest_comment_id(issue)
+        if latest is not None:
+            state.set("last_action_comment_id", latest)
+        # _handle_implementing writes pinned state after we return.
         return
     # Recover gracefully if a previous tick crashed between open_pr and the
     # relabel: reuse the existing open PR instead of 422-ing on duplicate.

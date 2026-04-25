@@ -26,6 +26,20 @@ _UUID_RE = re.compile(
 )
 _PRIORITY_KEYS = ("session_id", "conversation_id", "thread_id", "session", "id")
 
+# Strip GitHub credentials from the agent's environment. Issue/comment text is
+# untrusted and codex runs with sandbox bypass, so a prompt injection that
+# inherits these would let the agent push directly or call the API as us.
+# The orchestrator owns all GitHub writes; the agent must never see them.
+_FORBIDDEN_AGENT_ENV = frozenset({
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_PAT",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GIT_TOKEN",
+    "GH_HOST",
+})
+
 
 @dataclass
 class CodexResult:
@@ -98,7 +112,9 @@ def run_codex(
     else:
         cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
 
-    env = {**os.environ, **(extra_env or {})}
+    env = {k: v for k, v in os.environ.items() if k not in _FORBIDDEN_AGENT_ENV}
+    if extra_env:
+        env.update(extra_env)
     log.info(
         "codex spawn: cwd=%s resume=%s timeout=%ss",
         cwd, bool(resume_session_id), timeout,
