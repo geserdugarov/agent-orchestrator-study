@@ -60,7 +60,7 @@ class GitHubClient:
             raise RuntimeError(
                 "GITHUB_TOKEN is empty. Export it in the orchestrator's "
                 "environment or write it to "
-                "~/.config/agent-orchestrator-study/token "
+                f"~/.config/{config.REPO}/token "
                 "(override path with ORCHESTRATOR_TOKEN_FILE). "
                 "Do NOT put it in REPO_ROOT/.env -- the implementer agent "
                 "can read that file."

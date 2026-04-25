@@ -44,7 +44,7 @@ Flat package, ~5 files for v0. No premature abstraction.
 │   ├── agents.py                   # spawn codex/claude as subprocess, capture session ID, timeout, parse blocked/done signal
 │   └── config.py                   # env-var loader: GITHUB_TOKEN, REPO, POLL_INTERVAL, AGENT_TIMEOUT, agent CLI paths
 ├── pyproject.toml                  # PEP 621, deps = ["PyGithub"]
-├── .env.example                    # GITHUB_TOKEN=, REPO=geserdugarov/agent-orchestrator-study, POLL_INTERVAL=60
+├── .env.example                    # GITHUB_TOKEN=, REPO=podlodka-ai-club/spark-gap, POLL_INTERVAL=60
 ├── .gitignore                      # .env, __pycache__, *.pyc, .venv/, ../wt-issue-*
 └── tests/
     └── test_workflow.py            # state-machine transitions with a fake GitHub
@@ -114,7 +114,7 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 
 ## GitHub auth
 
-- **Fine-grained PAT scoped to `geserdugarov/agent-orchestrator-study` only**, with read/write on Contents, Issues, Pull requests, Metadata.
+- **Fine-grained PAT scoped to `podlodka-ai-club/spark-gap` only**, with read/write on Contents, Issues, Pull requests, Metadata.
 - Stored in `.env` as `GITHUB_TOKEN`. `.env` is in `.gitignore`.
 - `config.py` reads `.env` manually (5 lines, no dep).
 - The token is passed to agent subprocesses via `env={"GH_TOKEN": token, ...}` so they can `git push`. PR opening is done by the orchestrator (PyGithub), not by the agent — narrower agent surface.

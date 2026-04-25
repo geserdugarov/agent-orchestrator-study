@@ -45,8 +45,8 @@ Pinned in [`pyproject.toml`](pyproject.toml):
 1. **Clone and enter the repo**
 
    ```sh
-   git clone https://github.com/geserdugarov/agent-orchestrator-study.git
-   cd agent-orchestrator-study
+   git clone https://github.com/podlodka-ai-club/spark-gap.git
+   cd spark-gap
    ```
 
 2. **Create a venv and install dependencies**
@@ -70,10 +70,13 @@ Pinned in [`pyproject.toml`](pyproject.toml):
    in a sibling worktree with sandbox bypass) cannot read it via a relative
    path:
 
+   The default token path is derived from `REPO` (`~/.config/<owner>/<repo>/token`).
+   For the default repo:
+
    ```sh
-   install -d -m 700 ~/.config/agent-orchestrator-study
-   printf %s "$YOUR_PAT" > ~/.config/agent-orchestrator-study/token
-   chmod 600 ~/.config/agent-orchestrator-study/token
+   install -d -m 700 ~/.config/podlodka-ai-club/spark-gap
+   printf %s "$YOUR_PAT" > ~/.config/podlodka-ai-club/spark-gap/token
+   chmod 600 ~/.config/podlodka-ai-club/spark-gap/token
    ```
 
    Or export `GITHUB_TOKEN` in the orchestrator's launch environment. Putting
@@ -120,8 +123,8 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | Variable                  | Default                                       | Purpose                                                   |
 | ------------------------- | --------------------------------------------- | --------------------------------------------------------- |
 | `GITHUB_TOKEN`            | _(required, env-only — not read from `.env`)_ | fine-grained PAT                                          |
-| `ORCHESTRATOR_TOKEN_FILE` | `~/.config/agent-orchestrator-study/token`    | path to PAT file (used when `GITHUB_TOKEN` is not in env) |
-| `REPO`                    | `geserdugarov/agent-orchestrator-study`       | `owner/name` of the repo to manage                        |
+| `ORCHESTRATOR_TOKEN_FILE` | `~/.config/<owner>/<repo>/token` (from `REPO`) | path to PAT file (used when `GITHUB_TOKEN` is not in env) |
+| `REPO`                    | `podlodka-ai-club/spark-gap`       | `owner/name` of the repo to manage                        |
 | `POLL_INTERVAL`           | `60`                                          | seconds between polling ticks                             |
 | `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
 | `HITL_HANDLE`             | `geserdugarov`                                | comma-separated GitHub logins to @-mention when a human is needed |

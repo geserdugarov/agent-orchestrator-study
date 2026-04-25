@@ -5,7 +5,7 @@ runs in a sibling worktree with sandbox bypass, so anything readable inside
 REPO_ROOT (including .env) is recoverable by a prompt-injected agent via a
 relative-path read like `cat ../agent-orchestrator-study/.env`. GITHUB_TOKEN is
 only read from the process environment or from a token file outside REPO_ROOT
-(default `~/.config/agent-orchestrator-study/token`, override with
+(default `~/.config/<owner>/<repo>/token` derived from REPO, override with
 ORCHESTRATOR_TOKEN_FILE).
 """
 from __future__ import annotations
@@ -44,23 +44,25 @@ def _load_dotenv() -> None:
             print(
                 f"orchestrator: ignoring {key} in {env_path}; the implementer "
                 f"agent can read this file. Move the token to "
-                f"~/.config/agent-orchestrator-study/token or export "
-                f"{key} before launching.",
+                f"~/.config/<owner>/<repo>/token (path derived from REPO) "
+                f"or export {key} before launching.",
                 file=sys.stderr,
             )
             continue
         os.environ.setdefault(key, value)
 
 
-def _resolve_github_token() -> str:
+def _resolve_github_token(repo: str) -> str:
     """Resolve GITHUB_TOKEN from process env or a file outside REPO_ROOT.
 
+    Default file path is `~/.config/<owner>/<repo>/token`, derived from REPO so
+    a single host can drive multiple repos without colliding token files.
     Returns "" when neither is set; GitHubClient surfaces the actionable error.
     """
     env_val = os.environ.get("GITHUB_TOKEN", "").strip()
     if env_val:
         return env_val
-    default_path = Path.home() / ".config" / "agent-orchestrator-study" / "token"
+    default_path = Path.home() / ".config" / repo / "token"
     token_file = Path(os.environ.get("ORCHESTRATOR_TOKEN_FILE", str(default_path)))
     try:
         return token_file.read_text().strip()
@@ -88,8 +90,8 @@ def _parse_hitl_handles(raw: str) -> tuple[str, ...]:
         seen.add(handle)
     return tuple(handles)
 
-GITHUB_TOKEN: str = _resolve_github_token()
-REPO: str = os.environ.get("REPO", "geserdugarov/agent-orchestrator-study")
+REPO: str = os.environ.get("REPO", "podlodka-ai-club/spark-gap")
+GITHUB_TOKEN: str = _resolve_github_token(REPO)
 POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "60"))
 AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))
 HITL_HANDLES: tuple[str, ...] = (
