@@ -87,16 +87,16 @@ def run_codex(
     if last_msg_path.exists():
         last_msg_path.unlink()
 
+    # `codex exec resume` does not accept -C; we rely on subprocess cwd for it.
     common = [
         "--dangerously-bypass-approvals-and-sandbox",
-        "-C", str(cwd),
         "--json",
         "-o", str(last_msg_path),
     ]
     if resume_session_id:
         cmd = [config.CODEX_BIN, "exec", "resume", *common, resume_session_id, prompt]
     else:
-        cmd = [config.CODEX_BIN, "exec", *common, prompt]
+        cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
 
     env = {**os.environ, **(extra_env or {})}
     log.info(

@@ -145,6 +145,17 @@ class GitHubClient:
     ) -> PullRequest:
         return self.repo.create_pull(title=title, body=body, head=branch, base=base)
 
+    def find_open_pr(self, *, branch: str, base: str) -> Optional[PullRequest]:
+        """Return an open PR with the given head branch, or None.
+
+        Used to recover after a crash between create_pull and relabeling:
+        a duplicate create_pull would 422 and trap the issue in implementing.
+        """
+        head = f"{self.repo.owner.login}:{branch}"
+        for pr in self.repo.get_pulls(state="open", head=head, base=base):
+            return pr
+        return None
+
     def ensure_workflow_labels(self) -> None:
         """Create any missing workflow labels on the repo. Idempotent.
 
