@@ -99,9 +99,34 @@ def _push_branch(worktree: Path, branch: str) -> bool:
     script. This keeps the PAT out of `/proc/<pid>/cmdline`, which is
     world-readable on Linux. We also use an explicit `HEAD:refs/heads/<branch>`
     refspec so no upstream is set and no remote URL is stored in .git/config.
+
+    The worktree is shared with the codex agent, so anything in `.git/hooks/`
+    or `.git/config` is attacker-controlled. We harden the push so a planted
+    pre-push hook, credential helper, fsmonitor, or url-rewrite rule cannot
+    observe GIT_TOKEN or redirect the push to an attacker-controlled host:
+      * `core.hooksPath=/dev/null` disables `.git/hooks/*` and any hooksPath
+        override the agent set in the local config.
+      * `credential.helper=` (empty) clears all inherited credential helpers
+        so a repo-local helper script never executes with GIT_TOKEN in env.
+      * `core.fsmonitor=` disables any fsmonitor program git would otherwise
+        spawn for index-touching operations.
+      * We also refuse to push if the local config contains any url
+        insteadOf/pushInsteadOf rewrite, since those rewrite our auth URL
+        and would deliver the token to whatever host the agent picked.
     """
     if not config.GITHUB_TOKEN:
         log.error("GITHUB_TOKEN missing; cannot push")
+        return False
+    rewrite = subprocess.run(
+        ["git", "config", "--local", "--get-regexp",
+         r"^url\..*\.(insteadof|pushinsteadof)$"],
+        cwd=str(worktree), capture_output=True, text=True,
+    )
+    if rewrite.returncode == 0 and rewrite.stdout.strip():
+        log.error(
+            "refusing to push %s: worktree .git/config has url rewrite rules: %s",
+            branch, rewrite.stdout.strip(),
+        )
         return False
     auth_url = f"https://x-access-token@github.com/{config.REPO}.git"
     with tempfile.TemporaryDirectory(prefix="orch-askpass-") as td:
@@ -115,7 +140,13 @@ def _push_branch(worktree: Path, branch: str) -> bool:
             "GIT_TOKEN": config.GITHUB_TOKEN,
         }
         r = subprocess.run(
-            ["git", "push", auth_url, f"HEAD:refs/heads/{branch}"],
+            [
+                "git",
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "credential.helper=",
+                "-c", "core.fsmonitor=",
+                "push", auth_url, f"HEAD:refs/heads/{branch}",
+            ],
             cwd=str(worktree),
             capture_output=True,
             text=True,
