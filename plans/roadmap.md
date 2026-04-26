@@ -2,7 +2,7 @@
 
 ## Status as of 2026-04-26
 
-**v0 self-bootstrap path is shipped.** The scaffold, polling loop, codex invocation, hardened push, PR open, and the (no label → `implementing` → `in_review`) state machine all exist on `main` (commits `eb87246` … `06c7ea2`). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against the bootstrap test issue.
+**v0 self-bootstrap path is shipped.** The scaffold, polling loop, codex invocation, hardened push, PR open, and the (no label → `implementing` → `validating` → `in_review`) state machine all exist on `main` (commits `eb87246` … `06c7ea2`, plus the codex-review cycle). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against the bootstrap test issue.
 
 Done:
 
@@ -32,11 +32,19 @@ Open items from the Day-1 checklist:
 2. **Commit identity for agent commits** — still not enforced. Agent commits go out under whatever `git config user.name/user.email` the worktree inherits. *Open: decide identity and configure it on `_ensure_worktree`*.
 3. **HITL @mention handle** — resolved as a configurable list (`HITL_HANDLE`, default `geserdugarov,and-semakin,garudainfo55`).
 
+Done in Day 6 (validating stage):
+
+- `validating` stage as a **codex-on-codex review loop** (the doc's claude-as-reviewer is intentionally substituted with codex per user decision). Every PR opened by the implementer enters `validating`. A fresh codex session reviews `git diff origin/<base>...HEAD` against the issue and emits `VERDICT: APPROVED` / `VERDICT: CHANGES_REQUESTED`. On approval the label flips to `in_review` and humans take over. On changes requested the dev's codex session is resumed with the feedback, the fix is pushed, and the review re-runs. Capped at `MAX_REVIEW_ROUNDS` (default 3) before parking on `awaiting_human`.
+- Review feedback and approval comments go to the **PR** via `pr.create_issue_comment` (`gh.pr_comment`). HITL pings (timeouts, cap reached, malformed verdict) stay on the issue.
+- Pinned state gained `review_round`, `last_review_session_id`, `last_review_at`. Existing fields unchanged.
+- `tests/test_workflow.py` covers `_parse_review_verdict` against APPROVED / CHANGES_REQUESTED / inline marker / case-insensitive / last-marker-wins / missing-marker / empty input.
+- `_park_awaiting_human` extracted from the existing inline parking blocks; `_resume_developer_on_human_reply` extracted so both `implementing` and `validating` share the human-reply resume path.
+
 Not yet done:
 
-- Per-issue retry cap (3/day in pinned state). Today a run-and-park loop has no hard ceiling.
-- `tests/test_workflow.py` covering state transitions against an in-memory fake `Github`. (Only `test_config.py` exists.)
-- Everything from Day 6 onward: `validating` (claude review), auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, Dockerfile / systemd / GitHub App migration.
+- Per-issue retry cap (3/day in pinned state). Today a run-and-park loop has no hard ceiling. (Unrelated to the new `MAX_REVIEW_ROUNDS`, which only caps the review/fix loop.)
+- `tests/test_workflow.py` does not yet cover state transitions against an in-memory fake `Github` -- only `_parse_review_verdict` is unit-tested. The bigger fake harness is still on the roadmap.
+- Auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, Dockerfile / systemd / GitHub App migration.
 
 ## Context
 
@@ -55,7 +63,7 @@ Ship only the critical path; everything else is iteration:
 - HITL: when codex output indicates it's blocked / needs input, the orchestrator posts the question as an issue comment, leaves the issue at `implementing`, and waits for a fresh human comment before resuming the codex session.
 - Concurrency: **one agent at a time** (a `Lock` in `main.py`). Issues queue.
 
-Defer to Week 2 (Day 6–14): `validating` stage with claude PR review, auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, parallel agents, container isolation, VPS deploy, GitHub App migration.
+Defer to Week 2 (Day 6–14): ~~`validating` stage with claude PR review~~ (now done as a codex-on-codex loop), auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, parallel agents, container isolation, VPS deploy, GitHub App migration.
 
 ## Tech stack
 
@@ -168,7 +176,7 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 | **Day 2** | Agent invocation works | ✅ Done. `agents.run_codex(...)` confirmed, codex flags verified, askpass-based push and PyGithub PR open both wired up. |
 | **Day 3** | **Self-bootstrap milestone.** Polling loop end-to-end. | ✅ Done. Polling loop, signal handling, ancestry-aware self-update detection, and `run.sh` wrapper all merged (eb87246, 9e5eac6). |
 | **Day 4–5** | HITL + harden | 🟡 Partial. Question detection (no-commits heuristic), resume on human follow-up, pinned-state JSON, dirty-tree refusal, push-failure parking, comprehensive HITL mention plumbing all done. **Still open:** per-issue retry cap (3/day), `tests/test_workflow.py` covering state transitions against an in-memory fake `Github`, agent commit identity. |
-| **Day 6–8** | `validating` stage | ⬜ Not started. Need `run_claude` in `agents.py`, a `validating` handler, summary comment, transition to `in_review` on approve / back to `ready` on reject. `CLAUDE_BIN` is already wired in config. |
+| **Day 6–8** | `validating` stage | 🟢 Done as a codex-on-codex review loop (per user decision; `CLAUDE_BIN` is still wired but unused). `_handle_validating` runs a fresh codex review, posts feedback to the PR, resumes the dev session for fixes, re-reviews, and caps at `MAX_REVIEW_ROUNDS` rounds before parking on `awaiting_human`. Transitions to `in_review` on `VERDICT: APPROVED`. |
 | **Day 9–10** | Auto-merge + `rejected` | ⬜ Not started. Add `in_review` handler that watches PR state + check runs, auto-merges on approve+green, transitions to `done`. Add `rejected` on PR close-without-merge. PR-comment-resume during `in_review` with 10-min debounce. |
 | **Day 11–12** | `decomposing` stage | ⬜ Not started. New `_handle_decomposing` driving codex with a decomposition prompt; sub-issues created via PyGithub; `blocked` label + dependency linking when sub-issues exist. |
 | **Day 13** | VPS prep | ⬜ Not started. Dockerfile, systemd unit (`Restart=always` replaces `run.sh`), GitHub App migration to drop the PAT, structured logging, `--status` CLI flag listing in-flight issues. |
