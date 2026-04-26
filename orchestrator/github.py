@@ -150,6 +150,9 @@ class GitHubClient:
     ) -> PullRequest:
         return self.repo.create_pull(title=title, body=body, head=branch, base=base)
 
+    def pr_comment(self, pr_number: int, body: str) -> IssueComment:
+        return self.repo.get_pull(pr_number).create_issue_comment(body)
+
     def find_open_pr(self, *, branch: str, base: str) -> Optional[PullRequest]:
         """Return an open PR with the given head branch, or None.
 

@@ -1,16 +1,21 @@
 """State machine: drive issues through the orchestrator workflow.
 
-v0 only implements (no label) -> implementing -> in_review.
-Other labels are observed and logged as not-yet-implemented.
+v0 implements (no label) -> implementing -> validating -> in_review. Validating
+runs a fresh codex session as a reviewer; if it requests changes, the dev
+session is resumed with the feedback, the fix is pushed, and the review reruns
+until APPROVED or MAX_REVIEW_ROUNDS is hit. Other labels are observed and
+logged as not-yet-implemented.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Tuple
 
 from github.Issue import Issue
 
@@ -22,6 +27,16 @@ log = logging.getLogger(__name__)
 
 # Disable git's /dev/tty fallback prompts in any subprocess we spawn.
 _GIT_NO_PROMPT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+
+# The reviewer prompt asks for the marker alone on its own line, but real
+# codex output isn't always that disciplined: prefixes like "Final verdict:"
+# or trailing punctuation appear in practice. Match anywhere and take the
+# last occurrence, so a stray reference earlier in the text loses to the
+# concluding one.
+_VERDICT_RE = re.compile(
+    r"VERDICT:\s*(APPROVED|CHANGES_REQUESTED)\b",
+    re.IGNORECASE,
+)
 
 
 def _now_iso() -> str:
@@ -89,6 +104,20 @@ def _has_new_commits(worktree: Path) -> bool:
     if r.returncode != 0:
         return False
     return int((r.stdout or "0").strip() or "0") > 0
+
+
+def _head_sha(worktree: Path) -> str:
+    """HEAD commit SHA of the worktree, or '' if it cannot be read.
+
+    Used by the validating handler to detect whether a dev-fix codex run
+    produced a new commit. _has_new_commits compares against origin/<base>,
+    which is already true throughout validating, so we need an absolute SHA
+    snapshot instead.
+    """
+    r = _git("rev-parse", "HEAD", cwd=worktree)
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
 
 
 def _worktree_dirty_files(worktree: Path) -> list[str]:
@@ -213,6 +242,64 @@ def _build_implement_prompt(issue: Issue, comments_text: str) -> str:
     )
 
 
+def _build_review_prompt(issue: Issue, comments_text: str) -> str:
+    body = issue.body or "(no body)"
+    convo = comments_text or "(no prior comments)"
+    return (
+        f"You are an automated code reviewer for GitHub issue #{issue.number}: {issue.title!r}. "
+        "A separate codex session has implemented this issue and committed to the current "
+        f"branch. The base branch is `origin/{config.BASE_BRANCH}`.\n\n"
+        f"Issue body:\n{body}\n\n"
+        f"Conversation so far:\n{convo}\n\n"
+        "Inspect the change with:\n"
+        f"  git log --oneline origin/{config.BASE_BRANCH}..HEAD\n"
+        f"  git diff origin/{config.BASE_BRANCH}...HEAD\n\n"
+        "Review the change against the issue requirements. Flag correctness bugs, missing "
+        "tests, scope creep, obvious style issues, and anything that would block a human "
+        "approver. Do NOT edit or commit anything -- you are a reviewer only.\n\n"
+        "Your final message MUST end with exactly one of these markers, alone on its own line:\n"
+        "  VERDICT: APPROVED\n"
+        "  VERDICT: CHANGES_REQUESTED\n\n"
+        "If CHANGES_REQUESTED, list the specific items above the verdict line as a numbered "
+        "list so the implementer can address them one by one. If the change is acceptable as "
+        "is, write VERDICT: APPROVED with a one-line justification above it."
+    )
+
+
+def _build_fix_prompt(review_feedback: str) -> str:
+    feedback = review_feedback.strip() or "(reviewer left no detail)"
+    quoted = "> " + feedback.replace("\n", "\n> ")
+    return (
+        "An automated reviewer requested changes on your implementation. Address each item "
+        "below, then COMMIT the fix in your current worktree. Do NOT push -- the orchestrator "
+        "pushes and re-runs the review.\n\n"
+        f"Review feedback:\n\n{quoted}\n\n"
+        "If you genuinely disagree with a point, end your final message with a question for "
+        "the human and leave that item un-fixed; the orchestrator will park the issue for "
+        "human review. Otherwise, fix all items (a single commit is fine)."
+    )
+
+
+def _parse_review_verdict(last_message: str) -> Tuple[str, str]:
+    """Find the last 'VERDICT: APPROVED|CHANGES_REQUESTED' marker.
+
+    Returns (verdict, body_above_marker). verdict is one of "approved",
+    "changes_requested", or "unknown" (no marker found). body_above_marker is
+    the slice of last_message before the marker, used as PR-comment text for
+    the changes-requested case.
+    """
+    if not last_message:
+        return "unknown", ""
+    matches = list(_VERDICT_RE.finditer(last_message))
+    if not matches:
+        return "unknown", last_message
+    last = matches[-1]
+    word = last.group(1).upper()
+    verdict = "approved" if word == "APPROVED" else "changes_requested"
+    body = last_message[: last.start()].rstrip()
+    return verdict, body
+
+
 def _recent_comments_text(issue: Issue, max_chars: int = 4000) -> str:
     chunks: list[str] = []
     for c in issue.get_comments():
@@ -240,8 +327,10 @@ def _process_issue(gh: GitHubClient, issue: Issue) -> None:
         _handle_pickup(gh, issue)
     elif label == "implementing":
         _handle_implementing(gh, issue)
+    elif label == "validating":
+        _handle_validating(gh, issue)
     elif label == "in_review":
-        return  # v0: human owns the PR
+        return  # v0: human owns the PR after codex review approves
     else:
         log.warning(
             "issue=#%s label=%r not implemented in v0; leaving alone",
@@ -262,25 +351,55 @@ def _handle_pickup(gh: GitHubClient, issue: Issue) -> None:
     _handle_implementing(gh, issue)
 
 
+def _park_awaiting_human(
+    gh: GitHubClient, issue: Issue, state: PinnedState, message: str
+) -> None:
+    """Post `message` and mark the issue as awaiting a human reply.
+
+    Caller is responsible for `gh.write_pinned_state` afterwards (mirrors the
+    existing _on_question / _on_dirty_worktree contract).
+    """
+    gh.comment(issue, message)
+    state.set("awaiting_human", True)
+    latest = gh.latest_comment_id(issue)
+    if latest is not None:
+        state.set("last_action_comment_id", latest)
+
+
+def _resume_developer_on_human_reply(
+    gh: GitHubClient, issue: Issue, state: PinnedState
+) -> Optional[Tuple[Path, CodexResult]]:
+    """Resume the developer's codex session with new human comments.
+
+    Returns (worktree, codex_result) on resume, or None if there are no new
+    comments since the last park (caller should return without writing state).
+    """
+    last_action_id = state.get("last_action_comment_id")
+    new_comments = gh.comments_after(issue, last_action_id)
+    if not new_comments:
+        return None
+    followup = "\n\n".join(
+        f"@{c.user.login if c.user else 'user'}: {c.body}"
+        for c in new_comments if c.body
+    )
+    wt = _worktree_path(issue.number)
+    if not wt.exists():
+        wt = _ensure_worktree(issue.number)
+    result = run_codex(
+        followup, wt, resume_session_id=state.get("codex_session_id")
+    )
+    state.set("awaiting_human", False)
+    return wt, result
+
+
 def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
     state = gh.read_pinned_state(issue)
 
     if state.get("awaiting_human"):
-        last_action_id = state.get("last_action_comment_id")
-        new_comments = gh.comments_after(issue, last_action_id)
-        if not new_comments:
+        resumed = _resume_developer_on_human_reply(gh, issue, state)
+        if resumed is None:
             return
-        followup = "\n\n".join(
-            f"@{c.user.login if c.user else 'user'}: {c.body}"
-            for c in new_comments if c.body
-        )
-        wt = _worktree_path(issue.number)
-        if not wt.exists():
-            wt = _ensure_worktree(issue.number)
-        result = run_codex(
-            followup, wt, resume_session_id=state.get("codex_session_id")
-        )
-        state.set("awaiting_human", False)
+        wt, result = resumed
     else:
         wt = _ensure_worktree(issue.number)
         if _has_new_commits(wt):
@@ -308,18 +427,14 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
     state.set("last_agent_action_at", _now_iso())
 
     if result.timed_out:
-        gh.comment(
-            issue,
+        # Park on awaiting_human so the next tick doesn't restart codex or
+        # push partial commits left in the worktree. The HITL reply acts as
+        # the unblock signal, identical to the question path.
+        _park_awaiting_human(
+            gh, issue, state,
             f"{config.HITL_MENTIONS} agent timed out after {config.AGENT_TIMEOUT}s, "
             "manual intervention needed.",
         )
-        # Park the issue on awaiting_human so the next tick doesn't restart
-        # codex or push partial commits left in the worktree. The HITL reply
-        # acts as the unblock signal, identical to the question path.
-        state.set("awaiting_human", True)
-        latest = gh.latest_comment_id(issue)
-        if latest is not None:
-            state.set("last_action_comment_id", latest)
         gh.write_pinned_state(issue, state)
         return
 
@@ -336,6 +451,162 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
     gh.write_pinned_state(issue, state)
 
 
+def _handle_dev_fix_result(
+    gh: GitHubClient,
+    issue: Issue,
+    state: PinnedState,
+    wt: Path,
+    result: CodexResult,
+    before_sha: str,
+) -> bool:
+    """Post-codex handling for a dev fix during validating.
+
+    Returns True if a fix was committed, pushed, and the loop should re-review
+    on the next tick. Returns False if the run produced no fix (timeout,
+    no-new-commit, dirty tree, or push failure); caller should write state and
+    return.
+    """
+    if result.timed_out:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} agent timed out after {config.AGENT_TIMEOUT}s, "
+            "manual intervention needed.",
+        )
+        return False
+
+    after_sha = _head_sha(wt)
+    if after_sha == before_sha or not after_sha:
+        # No new commit: dev asked a question or did nothing.
+        _on_question(gh, issue, state, result)
+        return False
+
+    dirty = _worktree_dirty_files(wt)
+    if dirty:
+        _on_dirty_worktree(gh, issue, state, result, dirty)
+        return False
+
+    branch = _branch_name(issue.number)
+    if not _push_branch(wt, branch):
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} git push failed; see orchestrator logs.",
+        )
+        return False
+
+    return True
+
+
+def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
+    state = gh.read_pinned_state(issue)
+    pr_number = state.get("pr_number")
+
+    # Awaiting-human path: human replied after a park; resume the developer
+    # codex with their feedback. Identical mechanic to implementing's resume,
+    # but on success we stay in validating and bump the round so the reviewer
+    # runs again on the next tick.
+    if state.get("awaiting_human"):
+        wt = _worktree_path(issue.number)
+        if not wt.exists():
+            wt = _ensure_worktree(issue.number)
+        before_sha = _head_sha(wt)
+        resumed = _resume_developer_on_human_reply(gh, issue, state)
+        if resumed is None:
+            return
+        wt, result = resumed
+        state.set("last_agent_action_at", _now_iso())
+        if not _handle_dev_fix_result(gh, issue, state, wt, result, before_sha):
+            gh.write_pinned_state(issue, state)
+            return
+        round_n = int(state.get("review_round") or 0)
+        state.set("review_round", round_n + 1)
+        gh.write_pinned_state(issue, state)
+        return
+
+    round_n = int(state.get("review_round") or 0)
+    if round_n >= config.MAX_REVIEW_ROUNDS:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} review still has comments after "
+            f"{round_n} round(s); manual intervention needed.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    wt = _ensure_worktree(issue.number)
+    review_prompt = _build_review_prompt(issue, _recent_comments_text(issue))
+    review = run_codex(review_prompt, wt, timeout=config.REVIEW_TIMEOUT)
+    if review.session_id:
+        state.set("last_review_session_id", review.session_id)
+    state.set("last_review_at", _now_iso())
+
+    if review.timed_out:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} reviewer timed out after "
+            f"{config.REVIEW_TIMEOUT}s; manual intervention needed.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    verdict, body = _parse_review_verdict(review.last_message)
+
+    if verdict == "approved":
+        if pr_number is not None:
+            try:
+                gh.pr_comment(
+                    int(pr_number),
+                    ":white_check_mark: codex review approved.",
+                )
+            except Exception:
+                log.exception(
+                    "issue=#%s could not post approval to PR #%s",
+                    issue.number, pr_number,
+                )
+        gh.set_workflow_label(issue, "in_review")
+        gh.write_pinned_state(issue, state)
+        return
+
+    if verdict == "unknown":
+        raw = (review.last_message or "").strip() or "(reviewer produced no final message)"
+        quoted = "> " + raw.replace("\n", "\n> ")
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} reviewer did not emit a VERDICT line; "
+            f"manual adjudication needed.\n\n_Last reviewer message:_\n\n{quoted}",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    # CHANGES_REQUESTED -- post the feedback on the PR, then resume the dev.
+    feedback = body.strip() or (review.last_message or "").strip()
+    if pr_number is not None:
+        try:
+            gh.pr_comment(
+                int(pr_number),
+                f":eyes: codex review (round {round_n + 1}/"
+                f"{config.MAX_REVIEW_ROUNDS}) requested changes:\n\n{feedback}",
+            )
+        except Exception:
+            log.exception(
+                "issue=#%s could not post review to PR #%s",
+                issue.number, pr_number,
+            )
+
+    fix_prompt = _build_fix_prompt(feedback)
+    before_sha = _head_sha(wt)
+    dev_result = run_codex(
+        fix_prompt, wt, resume_session_id=state.get("codex_session_id")
+    )
+    state.set("last_agent_action_at", _now_iso())
+
+    if not _handle_dev_fix_result(gh, issue, state, wt, dev_result, before_sha):
+        gh.write_pinned_state(issue, state)
+        return
+
+    state.set("review_round", round_n + 1)
+    gh.write_pinned_state(issue, state)
+
+
 def _on_commits(
     gh: GitHubClient, issue: Issue, state: PinnedState, result: CodexResult
 ) -> None:
@@ -345,14 +616,10 @@ def _on_commits(
         # Park on awaiting_human like the timeout/question paths. Otherwise the
         # worktree's commits keep _has_new_commits() true, so every poll would
         # re-enter _on_commits() and re-comment indefinitely until a human acts.
-        gh.comment(
-            issue,
+        _park_awaiting_human(
+            gh, issue, state,
             f"{config.HITL_MENTIONS} git push failed; see orchestrator logs.",
         )
-        state.set("awaiting_human", True)
-        latest = gh.latest_comment_id(issue)
-        if latest is not None:
-            state.set("last_action_comment_id", latest)
         # _handle_implementing writes pinned state after we return.
         return
     # Recover gracefully if a previous tick crashed between open_pr and the
@@ -374,7 +641,10 @@ def _on_commits(
     else:
         log.info("issue=#%s reusing existing PR #%d for %s", issue.number, pr.number, branch)
     state.set("pr_number", pr.number)
-    gh.set_workflow_label(issue, "in_review")
+    # Reset the review counter every time we (re-)open a PR so the validating
+    # handler starts fresh on the new branch state.
+    state.set("review_round", 0)
+    gh.set_workflow_label(issue, "validating")
 
 
 def _on_question(

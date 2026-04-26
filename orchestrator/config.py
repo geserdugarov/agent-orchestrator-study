@@ -94,6 +94,8 @@ REPO: str = os.environ.get("REPO", "podlodka-ai-club/spark-gap")
 GITHUB_TOKEN: str = _resolve_github_token(REPO)
 POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "60"))
 AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))
+REVIEW_TIMEOUT: int = int(os.environ.get("REVIEW_TIMEOUT", str(AGENT_TIMEOUT)))
+MAX_REVIEW_ROUNDS: int = int(os.environ.get("MAX_REVIEW_ROUNDS", "3"))
 HITL_HANDLES: tuple[str, ...] = (
     _parse_hitl_handles(os.environ.get("HITL_HANDLE", "geserdugarov"))
     or ("geserdugarov",)
