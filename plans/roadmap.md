@@ -1,8 +1,44 @@
 # Agent Orchestrator MVP — Implementation Plan
 
-## Context
+## Status as of 2026-04-26
 
-The repo currently contains only `README.md` and `docs/workflow.md` (a Russian-language design spec). No code yet.
+**v0 self-bootstrap path is shipped.** The scaffold, polling loop, codex invocation, hardened push, PR open, and the (no label → `implementing` → `in_review`) state machine all exist on `main` (commits `eb87246` … `06c7ea2`). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against the bootstrap test issue.
+
+Done:
+
+- `orchestrator/{__init__,main,workflow,github,agents,config}.py`, `pyproject.toml`, `.env.example`, `.gitignore`, `run.sh` — all in place.
+- Polling loop with `--once`, `SIGTERM`/`SIGINT`-clean shutdown, ancestry-aware self-update detection (`main.py` exits when `origin/<BASE_BRANCH>` advances past the running HEAD with changes under `orchestrator/`).
+- `run.sh` self-restart wrapper that pulls the same `BASE_BRANCH` the Python code uses.
+- `GitHubClient`: list issues, workflow-label r/w, post comment, pinned-state JSON r/w, open/find PR, idempotent label bootstrap (graceful on under-scoped PAT).
+- Pinned-state JSON comment with `<!--orchestrator-state ...-->` marker (note: differs slightly from the original plan's `<!-- orchestrator-state -->` plus fenced JSON — the marker is now inline with the JSON payload).
+- `run_codex` against `codex exec` and `codex exec resume`, `--dangerously-bypass-approvals-and-sandbox`, `--json`, `-o <last-message-file>`. Session ID parsed by walking JSONL events for any UUID-shaped value at `session_id`/`conversation_id`/etc.
+- `_handle_implementing` covers: fresh run, resume on human follow-up, timeout → park on `awaiting_human`, no-commits-but-message → park as question, commits + clean tree → push + open PR + flip to `in_review`, commits + dirty tree → park (refuse to push partial branch), push failure → park.
+- Worktrees at `WORKTREES_DIR/issue-<N>` (default `../wt-orchestrator/issue-<N>`), reused when prior commits remain unpushed so a crash between commit and push doesn't burn another codex run.
+- Multi-handle HITL mentions via comma-separated `HITL_HANDLE` (commits `34853f9`, `b8e5fb2`).
+- `tests/test_config.py` covers HITL handle parsing.
+
+Done beyond the original plan (security hardening from review iterations):
+
+- **PAT never leaves orchestrator-controlled surfaces.** The agent's environment is scrubbed of `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_TOKEN`/`GITHUB_PAT`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`/`GH_HOST` (`agents.py`). The orchestrator owns all GitHub writes; the agent has no path to push or call the API as us.
+- **PAT cannot live in `REPO_ROOT/.env`** (which is agent-readable via relative path from the worktree). `config._load_dotenv` actively rejects secret keys found there with a clear stderr message. Token must come from the process environment or a file outside `REPO_ROOT` — default `~/.config/<owner>/<repo>/token`, derived from `REPO` (commit `06c7ea2`).
+- **Hardened `git push`**: askpass tempscript reads token from env (token never in argv / `/proc/<pid>/cmdline`); `core.hooksPath=/dev/null`, `credential.helper=`, `core.fsmonitor=`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` to defeat agent-planted hooks, helpers, fsmonitor programs, and `~/.gitconfig` `url.insteadOf` rewrites that could redirect the auth URL. Also refuses to push when the local config carries `url.*.insteadOf`/`pushInsteadOf` rules. Push errors are logged with the token scrubbed (commits `c9f1bb1`, `26d9a1f`).
+- **Refuse incomplete branches**: `_worktree_dirty_files` blocks the push when codex committed only part of its work, parks on `awaiting_human` instead of publishing a misleading PR.
+- **Idempotent PR open**: `find_open_pr` recovers when a previous tick crashed between `create_pull` and the relabel — reuses the existing open PR rather than 422-ing.
+- **Idempotent label bootstrap**: `ensure_workflow_labels` swallows 403s with an actionable message so the loop keeps running while the PAT is being fixed.
+
+Open items from the Day-1 checklist:
+
+1. **Codex flag name & JSON output shape** — resolved during Day 2 (`--dangerously-bypass-approvals-and-sandbox`, `--json`, last-message-via-`-o`, UUID walker for session ID).
+2. **Commit identity for agent commits** — still not enforced. Agent commits go out under whatever `git config user.name/user.email` the worktree inherits. *Open: decide identity and configure it on `_ensure_worktree`*.
+3. **HITL @mention handle** — resolved as a configurable list (`HITL_HANDLE`, default `geserdugarov,and-semakin,garudainfo55`).
+
+Not yet done:
+
+- Per-issue retry cap (3/day in pinned state). Today a run-and-park loop has no hard ceiling.
+- `tests/test_workflow.py` covering state transitions against an in-memory fake `Github`. (Only `test_config.py` exists.)
+- Everything from Day 6 onward: `validating` (claude review), auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, Dockerfile / systemd / GitHub App migration.
+
+## Context
 
 The goal documented in `docs/workflow.md` is an "orchestrator": a long-running process that watches GitHub Issues, drives them through a fixed 4-stage workflow (Decompose → Implement → Validate → Accept), and uses local AI coding-agent CLIs (`codex`, `claude`) to do the actual work. State lives in GitHub Issues themselves (one label per issue, plus pinned JSON state in a comment) so the orchestrator stays stateless and the user can watch progress on github.com.
 
@@ -30,24 +66,27 @@ Defer to Week 2 (Day 6–14): `validating` stage with claude PR review, auto-mer
 
 ## File layout
 
-Flat package, ~5 files for v0. No premature abstraction.
+Flat package, ~5 files for v0. No premature abstraction. Current shape on disk:
 
 ```
 /home/geserdugarov/git/agent-orchestrator-study/
-├── README.md                       (existing)
-├── docs/workflow.md                (existing — source of truth for label/stage semantics)
+├── README.md
+├── docs/workflow.md                (Russian-language source of truth for label/stage semantics)
 ├── orchestrator/
 │   ├── __init__.py
-│   ├── main.py                     # entry point, polling loop, signal handling, --once flag
-│   ├── workflow.py                 # state machine: label → handler dispatch (heart of v0, <300 LoC)
-│   ├── github.py                   # PyGithub wrapper: list issues, label r/w, comment, open PR, PR state, pinned-state-comment helpers
-│   ├── agents.py                   # spawn codex/claude as subprocess, capture session ID, timeout, parse blocked/done signal
-│   └── config.py                   # env-var loader: GITHUB_TOKEN, REPO, POLL_INTERVAL, AGENT_TIMEOUT, agent CLI paths
-├── pyproject.toml                  # PEP 621, deps = ["PyGithub"]
-├── .env.example                    # GITHUB_TOKEN=, REPO=podlodka-ai-club/spark-gap, POLL_INTERVAL=60
-├── .gitignore                      # .env, __pycache__, *.pyc, .venv/, ../wt-issue-*
+│   ├── main.py                     # polling loop, --once, --log-level, SIGTERM/SIGINT, ancestry-aware self-update detection
+│   ├── workflow.py                 # state machine + worktree mgmt + hardened push (heart of v0)
+│   ├── github.py                   # PyGithub wrapper: issues, labels, comments, pinned-state JSON, open/find PR, label bootstrap
+│   ├── agents.py                   # codex spawn/resume, session-ID walker, env scrub, last-message capture
+│   └── config.py                   # .env loader (rejects secrets), token resolution from env or ~/.config/<owner>/<repo>/token, HITL parsing
+├── pyproject.toml                  # PEP 621, deps = ["PyGithub>=2.1"]
+├── run.sh                          # self-restart wrapper, BASE_BRANCH-aware pull
+├── .env.example                    # REPO, POLL_INTERVAL, AGENT_TIMEOUT, HITL_HANDLE, *_BIN (no GITHUB_TOKEN — banned from .env)
+├── .gitignore                      # .env, __pycache__, .venv, .codex/, .claude/, …
 └── tests/
-    └── test_workflow.py            # state-machine transitions with a fake GitHub
+    ├── __init__.py
+    └── test_config.py              # HITL handle parsing
+                                    # test_workflow.py — TODO (Day 4)
 ```
 
 ## State machine (v0)
@@ -63,13 +102,13 @@ Flat package, ~5 files for v0. No premature abstraction.
 
 Defer to Week 2 transitions: `(none) → decomposing`, `decomposing → ready/blocked`, `ready → implementing` (split out from pickup), `implementing → validating`, `validating → in_review` / `validating → ready`, `in_review → done` (auto-merge), `in_review → rejected`.
 
-Pinned-state comment shape (one per issue, the orchestrator searches for the first comment containing `<!-- orchestrator-state -->`):
+Pinned-state comment shape (one per issue, found by the marker `<!--orchestrator-state` and parsed via `PINNED_STATE_RE`):
 
 ```
-<!-- orchestrator-state -->
-```json
-{"codex_session_id": "...", "branch": "orchestrator/issue-7", "pr_number": 42, "awaiting_human": false, "last_seen_comment_id": 1234567}
+<!--orchestrator-state {"codex_session_id":"…","branch":"orchestrator/issue-7","pr_number":42,"awaiting_human":false,"last_action_comment_id":1234567,"created_at":"…","last_agent_action_at":"…"}-->
 ```
+
+The orchestrator-owned keys today: `codex_session_id`, `branch`, `pr_number`, `awaiting_human`, `last_action_comment_id`, `created_at`, `last_agent_action_at`. The `retry_count` / per-day cap is **not yet** persisted here — see Day 4–5 work below.
 
 ## Polling loop
 
@@ -95,12 +134,13 @@ codex exec \
   "<prompt>"        # or: codex resume --session <id> "<follow-up>"
 ```
 
-Implementation:
-- `subprocess.run(..., timeout=AGENT_TIMEOUT)` with `AGENT_TIMEOUT=1800` (30 min hard cap).
-- Parse JSON-lines output to capture the session ID. **Day 1 task**: run `codex exec --help` on this host to confirm the exact flag name and output format before writing this module — the doc references `--dangerously-skip-permissions` but `codex` may use a slightly different flag name.
-- Detect "blocked / needs human input" by a simple heuristic: agent finishes without committing changes AND its final message contains a question. Refine the heuristic only if it misfires.
-- On timeout: kill the subprocess, post `@geserdugarov agent timed out, manual intervention needed`, leave label as-is, do not retry on this tick.
-- Per-issue retry counter in pinned-state, hard cap 3/day; over the cap → ping the user and stop.
+Implementation (current state in `agents.py` / `workflow.py`):
+- `subprocess.run(..., timeout=AGENT_TIMEOUT)` with `AGENT_TIMEOUT=1800` (30 min hard cap). **Done.**
+- Parse JSON-lines output to capture the session ID. **Done** — `parse_session_id` walks JSONL events for any UUID at `session_id`/`conversation_id`/`thread_id`/`session`/`id` (or anywhere nested).
+- Detect "blocked / needs human input" by a simple heuristic: agent finishes without committing changes. **Done** — implemented as `not _has_new_commits(wt)` after the codex run. The final message captured via `-o <last-message-file>` is quoted into the HITL comment as the question text.
+- On timeout: kill the subprocess, post `<HITL mention> agent timed out…`, park on `awaiting_human=true`, do not retry until a human comments. **Done.**
+- **Not done:** per-issue retry counter in pinned-state, hard cap 3/day; over the cap → ping the user and stop. (Day 4–5 work.)
+- **Not done:** confirming codex commit identity. Today the agent inherits `git config user.{name,email}` from the worktree. Suggest setting `user.name = "agent-orchestrator"` and a deliberate `user.email` on `_ensure_worktree` so authorship is unambiguous in `git log`.
 
 **Worktrees** are mandatory for self-bootstrap safety: `git worktree add ../wt-issue-<N> -b orchestrator/issue-<N> origin/main`. The orchestrator's own checkout (which is also the running process's source code) is never touched while codex edits files. After PR open, the worktree can be removed lazily on next pickup of the same issue, or kept until merge.
 
@@ -115,24 +155,24 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 ## GitHub auth
 
 - **Fine-grained PAT scoped to `podlodka-ai-club/spark-gap` only**, with read/write on Contents, Issues, Pull requests, Metadata.
-- Stored in `.env` as `GITHUB_TOKEN`. `.env` is in `.gitignore`.
-- `config.py` reads `.env` manually (5 lines, no dep).
-- The token is passed to agent subprocesses via `env={"GH_TOKEN": token, ...}` so they can `git push`. PR opening is done by the orchestrator (PyGithub), not by the agent — narrower agent surface.
+- **Token storage (revised from original plan).** The PAT is **not** stored in `.env` — that file is reachable from the agent's worktree via relative path. It must come from either the orchestrator's process environment (`GITHUB_TOKEN=…` exported before launch) or a file outside `REPO_ROOT`. Default file path is `~/.config/<owner>/<repo>/token`, derived from `REPO`; override with `ORCHESTRATOR_TOKEN_FILE`. `config._load_dotenv` actively rejects `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_TOKEN`/etc. found in `.env` with a clear stderr message.
+- `config.py` reads `.env` manually (no dep). The agent process never receives `GITHUB_TOKEN` (or any `GH_*` / `GIT_TOKEN` synonym) — `agents.run_codex` strips them from the inherited environment.
+- The orchestrator does the `git push` itself via an askpass tempscript (token in env, never in argv) and does the PR open via PyGithub. The agent only edits files and commits inside its worktree. See "Done beyond the original plan" above for the full list of push hardening.
 - Agent API keys (Anthropic / OpenAI): the orchestrator does **not** hold these. It relies on the user's existing global `claude` and `codex` CLI logins on this host.
 
 ## Phased rollout
 
-| Days | Milestone | Done when |
+| Days | Milestone | Status |
 |---|---|---|
-| **Day 1** | Scaffold + read-only GitHub | `python -m orchestrator.main --once` lists open issues and prints their labels. `pyproject.toml`, `orchestrator/{__init__,main,github,config}.py`, `.env.example`, `.gitignore` all exist. PAT created and tested. |
-| **Day 2** | Agent invocation works | `agents.run_codex(...)` against a throwaway worktree successfully edits a file, captures the session ID, and the orchestrator pushes the branch and opens a PR via PyGithub. Codex flag name verified. |
-| **Day 3** | **Self-bootstrap milestone.** Polling loop end-to-end. | The bootstrap test issue (§Verification) is filed, orchestrator started, walked away from for 10 min, and a PR appears that the user can manually merge. Self-update wrapper script in place. |
-| **Day 4–5** | HITL + harden | Codex-asks-question detection, resume on human reply, pinned-state comment, retry cap, `tests/test_workflow.py` for state transitions. |
-| **Day 6–8** | `validating` stage | `claude` reviews each PR, posts review summary, flips `implementing → validating → in_review` or `validating → ready`. |
-| **Day 9–10** | Auto-merge + `rejected` | Auto-merge on approve + green CI. PR-comment-resume during `in_review` with 10-min debounce. `rejected` flow on PR close. |
-| **Day 11–12** | `decomposing` stage | Codex with a decomposition prompt; sub-issues created via PyGithub when the LLM judges the issue too large for one context. `blocked` label + dependency linking. |
-| **Day 13** | VPS prep | Dockerfile, systemd unit, GitHub App migration (replaces fine-grained PAT), structured logging, `--status` CLI flag listing in-flight issues. |
-| **Day 14** | Buffer / dogfood / docs | Update `docs/workflow.md` to reflect what actually shipped vs what's still future work. |
+| **Day 1** | Scaffold + read-only GitHub | ✅ Done. `pyproject.toml`, `orchestrator/{__init__,main,github,config}.py`, `.env.example`, `.gitignore`, PAT all in place. |
+| **Day 2** | Agent invocation works | ✅ Done. `agents.run_codex(...)` confirmed, codex flags verified, askpass-based push and PyGithub PR open both wired up. |
+| **Day 3** | **Self-bootstrap milestone.** Polling loop end-to-end. | ✅ Done. Polling loop, signal handling, ancestry-aware self-update detection, and `run.sh` wrapper all merged (eb87246, 9e5eac6). |
+| **Day 4–5** | HITL + harden | 🟡 Partial. Question detection (no-commits heuristic), resume on human follow-up, pinned-state JSON, dirty-tree refusal, push-failure parking, comprehensive HITL mention plumbing all done. **Still open:** per-issue retry cap (3/day), `tests/test_workflow.py` covering state transitions against an in-memory fake `Github`, agent commit identity. |
+| **Day 6–8** | `validating` stage | ⬜ Not started. Need `run_claude` in `agents.py`, a `validating` handler, summary comment, transition to `in_review` on approve / back to `ready` on reject. `CLAUDE_BIN` is already wired in config. |
+| **Day 9–10** | Auto-merge + `rejected` | ⬜ Not started. Add `in_review` handler that watches PR state + check runs, auto-merges on approve+green, transitions to `done`. Add `rejected` on PR close-without-merge. PR-comment-resume during `in_review` with 10-min debounce. |
+| **Day 11–12** | `decomposing` stage | ⬜ Not started. New `_handle_decomposing` driving codex with a decomposition prompt; sub-issues created via PyGithub; `blocked` label + dependency linking when sub-issues exist. |
+| **Day 13** | VPS prep | ⬜ Not started. Dockerfile, systemd unit (`Restart=always` replaces `run.sh`), GitHub App migration to drop the PAT, structured logging, `--status` CLI flag listing in-flight issues. |
+| **Day 14** | Buffer / dogfood / docs | ⬜ Not started. Update `docs/workflow.md` to reflect what actually shipped (incl. the inline pinned-state marker change and the new token-storage rules). |
 
 ## Verification
 
@@ -150,15 +190,13 @@ This exercises the entire v0 path: pickup → branch → codex run → push → 
 3. **Day 9 acceptance:** file a "rename `hello()` to `greet()`" issue. Pass criterion: orchestrator opens PR and *auto-merges* once the user clicks Approve (no manual merge needed).
 4. **Day 12 acceptance:** file a deliberately oversized issue ("Add `status`, `pause`, `resume` CLI subcommands"). Pass criterion: orchestrator creates 3 sub-issues linked to the parent and labels them `ready` / parent `blocked`.
 
-**Unit tests** (Day 4): `tests/test_workflow.py` drives every state transition against an in-memory fake `Github`; no real network. Asserts label changes, comment posts, and pinned-state JSON shape.
+**Unit tests** (Day 4 — **still open**): `tests/test_workflow.py` should drive every state transition against an in-memory fake `Github`; no real network. Asserts label changes, comment posts, and pinned-state JSON shape. Today only `tests/test_config.py` exists (HITL handle parsing).
 
-## Open items to resolve on Day 1 (before writing code)
+## Open items from Day-1 checklist
 
-1. **Codex flag name & JSON output shape.** Run `codex exec --help` and a one-line dry run to confirm `--dangerously-bypass-approvals-and-sandbox` (or whatever the current flag is) and the location of the session ID in `--json` output.
-2. **Commit identity for agent commits.** Suggest configuring `user.name = "agent-orchestrator"`, `user.email = "noreply+orchestrator@geserdugarov.dev"` in each agent worktree. Confirm the email you want.
-3. **HITL @mention handle.** Suggest `@geserdugarov`. Confirm.
-
-These are 15-minute checks, not blockers — they sit at the start of Day 1.
+1. **Codex flag name & JSON output shape.** ✅ Resolved during Day 2: `codex exec [-C <cwd>] --dangerously-bypass-approvals-and-sandbox --json -o <last-message-file> "<prompt>"` (resume variant: `codex exec resume <session-id> "<follow-up>"` — does **not** accept `-C`, so we rely on `subprocess` cwd).
+2. **Commit identity for agent commits.** ⬜ Still open. Worktrees inherit the host's git config. Configure `user.name`/`user.email` explicitly on `_ensure_worktree` so authorship is unambiguous in `git log`.
+3. **HITL @mention handle.** ✅ Resolved as a configurable comma-separated list (`HITL_HANDLE`); current default is `geserdugarov,and-semakin,garudainfo55`.
 
 ## Risks (carry-over from agent design)
 
