@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -366,6 +366,56 @@ def _park_awaiting_human(
         state.set("last_action_comment_id", latest)
 
 
+def _check_and_increment_retry_budget(
+    gh: GitHubClient, issue: Issue, state: PinnedState
+) -> bool:
+    """Gate fresh implementing-codex spawns by a per-issue 24h retry cap.
+
+    The window starts at the first counted attempt and resets once 24h after
+    that start has elapsed -- a fixed window per issue, not a true rolling
+    window, but enough to stop a stuck issue from burning tokens for a day.
+
+    Returns True if the spawn is allowed (and the budget was incremented);
+    False if the cap is exhausted (and the issue was parked on awaiting_human).
+
+    Only fresh spawns count. Resumes on human reply and recovered-worktree
+    pushes are explicit unblock signals or carry-over work, not retries.
+    Caller writes pinned state after this returns; on the False branch we have
+    already parked, so caller's pinned-state write commits the park.
+    """
+    cap = config.MAX_RETRIES_PER_DAY
+    if cap <= 0:
+        return True
+
+    now = datetime.now(timezone.utc)
+    window_start_raw = state.get("retry_window_start")
+    window_start: Optional[datetime] = None
+    if window_start_raw:
+        try:
+            window_start = datetime.fromisoformat(window_start_raw)
+        except (TypeError, ValueError):
+            window_start = None
+
+    if window_start is None or now - window_start > timedelta(hours=24):
+        # Window absent/corrupt/expired: open a new one.
+        state.set("retry_window_start", _now_iso())
+        state.set("retry_count", 0)
+        window_start_raw = state.get("retry_window_start")
+
+    count = int(state.get("retry_count") or 0)
+    if count >= cap:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} hit retry cap ({cap}/day) for "
+            f"implementing; manual intervention needed. "
+            f"Window opened at {window_start_raw}.",
+        )
+        return False
+
+    state.set("retry_count", count + 1)
+    return True
+
+
 def _resume_developer_on_human_reply(
     gh: GitHubClient, issue: Issue, state: PinnedState
 ) -> Optional[Tuple[Path, CodexResult]]:
@@ -418,6 +468,9 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
                 stderr="",
             )
         else:
+            if not _check_and_increment_retry_budget(gh, issue, state):
+                gh.write_pinned_state(issue, state)
+                return
             prompt = _build_implement_prompt(issue, _recent_comments_text(issue))
             result = run_codex(prompt, wt)
             if result.session_id:
@@ -644,6 +697,11 @@ def _on_commits(
     # Reset the review counter every time we (re-)open a PR so the validating
     # handler starts fresh on the new branch state.
     state.set("review_round", 0)
+    # Issue moved forward; reset the implementing retry budget so any future
+    # bounce back into implementing (e.g. validating -> implementing in a
+    # later stage) starts with a fresh window.
+    state.set("retry_count", 0)
+    state.set("retry_window_start", None)
     gh.set_workflow_label(issue, "validating")
 
 

@@ -113,6 +113,13 @@ def run_codex(
         cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
 
     env = {k: v for k, v in os.environ.items() if k not in _FORBIDDEN_AGENT_ENV}
+    # Stamp agent commits with the orchestrator's identity. Env vars take
+    # precedence over user.name/user.email from any config scope, so the
+    # host's git config is untouched and no per-worktree config is needed.
+    env["GIT_AUTHOR_NAME"] = config.AGENT_GIT_NAME
+    env["GIT_AUTHOR_EMAIL"] = config.AGENT_GIT_EMAIL
+    env["GIT_COMMITTER_NAME"] = config.AGENT_GIT_NAME
+    env["GIT_COMMITTER_EMAIL"] = config.AGENT_GIT_EMAIL
     if extra_env:
         env.update(extra_env)
     log.info(

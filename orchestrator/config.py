@@ -96,6 +96,11 @@ POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "60"))
 AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))
 REVIEW_TIMEOUT: int = int(os.environ.get("REVIEW_TIMEOUT", str(AGENT_TIMEOUT)))
 MAX_REVIEW_ROUNDS: int = int(os.environ.get("MAX_REVIEW_ROUNDS", "3"))
+# Cap on how many fresh implementing-codex spawns one issue can use within a
+# 24h window opened at the first counted attempt. The window resets once 24h
+# elapses since that start. Resumes on human reply do not count. 0 = unbounded
+# (matches MAX_REVIEW_ROUNDS's implied semantics).
+MAX_RETRIES_PER_DAY: int = int(os.environ.get("MAX_RETRIES_PER_DAY", "3"))
 HITL_HANDLES: tuple[str, ...] = (
     _parse_hitl_handles(os.environ.get("HITL_HANDLE", "geserdugarov"))
     or ("geserdugarov",)
@@ -104,6 +109,17 @@ HITL_HANDLE: str = ",".join(HITL_HANDLES)
 HITL_MENTIONS: str = " ".join(f"@{handle}" for handle in HITL_HANDLES)
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 CLAUDE_BIN: str = os.environ.get("CLAUDE_BIN", "claude")
+
+# git identity injected into each codex spawn via GIT_AUTHOR_*/GIT_COMMITTER_*
+# env vars (see agents.run_codex). Env vars take precedence over user.name and
+# user.email from any config scope, so agent commits are attributable to the
+# orchestrator without touching the host's git config or the shared repo
+# config. The default email uses the GitHub-recognized noreply form so it
+# won't bounce and won't link to a real user account.
+AGENT_GIT_NAME: str = os.environ.get("AGENT_GIT_NAME", "agent-orchestrator")
+AGENT_GIT_EMAIL: str = os.environ.get(
+    "AGENT_GIT_EMAIL", "agent-orchestrator@users.noreply.github.com"
+)
 
 WORKTREES_DIR: Path = Path(
     os.environ.get("WORKTREES_DIR", str(REPO_ROOT.parent / "wt-orchestrator"))
