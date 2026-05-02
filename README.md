@@ -18,10 +18,10 @@ For the implementation roadmap and v0 scope cut, see [`plans/roadmap.md`](plans/
 
 ### CLI agents
 
-The orchestrator spawns these as subprocesses; both must be installed and authenticated on the host before the orchestrator starts.
+The orchestrator spawns these as subprocesses; both must be installed and authenticated on the host before the orchestrator starts. Roles are configurable via `DEV_AGENT` / `REVIEW_AGENT` (default: `claude` implements, `codex` reviews).
 
-- [`codex`](https://github.com/openai/codex) — implementer. Run `codex login` once. The orchestrator invokes it with `--dangerously-bypass-approvals-and-sandbox`, so the host should be considered the sandbox boundary.
-- [`claude`](https://docs.anthropic.com/en/docs/claude-code) — validator (Week 2 stage; **not used in v0**). Authenticate when needed.
+- [`codex`](https://github.com/openai/codex) — invoked with `--dangerously-bypass-approvals-and-sandbox`. Run `codex login` once. The host is the sandbox boundary.
+- [`claude`](https://docs.anthropic.com/en/docs/claude-code) — invoked with `--dangerously-skip-permissions`. Authenticate via `claude` once.
 
 ### GitHub
 
@@ -88,10 +88,10 @@ Pinned in [`pyproject.toml`](pyproject.toml):
 
    ```sh
    codex --version
-   claude --version    # only required for Week 2 validate stage
+   claude --version
    ```
 
-   If `codex` is not logged in, run `codex login`.
+   If a backend is not logged in, run its `login` flow (`codex login` / `claude /login`). Only the backends you actually route to via `DEV_AGENT` / `REVIEW_AGENT` need to be authenticated, but the defaults use both.
 
 5. **Run**
 
@@ -108,7 +108,7 @@ Pinned in [`pyproject.toml`](pyproject.toml):
    > **Title:** Add a `hello()` function to the orchestrator package
    > **Body:** Add `hello()` to `orchestrator/__init__.py` returning the string `"hello, world"`. Add `tests/test_hello.py` asserting the return value. Don't change anything else.
 
-   Within ~1 minute the orchestrator should comment "picking this up", label the issue `implementing`, run codex in a fresh worktree at `../wt-orchestrator/issue-N`, push the branch, open a PR, and label the issue `in_review`. Review the PR and merge manually (auto-merge is a Week 2 feature).
+   Within ~1 minute the orchestrator should comment "picking this up", label the issue `implementing`, run the dev agent (`DEV_AGENT`, default `claude`) in a fresh worktree at `../wt-orchestrator/issue-N`, push the branch, open a PR, label the issue `validating`, run a fresh reviewer session (`REVIEW_AGENT`, default `codex`) against the diff, and on `VERDICT: APPROVED` move the issue to `in_review`. Review the PR and merge manually (auto-merge is still on the Week 2 list).
 
 ## Run modes
 
@@ -127,12 +127,19 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | `REPO`                    | `podlodka-ai-club/spark-gap`       | `owner/name` of the repo to manage                        |
 | `POLL_INTERVAL`           | `60`                                          | seconds between polling ticks                             |
 | `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
+| `REVIEW_TIMEOUT`          | (= `AGENT_TIMEOUT`)                           | wall-clock cap per reviewer invocation, seconds           |
+| `MAX_REVIEW_ROUNDS`       | `3`                                           | review/fix iterations before parking on `awaiting_human` |
+| `MAX_RETRIES_PER_DAY`     | `3`                                           | fresh implementer spawns per issue per 24h window (`0` = unbounded) |
+| `DEV_AGENT`               | `claude`                                      | implementer backend; one of `codex` / `claude`            |
+| `REVIEW_AGENT`            | `codex`                                       | reviewer backend; one of `codex` / `claude`               |
 | `HITL_HANDLE`             | `geserdugarov`                                | comma-separated GitHub logins to @-mention when a human is needed |
 | `WORKTREES_DIR`           | `../wt-orchestrator`                          | where per-issue git worktrees are created                 |
 | `CODEX_BIN`               | `codex`                                       | override only if `codex` is not on `$PATH`                |
 | `CLAUDE_BIN`              | `claude`                                      | override only if `claude` is not on `$PATH`               |
+| `AGENT_GIT_NAME`          | `agent-orchestrator`                          | `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` injected into agent spawns |
+| `AGENT_GIT_EMAIL`         | `agent-orchestrator@users.noreply.github.com` | `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` injected into agent spawns |
 | `BASE_BRANCH`             | `main`                                        | branch PRs target                                         |
 
 ## v0 scope
 
-The current MVP implements only the (no label) → `implementing` → `in_review` path. The full 4-stage workflow (`decomposing`, `validating`, auto-merge, `blocked`/`rejected`) is scoped for Week 2; see [`plans/roadmap.md`](plans/roadmap.md).
+The orchestrator currently drives (no label) → `implementing` → `validating` → `in_review`, with a configurable dev/review backend split, a per-issue retry budget (`MAX_RETRIES_PER_DAY`), and a review/fix loop capped by `MAX_REVIEW_ROUNDS`. Still on the Week 2 list: `decomposing`, auto-merge on approve+green-CI, and `blocked`/`rejected` flows. See [`plans/roadmap.md`](plans/roadmap.md).
