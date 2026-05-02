@@ -29,21 +29,26 @@ Done beyond the original plan (security hardening from review iterations):
 Open items from the Day-1 checklist:
 
 1. **Codex flag name & JSON output shape** — resolved during Day 2 (`--dangerously-bypass-approvals-and-sandbox`, `--json`, last-message-via-`-o`, UUID walker for session ID).
-2. **Commit identity for agent commits** — still not enforced. Agent commits go out under whatever `git config user.name/user.email` the worktree inherits. *Open: decide identity and configure it on `_ensure_worktree`*.
+2. **Commit identity for agent commits** — resolved in `7f9c6e2`. `agents._agent_env` injects `GIT_AUTHOR_*` / `GIT_COMMITTER_*` from `AGENT_GIT_NAME` / `AGENT_GIT_EMAIL` (default `agent-orchestrator <agent-orchestrator@users.noreply.github.com>`) into every spawn, overriding any `~/.gitconfig` without touching it.
 3. **HITL @mention handle** — resolved as a configurable list (`HITL_HANDLE`, default `geserdugarov,and-semakin,garudainfo55`).
+
+Done in Day 4–5 (post-original-plan, shipped together as `7f9c6e2`):
+
+- **Per-issue retry budget.** `MAX_RETRIES_PER_DAY` (default 3, `0` = unbounded) caps fresh implementing-codex spawns within a 24h window opened at the first counted attempt; resumes on human reply and recovered-worktree pushes don't count. Pinned state grew `retry_window_start` + `retry_count`. Forward progress (`_on_commits`) resets the budget.
+- **Agent commit identity stamped via env.** See Day-1 item 2 above.
+- **Fake-`Github` test harness landed.** `tests/fakes.py` (199 lines) plus a 700-line expansion of `tests/test_workflow.py` cover state transitions, the resume-on-human-reply path, retry-budget gating, and the new agent-identity env stamping. The original-plan TODO for `tests/test_workflow.py` is no longer outstanding.
 
 Done in Day 6 (validating stage):
 
-- `validating` stage as a **codex-on-codex review loop** (the doc's claude-as-reviewer is intentionally substituted with codex per user decision). Every PR opened by the implementer enters `validating`. A fresh codex session reviews `git diff origin/<base>...HEAD` against the issue and emits `VERDICT: APPROVED` / `VERDICT: CHANGES_REQUESTED`. On approval the label flips to `in_review` and humans take over. On changes requested the dev's codex session is resumed with the feedback, the fix is pushed, and the review re-runs. Capped at `MAX_REVIEW_ROUNDS` (default 3) before parking on `awaiting_human`.
+- `validating` stage as a review loop. Every PR opened by the implementer enters `validating`. A fresh reviewer-agent session (`run_agent(config.REVIEW_AGENT, ...)`) reviews `git diff origin/<base>...HEAD` against the issue and emits `VERDICT: APPROVED` / `VERDICT: CHANGES_REQUESTED`. On approval the label flips to `in_review` and humans take over. On changes requested the dev session is resumed (on whichever backend started the issue) with the feedback, the fix is pushed, and the review re-runs. Capped at `MAX_REVIEW_ROUNDS` (default 3) before parking on `awaiting_human`.
 - Review feedback and approval comments go to the **PR** via `pr.create_issue_comment` (`gh.pr_comment`). HITL pings (timeouts, cap reached, malformed verdict) stay on the issue.
-- Pinned state gained `review_round`, `last_review_session_id`, `last_review_at`. Existing fields unchanged.
+- Pinned state gained `review_round`, `last_review_session_id`, `last_review_at`, plus `review_agent` (which backend ran the review) added with the configurable-backend rollout in `8f91df5`.
 - `tests/test_workflow.py` covers `_parse_review_verdict` against APPROVED / CHANGES_REQUESTED / inline marker / case-insensitive / last-marker-wins / missing-marker / empty input.
 - `_park_awaiting_human` extracted from the existing inline parking blocks; `_resume_developer_on_human_reply` extracted so both `implementing` and `validating` share the human-reply resume path.
+- **Configurable dev/review backends (`8f91df5`).** `DEV_AGENT` (default `claude`) and `REVIEW_AGENT` (default `codex`) route each spawn through `run_agent` to either `_run_codex` or `_run_claude`; both backends return a unified `AgentResult` (with `CodexResult` kept as a one-release alias). Both values are validated at config load — a typo aborts startup. `CLAUDE_BIN` is no longer dormant. Pinned state grew `dev_agent` + `dev_session_id` (replacing `codex_session_id`); the legacy key is still honored on read and treated as codex, so in-flight issues stay locked to whichever backend started them across a `DEV_AGENT` flip.
 
 Not yet done:
 
-- Per-issue retry cap (3/day in pinned state). Today a run-and-park loop has no hard ceiling. (Unrelated to the new `MAX_REVIEW_ROUNDS`, which only caps the review/fix loop.)
-- `tests/test_workflow.py` does not yet cover state transitions against an in-memory fake `Github` -- only `_parse_review_verdict` is unit-tested. The bigger fake harness is still on the roadmap.
 - Auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, Dockerfile / systemd / GitHub App migration.
 
 ## Context
@@ -113,10 +118,10 @@ Defer to Week 2 transitions: `(none) → decomposing`, `decomposing → ready/bl
 Pinned-state comment shape (one per issue, found by the marker `<!--orchestrator-state` and parsed via `PINNED_STATE_RE`):
 
 ```
-<!--orchestrator-state {"codex_session_id":"…","branch":"orchestrator/issue-7","pr_number":42,"awaiting_human":false,"last_action_comment_id":1234567,"created_at":"…","last_agent_action_at":"…"}-->
+<!--orchestrator-state {"dev_agent":"claude","dev_session_id":"…","review_agent":"codex","last_review_session_id":"…","last_review_at":"…","branch":"orchestrator/issue-7","pr_number":42,"review_round":0,"retry_window_start":"…","retry_count":1,"awaiting_human":false,"last_action_comment_id":1234567,"created_at":"…","last_agent_action_at":"…"}-->
 ```
 
-The orchestrator-owned keys today: `codex_session_id`, `branch`, `pr_number`, `awaiting_human`, `last_action_comment_id`, `created_at`, `last_agent_action_at`. The `retry_count` / per-day cap is **not yet** persisted here — see Day 4–5 work below.
+The orchestrator-owned keys today: `dev_agent`, `dev_session_id`, `review_agent`, `last_review_session_id`, `last_review_at`, `branch`, `pr_number`, `review_round`, `retry_window_start`, `retry_count`, `awaiting_human`, `last_action_comment_id`, `created_at`, `last_agent_action_at`. Issues created before the configurable-backend rollout still carry the legacy `codex_session_id`; readers fall back to it and treat it as a codex session.
 
 ## Polling loop
 
@@ -147,8 +152,8 @@ Implementation (current state in `agents.py` / `workflow.py`):
 - Parse JSON-lines output to capture the session ID. **Done** — `parse_session_id` walks JSONL events for any UUID at `session_id`/`conversation_id`/`thread_id`/`session`/`id` (or anywhere nested).
 - Detect "blocked / needs human input" by a simple heuristic: agent finishes without committing changes. **Done** — implemented as `not _has_new_commits(wt)` after the codex run. The final message captured via `-o <last-message-file>` is quoted into the HITL comment as the question text.
 - On timeout: kill the subprocess, post `<HITL mention> agent timed out…`, park on `awaiting_human=true`, do not retry until a human comments. **Done.**
-- **Not done:** per-issue retry counter in pinned-state, hard cap 3/day; over the cap → ping the user and stop. (Day 4–5 work.)
-- **Not done:** confirming codex commit identity. Today the agent inherits `git config user.{name,email}` from the worktree. Suggest setting `user.name = "agent-orchestrator"` and a deliberate `user.email` on `_ensure_worktree` so authorship is unambiguous in `git log`.
+- Per-issue retry budget in pinned state, hard cap `MAX_RETRIES_PER_DAY`/day (default 3); over the cap → park on `awaiting_human` with a HITL ping. **Done in `7f9c6e2`** (24h fixed window per issue, opened on first counted attempt; resumes don't count; `_on_commits` resets it).
+- Agent commit identity. **Done in `7f9c6e2`** via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env injection from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` on every spawn — overrides any `git config user.{name,email}` without needing per-worktree config and leaves the host `~/.gitconfig` untouched.
 
 **Worktrees** are mandatory for self-bootstrap safety: `git worktree add ../wt-issue-<N> -b orchestrator/issue-<N> origin/main`. The orchestrator's own checkout (which is also the running process's source code) is never touched while codex edits files. After PR open, the worktree can be removed lazily on next pickup of the same issue, or kept until merge.
 
@@ -175,8 +180,8 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 | **Day 1** | Scaffold + read-only GitHub | ✅ Done. `pyproject.toml`, `orchestrator/{__init__,main,github,config}.py`, `.env.example`, `.gitignore`, PAT all in place. |
 | **Day 2** | Agent invocation works | ✅ Done. `agents.run_codex(...)` confirmed, codex flags verified, askpass-based push and PyGithub PR open both wired up. |
 | **Day 3** | **Self-bootstrap milestone.** Polling loop end-to-end. | ✅ Done. Polling loop, signal handling, ancestry-aware self-update detection, and `run.sh` wrapper all merged (eb87246, 9e5eac6). |
-| **Day 4–5** | HITL + harden | 🟡 Partial. Question detection (no-commits heuristic), resume on human follow-up, pinned-state JSON, dirty-tree refusal, push-failure parking, comprehensive HITL mention plumbing all done. **Still open:** per-issue retry cap (3/day), `tests/test_workflow.py` covering state transitions against an in-memory fake `Github`, agent commit identity. |
-| **Day 6–8** | `validating` stage | 🟢 Done as a codex-on-codex review loop (per user decision; `CLAUDE_BIN` is still wired but unused). `_handle_validating` runs a fresh codex review, posts feedback to the PR, resumes the dev session for fixes, re-reviews, and caps at `MAX_REVIEW_ROUNDS` rounds before parking on `awaiting_human`. Transitions to `in_review` on `VERDICT: APPROVED`. |
+| **Day 4–5** | HITL + harden | 🟢 Done. Question detection (no-commits heuristic), resume on human follow-up, pinned-state JSON, dirty-tree refusal, push-failure parking, comprehensive HITL mention plumbing all in place; per-issue retry budget (`MAX_RETRIES_PER_DAY`, 24h window) and agent commit-identity stamping landed in `7f9c6e2`; `tests/fakes.py` + an expanded `tests/test_workflow.py` now cover state transitions against an in-memory fake `Github`. |
+| **Day 6–8** | `validating` stage | 🟢 Done. `_handle_validating` runs a fresh review, posts feedback to the PR, resumes the dev session for fixes, re-reviews, and caps at `MAX_REVIEW_ROUNDS` rounds before parking on `awaiting_human`. Transitions to `in_review` on `VERDICT: APPROVED`. The dev/review backend split is now config-driven (`DEV_AGENT` / `REVIEW_AGENT`), defaults to claude implements + codex reviews, and `CLAUDE_BIN` is no longer dormant. The dev backend for an in-flight issue is locked in pinned state (`dev_agent`/`dev_session_id`, with legacy `codex_session_id` falling back to codex). |
 | **Day 9–10** | Auto-merge + `rejected` | ⬜ Not started. Add `in_review` handler that watches PR state + check runs, auto-merges on approve+green, transitions to `done`. Add `rejected` on PR close-without-merge. PR-comment-resume during `in_review` with 10-min debounce. |
 | **Day 11–12** | `decomposing` stage | ⬜ Not started. New `_handle_decomposing` driving codex with a decomposition prompt; sub-issues created via PyGithub; `blocked` label + dependency linking when sub-issues exist. |
 | **Day 13** | VPS prep | ⬜ Not started. Dockerfile, systemd unit (`Restart=always` replaces `run.sh`), GitHub App migration to drop the PAT, structured logging, `--status` CLI flag listing in-flight issues. |
@@ -198,12 +203,12 @@ This exercises the entire v0 path: pickup → branch → codex run → push → 
 3. **Day 9 acceptance:** file a "rename `hello()` to `greet()`" issue. Pass criterion: orchestrator opens PR and *auto-merges* once the user clicks Approve (no manual merge needed).
 4. **Day 12 acceptance:** file a deliberately oversized issue ("Add `status`, `pause`, `resume` CLI subcommands"). Pass criterion: orchestrator creates 3 sub-issues linked to the parent and labels them `ready` / parent `blocked`.
 
-**Unit tests** (Day 4 — **still open**): `tests/test_workflow.py` should drive every state transition against an in-memory fake `Github`; no real network. Asserts label changes, comment posts, and pinned-state JSON shape. Today only `tests/test_config.py` exists (HITL handle parsing).
+**Unit tests** (Day 4 — **done in `7f9c6e2`**): `tests/test_workflow.py` drives state transitions against an in-memory fake `Github` (`tests/fakes.py`, ~200 lines); covers pickup, implementing-with-resume, retry-budget gating, agent-identity env stamping, validating round-trips, and pinned-state JSON shape. `tests/test_config.py` covers HITL handle parsing, retry-cap parsing, and agent-identity env defaults. `tests/test_agents.py` covers the per-backend dispatch added in `8f91df5`.
 
 ## Open items from Day-1 checklist
 
 1. **Codex flag name & JSON output shape.** ✅ Resolved during Day 2: `codex exec [-C <cwd>] --dangerously-bypass-approvals-and-sandbox --json -o <last-message-file> "<prompt>"` (resume variant: `codex exec resume <session-id> "<follow-up>"` — does **not** accept `-C`, so we rely on `subprocess` cwd).
-2. **Commit identity for agent commits.** ⬜ Still open. Worktrees inherit the host's git config. Configure `user.name`/`user.email` explicitly on `_ensure_worktree` so authorship is unambiguous in `git log`.
+2. **Commit identity for agent commits.** ✅ Resolved in `7f9c6e2` via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env injection from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` (default `agent-orchestrator <agent-orchestrator@users.noreply.github.com>`). Env vars beat `git config user.{name,email}` at every scope, so the host's `~/.gitconfig` and the per-worktree config are both left untouched.
 3. **HITL @mention handle.** ✅ Resolved as a configurable comma-separated list (`HITL_HANDLE`); current default is `geserdugarov,and-semakin,garudainfo55`.
 
 ## Risks (carry-over from agent design)
