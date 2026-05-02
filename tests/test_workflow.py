@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator import config, workflow
-from orchestrator.agents import CodexResult
+from orchestrator.agents import AgentResult
 from orchestrator.workflow import _parse_review_verdict
 
 from tests.fakes import (
@@ -20,44 +20,19 @@ from tests.fakes import (
 _FAKE_WT = Path("/tmp/orchestrator-test-wt-doesnt-matter")
 
 
-def _codex(
+def _agent(
     *,
     session_id: str = "sess-1",
     last_message: str = "",
     timed_out: bool = False,
-) -> CodexResult:
-    return CodexResult(
+) -> AgentResult:
+    return AgentResult(
         session_id=session_id,
         last_message=last_message,
         exit_code=-1 if timed_out else 0,
         timed_out=timed_out,
         stdout="",
         stderr="",
-    )
-
-
-def _patch_workflow(
-    *,
-    run_codex,
-    has_new_commits=False,
-    dirty_files=(),
-    push_branch=True,
-    head_shas=("",),
-):
-    """Apply the standard set of monkeypatches to orchestrator.workflow.
-
-    `run_codex` and `head_shas` accept either a single value or an iterable
-    used as a side_effect sequence (for tests that span multiple codex spawns
-    or before/after SHA reads in one tick).
-    """
-    return patch.multiple(
-        workflow,
-        run_codex=_as_mock(run_codex),
-        _ensure_worktree=patch.DEFAULT,
-        _has_new_commits=patch.DEFAULT,
-        _worktree_dirty_files=patch.DEFAULT,
-        _push_branch=patch.DEFAULT,
-        _head_sha=patch.DEFAULT,
     )
 
 
@@ -82,7 +57,7 @@ class _PatchedWorkflowMixin:
         self,
         callable_,
         *,
-        run_codex,
+        run_agent,
         has_new_commits=False,
         dirty_files=(),
         push_branch=True,
@@ -90,7 +65,7 @@ class _PatchedWorkflowMixin:
     ):
         from unittest.mock import MagicMock
 
-        rc_mock = _as_mock(run_codex)
+        rc_mock = _as_mock(run_agent)
         hnc_seq = has_new_commits if isinstance(has_new_commits, (list, tuple)) else None
         hnc_mock = MagicMock()
         if hnc_seq is not None:
@@ -103,7 +78,7 @@ class _PatchedWorkflowMixin:
         head_mock = MagicMock(side_effect=list(head_shas))
         wt_mock = MagicMock(return_value=_FAKE_WT)
 
-        with patch.object(workflow, "run_codex", rc_mock), \
+        with patch.object(workflow, "run_agent", rc_mock), \
              patch.object(workflow, "_ensure_worktree", wt_mock), \
              patch.object(workflow, "_has_new_commits", hnc_mock), \
              patch.object(workflow, "_worktree_dirty_files", df_mock), \
@@ -112,7 +87,7 @@ class _PatchedWorkflowMixin:
             callable_()
 
         return {
-            "run_codex": rc_mock,
+            "run_agent": rc_mock,
             "_ensure_worktree": wt_mock,
             "_has_new_commits": hnc_mock,
             "_worktree_dirty_files": df_mock,
@@ -168,7 +143,7 @@ class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         mocks = self._run(
             lambda: workflow._handle_pickup(gh, issue),
-            run_codex=_codex(last_message="need clarification"),
+            run_agent=_agent(last_message="need clarification"),
             has_new_commits=False,
         )
 
@@ -181,7 +156,7 @@ class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertEqual(gh.label_history[0], (1, "implementing"))
         self.assertIn("created_at", gh.pinned_data(1))
         # _handle_implementing was actually entered (codex spawned).
-        mocks["run_codex"].assert_called_once()
+        mocks["run_agent"].assert_called_once()
 
 
 class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
@@ -196,7 +171,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(session_id="sess-1", last_message="implemented"),
+            run_agent=_agent(session_id="sess-1", last_message="implemented"),
             # First call: not a recovered worktree -> codex runs.
             # Second call: codex produced commits -> push path.
             has_new_commits=[False, True],
@@ -214,7 +189,11 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         data = gh.pinned_data(1)
         self.assertEqual(data["pr_number"], opened.number)
         self.assertEqual(data["branch"], "orchestrator/issue-1")
-        self.assertEqual(data["codex_session_id"], "sess-1")
+        # First fresh dev spawn writes the new keys; the legacy field is
+        # deliberately not migrated.
+        self.assertEqual(data["dev_agent"], config.DEV_AGENT)
+        self.assertEqual(data["dev_session_id"], "sess-1")
+        self.assertNotIn("codex_session_id", data)
         self.assertEqual(data["review_round"], 0)
 
     def test_commits_with_dirty_tree_parks_without_pushing(self) -> None:
@@ -222,7 +201,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         dirty = [f"file_{i}.py" for i in range(15)]
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(last_message="commit done but more work pending"),
+            run_agent=_agent(last_message="commit done but more work pending"),
             has_new_commits=[False, True],
             dirty_files=dirty,
             push_branch=True,
@@ -241,7 +220,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(last_message="What database should I use?"),
+            run_agent=_agent(last_message="What database should I use?"),
             has_new_commits=False,
         )
 
@@ -255,7 +234,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(timed_out=True),
+            run_agent=_agent(timed_out=True),
             has_new_commits=False,
         )
 
@@ -269,7 +248,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(session_id="sess-1", last_message="done"),
+            run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
             push_branch=False,
@@ -297,10 +276,10 @@ class HandleImplementingAwaitingHumanTest(unittest.TestCase, _PatchedWorkflowMix
 
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(),
+            run_agent=_agent(),
         )
 
-        mocks["run_codex"].assert_not_called()
+        mocks["run_agent"].assert_not_called()
         self.assertEqual(gh.write_state_calls, before)
         # Pinned data unchanged.
         self.assertTrue(gh.pinned_data(2).get("awaiting_human"))
@@ -323,7 +302,7 @@ class HandleImplementingAwaitingHumanTest(unittest.TestCase, _PatchedWorkflowMix
 
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(session_id="sess-old", last_message="ok"),
+            run_agent=_agent(session_id="sess-old", last_message="ok"),
             # awaiting_human path skips the recovered-worktree probe; only
             # the post-codex commit check runs.
             has_new_commits=[True],
@@ -331,10 +310,13 @@ class HandleImplementingAwaitingHumanTest(unittest.TestCase, _PatchedWorkflowMix
             push_branch=True,
         )
 
-        mocks["run_codex"].assert_called_once()
-        _, kwargs = mocks["run_codex"].call_args
-        self.assertEqual(kwargs.get("resume_session_id"), "sess-old")
-        followup_arg = mocks["run_codex"].call_args.args[0]
+        mocks["run_agent"].assert_called_once()
+        call = mocks["run_agent"].call_args
+        # Legacy `codex_session_id` locks the resume to the codex backend
+        # regardless of the current DEV_AGENT default.
+        self.assertEqual(call.args[0], "codex")
+        self.assertEqual(call.kwargs.get("resume_session_id"), "sess-old")
+        followup_arg = call.args[1]
         self.assertIn("please use sqlite", followup_arg)
         # Ran through to PR open.
         self.assertEqual(len(gh.opened_prs), 1)
@@ -350,13 +332,13 @@ class HandleImplementingRecoveredWorktreeTest(unittest.TestCase, _PatchedWorkflo
 
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(),
+            run_agent=_agent(),
             has_new_commits=True,
             dirty_files=(),
             push_branch=True,
         )
 
-        mocks["run_codex"].assert_not_called()
+        mocks["run_agent"].assert_not_called()
         mocks["_push_branch"].assert_called_once()
         self.assertEqual(len(gh.opened_prs), 1)
         # Prior session id retained.
@@ -375,7 +357,7 @@ class OnCommitsPRReuseTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(session_id="sess-1", last_message="done"),
+            run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
             push_branch=True,
@@ -408,10 +390,10 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         mocks = self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=_codex(last_message="LGTM\n\nVERDICT: APPROVED"),
+            run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
 
-        self.assertEqual(mocks["run_codex"].call_count, 1)
+        self.assertEqual(mocks["run_agent"].call_count, 1)
         self.assertIn((5, "in_review"), gh.label_history)
         self.assertTrue(any(
             ":white_check_mark: codex review approved" in body
@@ -420,23 +402,23 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
     def test_changes_requested_resumes_dev_increments_round(self) -> None:
         gh, issue = self._seeded()
-        review = _codex(
+        review = _agent(
             session_id="rev-sess",
             last_message="1. Fix typo\n\nVERDICT: CHANGES_REQUESTED",
         )
-        dev_fix = _codex(session_id="dev-sess", last_message="fixed")
+        dev_fix = _agent(session_id="dev-sess", last_message="fixed")
 
         mocks = self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=[review, dev_fix],
+            run_agent=[review, dev_fix],
             dirty_files=(),
             push_branch=True,
             head_shas=["aaa", "bbb"],
         )
 
-        self.assertEqual(mocks["run_codex"].call_count, 2)
+        self.assertEqual(mocks["run_agent"].call_count, 2)
         # Second call (dev fix) must resume the developer session.
-        _, second_kwargs = mocks["run_codex"].call_args_list[1]
+        _, second_kwargs = mocks["run_agent"].call_args_list[1]
         self.assertEqual(second_kwargs.get("resume_session_id"), "dev-sess")
 
         self.assertTrue(any(
@@ -452,7 +434,7 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=_codex(last_message="I'm not sure what to think"),
+            run_agent=_agent(last_message="I'm not sure what to think"),
         )
 
         self.assertTrue(gh.pinned_data(5).get("awaiting_human"))
@@ -466,7 +448,7 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=_codex(timed_out=True),
+            run_agent=_agent(timed_out=True),
         )
 
         self.assertTrue(gh.pinned_data(5).get("awaiting_human"))
@@ -491,7 +473,7 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
         return gh, issue
 
     def _changes_requested_review(self):
-        return _codex(
+        return _agent(
             session_id="rev-sess",
             last_message="1. Fix typo\n\nVERDICT: CHANGES_REQUESTED",
         )
@@ -500,9 +482,9 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
         gh, issue = self._seeded()
         mocks = self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=[
+            run_agent=[
                 self._changes_requested_review(),
-                _codex(session_id="dev-sess", last_message="why?"),
+                _agent(session_id="dev-sess", last_message="why?"),
             ],
             dirty_files=(),
             push_branch=True,
@@ -519,9 +501,9 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
         gh, issue = self._seeded()
         mocks = self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=[
+            run_agent=[
                 self._changes_requested_review(),
-                _codex(session_id="dev-sess", last_message="partial"),
+                _agent(session_id="dev-sess", last_message="partial"),
             ],
             dirty_files=["leftover.py"],
             push_branch=True,
@@ -539,9 +521,9 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
         gh, issue = self._seeded()
         self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=[
+            run_agent=[
                 self._changes_requested_review(),
-                _codex(session_id="dev-sess", last_message="fixed"),
+                _agent(session_id="dev-sess", last_message="fixed"),
             ],
             dirty_files=(),
             push_branch=False,
@@ -557,10 +539,10 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
         gh, issue = self._seeded(review_round=config.MAX_REVIEW_ROUNDS)
         mocks = self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=_codex(),
+            run_agent=_agent(),
         )
 
-        mocks["run_codex"].assert_not_called()
+        mocks["run_agent"].assert_not_called()
         self.assertTrue(gh.pinned_data(6).get("awaiting_human"))
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("review still has comments", last_comment)
@@ -586,17 +568,18 @@ class HandleValidatingAwaitingHumanResumeTest(unittest.TestCase, _PatchedWorkflo
 
         mocks = self._run(
             lambda: workflow._handle_validating(gh, issue),
-            run_codex=_codex(session_id="dev-sess", last_message="fixed"),
+            run_agent=_agent(session_id="dev-sess", last_message="fixed"),
             dirty_files=(),
             push_branch=True,
             head_shas=["aaa", "bbb"],
         )
 
         # Only the dev resume runs this tick; the reviewer fires on the next.
-        self.assertEqual(mocks["run_codex"].call_count, 1)
-        _, kwargs = mocks["run_codex"].call_args
-        self.assertEqual(kwargs.get("resume_session_id"), "dev-sess")
-        followup = mocks["run_codex"].call_args.args[0]
+        self.assertEqual(mocks["run_agent"].call_count, 1)
+        call = mocks["run_agent"].call_args
+        self.assertEqual(call.args[0], "codex")
+        self.assertEqual(call.kwargs.get("resume_session_id"), "dev-sess")
+        followup = call.args[1]
         self.assertIn("use sqlite please", followup)
 
         mocks["_push_branch"].assert_called_once()
@@ -623,7 +606,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
 
     def test_fourth_fresh_attempt_in_window_is_parked_before_codex(self) -> None:
         # Run three fresh attempts that each park as a question, then assert
-        # the fourth tick parks before run_codex is called. Cap is 3/day.
+        # the fourth tick parks before run_agent is called. Cap is 3/day.
         gh, issue = self._seeded()
 
         # First three ticks: codex returns no commits + a question, parking on
@@ -631,7 +614,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
         for tick in range(3):
             self._run(
                 lambda: workflow._handle_implementing(gh, issue),
-                run_codex=_codex(last_message=f"q{tick}"),
+                run_agent=_agent(last_message=f"q{tick}"),
                 has_new_commits=False,
             )
             # Clear the awaiting-human flag manually so the next tick takes
@@ -648,11 +631,11 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
         # Fourth tick: must park before codex spawns.
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(last_message="should not run"),
+            run_agent=_agent(last_message="should not run"),
             has_new_commits=False,
         )
 
-        mocks["run_codex"].assert_not_called()
+        mocks["run_agent"].assert_not_called()
         self.assertTrue(gh.pinned_data(8).get("awaiting_human"))
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("hit retry cap (3/day)", last_comment)
@@ -668,7 +651,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(session_id="sess-1", last_message="done"),
+            run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
             push_branch=True,
@@ -690,11 +673,11 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(last_message="ask again"),
+            run_agent=_agent(last_message="ask again"),
             has_new_commits=False,
         )
 
-        mocks["run_codex"].assert_called_once()
+        mocks["run_agent"].assert_called_once()
         data = gh.pinned_data(8)
         # Reset to 0 by the window-expired branch, then incremented to 1.
         self.assertEqual(data.get("retry_count"), 1)
@@ -720,14 +703,14 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         mocks = self._run(
             lambda: workflow._handle_implementing(gh, issue),
-            run_codex=_codex(session_id="sess-old", last_message="ok"),
+            run_agent=_agent(session_id="sess-old", last_message="ok"),
             has_new_commits=[True],
             dirty_files=(),
             push_branch=True,
         )
 
         # Resume happened (codex was called once with the followup comment).
-        mocks["run_codex"].assert_called_once()
+        mocks["run_agent"].assert_called_once()
         # retry_count NOT incremented by the resume itself. The successful
         # _on_commits then clears it to 0.
         data = gh.pinned_data(9)
@@ -738,6 +721,137 @@ def _iso_hours_ago(hours: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(
         timespec="seconds"
     )
+
+
+class ConfigurableBackendTest(unittest.TestCase, _PatchedWorkflowMixin):
+    """The dev/review backends are picked from config, with the dev backend
+    locked to whatever wrote `dev_session_id` (or legacy `codex_session_id`)
+    so a config flip mid-flight does not break a resumable session.
+    """
+
+    def test_fresh_implementing_spawn_uses_dev_agent_config(self) -> None:
+        gh = FakeGitHubClient()
+        issue = make_issue(20, label="implementing")
+        gh.add_issue(issue)
+
+        with patch.object(config, "DEV_AGENT", "claude"):
+            mocks = self._run(
+                lambda: workflow._handle_implementing(gh, issue),
+                run_agent=_agent(session_id="sess-fresh", last_message="done"),
+                has_new_commits=[False, True],
+                dirty_files=(),
+                push_branch=True,
+            )
+
+        self.assertEqual(mocks["run_agent"].call_args.args[0], "claude")
+        data = gh.pinned_data(20)
+        self.assertEqual(data["dev_agent"], "claude")
+        self.assertEqual(data["dev_session_id"], "sess-fresh")
+        self.assertNotIn("codex_session_id", data)
+
+    def test_reviewer_spawn_uses_review_agent_config(self) -> None:
+        gh = FakeGitHubClient()
+        issue = make_issue(21, label="validating")
+        gh.add_issue(issue)
+        gh.seed_state(
+            21,
+            pr_number=21,
+            branch="orchestrator/issue-21",
+            dev_agent="claude",
+            dev_session_id="dev-sess",
+            review_round=0,
+        )
+
+        with patch.object(config, "REVIEW_AGENT", "codex"):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, issue),
+                run_agent=_agent(
+                    session_id="rev-sess",
+                    last_message="LGTM\n\nVERDICT: APPROVED",
+                ),
+            )
+
+        self.assertEqual(mocks["run_agent"].call_args.args[0], "codex")
+        data = gh.pinned_data(21)
+        self.assertEqual(data["review_agent"], "codex")
+        self.assertEqual(data["last_review_session_id"], "rev-sess")
+
+    def test_dev_fix_uses_recorded_dev_backend_not_current_config(self) -> None:
+        # Issue locked to codex via pinned state; even if config flips to
+        # claude, the validating dev-fix call must stay on codex.
+        gh = FakeGitHubClient()
+        issue = make_issue(22, label="validating")
+        gh.add_issue(issue)
+        gh.seed_state(
+            22,
+            pr_number=22,
+            branch="orchestrator/issue-22",
+            dev_agent="codex",
+            dev_session_id="dev-sess",
+            review_round=0,
+        )
+        review = _agent(
+            session_id="rev-sess",
+            last_message="1. Tighten\n\nVERDICT: CHANGES_REQUESTED",
+        )
+        dev_fix = _agent(session_id="dev-sess", last_message="fixed")
+
+        with patch.object(config, "DEV_AGENT", "claude"), \
+             patch.object(config, "REVIEW_AGENT", "claude"):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, issue),
+                run_agent=[review, dev_fix],
+                dirty_files=(),
+                push_branch=True,
+                head_shas=["aaa", "bbb"],
+            )
+
+        # Reviewer takes config; dev-fix takes pinned state.
+        self.assertEqual(mocks["run_agent"].call_count, 2)
+        self.assertEqual(mocks["run_agent"].call_args_list[0].args[0], "claude")
+        self.assertEqual(mocks["run_agent"].call_args_list[1].args[0], "codex")
+        self.assertEqual(
+            mocks["run_agent"].call_args_list[1].kwargs.get("resume_session_id"),
+            "dev-sess",
+        )
+
+    def test_legacy_codex_session_id_resumes_with_codex(self) -> None:
+        # Pinned state predates the rollout: only `codex_session_id`. Resume
+        # on human reply must stick with codex even when DEV_AGENT=claude.
+        gh = FakeGitHubClient()
+        issue = make_issue(23, label="implementing")
+        issue.comments.append(
+            FakeComment(id=1100, body="use sqlite", user=FakeUser("alice"))
+        )
+        gh.add_issue(issue)
+        gh.seed_state(
+            23,
+            awaiting_human=True,
+            last_action_comment_id=900,
+            codex_session_id="sess-legacy",
+            branch="orchestrator/issue-23",
+        )
+
+        with patch.object(config, "DEV_AGENT", "claude"):
+            mocks = self._run(
+                lambda: workflow._handle_implementing(gh, issue),
+                run_agent=_agent(session_id="sess-legacy", last_message="ok"),
+                has_new_commits=[True],
+                dirty_files=(),
+                push_branch=True,
+            )
+
+        self.assertEqual(mocks["run_agent"].call_args.args[0], "codex")
+        self.assertEqual(
+            mocks["run_agent"].call_args.kwargs.get("resume_session_id"),
+            "sess-legacy",
+        )
+        # No proactive migration: legacy key stays put, no new keys written
+        # by a resume (only fresh spawns write `dev_agent`/`dev_session_id`).
+        data = gh.pinned_data(23)
+        self.assertEqual(data.get("codex_session_id"), "sess-legacy")
+        self.assertNotIn("dev_agent", data)
+        self.assertNotIn("dev_session_id", data)
 
 
 if __name__ == "__main__":

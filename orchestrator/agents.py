@@ -1,9 +1,10 @@
-"""Spawn the local codex CLI as a subprocess.
+"""Spawn a local coding-agent CLI (codex or claude) as a subprocess.
 
-Codex's --json output emits JSONL events. We don't pin its event-shape
-contract; instead we walk the parsed JSON looking for any UUID-shaped value
-at common keys (session_id, conversation_id, ...). If the format drifts, the
-unit test on parse_session_id will fail loudly.
+Both backends emit JSONL events on stdout. We don't pin their event-shape
+contracts; instead `parse_session_id` walks the parsed JSON looking for any
+UUID-shaped value at common keys (session_id, conversation_id, ...). If a
+format drifts, the unit tests on parse_session_id and the claude
+last-message walker will fail loudly.
 """
 from __future__ import annotations
 
@@ -27,9 +28,15 @@ _UUID_RE = re.compile(
 _PRIORITY_KEYS = ("session_id", "conversation_id", "thread_id", "session", "id")
 
 # Strip GitHub credentials from the agent's environment. Issue/comment text is
-# untrusted and codex runs with sandbox bypass, so a prompt injection that
+# untrusted and the agent runs with sandbox bypass, so a prompt injection that
 # inherits these would let the agent push directly or call the API as us.
 # The orchestrator owns all GitHub writes; the agent must never see them.
+#
+# Scope is intentionally GitHub-only: the agent's own provider auth
+# (ANTHROPIC_API_KEY for claude, OpenAI keychain for codex, etc.) belongs to
+# the user's pre-existing CLI login on the host and MUST be left intact.
+# Do not add ANTHROPIC_API_KEY / OPENAI_API_KEY here "for symmetry" -- they
+# are how the agent talks to its own model and stripping them breaks the run.
 _FORBIDDEN_AGENT_ENV = frozenset({
     "GITHUB_TOKEN",
     "GH_TOKEN",
@@ -42,13 +49,18 @@ _FORBIDDEN_AGENT_ENV = frozenset({
 
 
 @dataclass
-class CodexResult:
+class AgentResult:
     session_id: Optional[str]
     last_message: str
     exit_code: int
     timed_out: bool
     stdout: str
     stderr: str
+
+
+# Transitional alias for one release so external imports (debugging scripts,
+# downstream tests) keep working while call sites migrate to AgentResult.
+CodexResult = AgentResult
 
 
 def _walk_for_uuid(obj: Any) -> Optional[str]:
@@ -88,14 +100,48 @@ def parse_session_id(jsonl_output: str) -> Optional[str]:
     return None
 
 
-def run_codex(
+def _agent_env(extra_env: Optional[dict[str, str]]) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _FORBIDDEN_AGENT_ENV}
+    # Stamp agent commits with the orchestrator's identity. Env vars take
+    # precedence over user.name/user.email from any config scope, so the
+    # host's git config is untouched and no per-worktree config is needed.
+    env["GIT_AUTHOR_NAME"] = config.AGENT_GIT_NAME
+    env["GIT_AUTHOR_EMAIL"] = config.AGENT_GIT_EMAIL
+    env["GIT_COMMITTER_NAME"] = config.AGENT_GIT_NAME
+    env["GIT_COMMITTER_EMAIL"] = config.AGENT_GIT_EMAIL
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def _run_subprocess(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> tuple[str, str, int, bool]:
+    timed_out = False
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(cwd), env=env,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.stdout, proc.stderr, proc.returncode, False
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stderr = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        return stdout, stderr, -1, timed_out
+
+
+def _run_codex(
     prompt: str,
     cwd: Path,
     *,
     resume_session_id: Optional[str] = None,
     extra_env: Optional[dict[str, str]] = None,
     timeout: Optional[int] = None,
-) -> CodexResult:
+) -> AgentResult:
     timeout = timeout or config.AGENT_TIMEOUT
     last_msg_path = cwd / ".codex-last-message.txt"
     if last_msg_path.exists():
@@ -112,35 +158,13 @@ def run_codex(
     else:
         cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
 
-    env = {k: v for k, v in os.environ.items() if k not in _FORBIDDEN_AGENT_ENV}
-    # Stamp agent commits with the orchestrator's identity. Env vars take
-    # precedence over user.name/user.email from any config scope, so the
-    # host's git config is untouched and no per-worktree config is needed.
-    env["GIT_AUTHOR_NAME"] = config.AGENT_GIT_NAME
-    env["GIT_AUTHOR_EMAIL"] = config.AGENT_GIT_EMAIL
-    env["GIT_COMMITTER_NAME"] = config.AGENT_GIT_NAME
-    env["GIT_COMMITTER_EMAIL"] = config.AGENT_GIT_EMAIL
-    if extra_env:
-        env.update(extra_env)
+    env = _agent_env(extra_env)
     log.info(
         "codex spawn: cwd=%s resume=%s timeout=%ss",
         cwd, bool(resume_session_id), timeout,
     )
 
-    timed_out = False
-    try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), env=env,
-            capture_output=True, text=True, timeout=timeout,
-        )
-        stdout = proc.stdout
-        stderr = proc.stderr
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired as e:
-        timed_out = True
-        stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        stderr = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
-        exit_code = -1
+    stdout, stderr, exit_code, timed_out = _run_subprocess(cmd, cwd, env, timeout)
 
     sid = resume_session_id or parse_session_id(stdout)
     last_msg = ""
@@ -150,11 +174,129 @@ def run_codex(
         except OSError:
             last_msg = ""
 
-    return CodexResult(
+    return AgentResult(
         session_id=sid,
         last_message=last_msg,
         exit_code=exit_code,
         timed_out=timed_out,
         stdout=stdout,
         stderr=stderr,
+    )
+
+
+def _claude_last_message(jsonl_output: str) -> str:
+    """Pull the final assistant text out of claude's stream-json output.
+
+    Prefers the terminal `{"type":"result", "result": "..."}` event, which is
+    the documented final-message channel. Falls back to the last `assistant`
+    or `message` event's text content for forward-compat with schema drift.
+    Returns "" on total absence; the question/timeout paths in workflow.py
+    already accept an empty last_message.
+    """
+    last_result: Optional[str] = None
+    last_assistant_text: Optional[str] = None
+    for line in jsonl_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        ev_type = obj.get("type")
+        if ev_type == "result":
+            res = obj.get("result")
+            if isinstance(res, str):
+                last_result = res
+        elif ev_type in ("assistant", "message"):
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+            content = msg.get("content")
+            if isinstance(content, list):
+                texts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            texts.append(text)
+                if texts:
+                    last_assistant_text = "".join(texts)
+            elif isinstance(content, str):
+                last_assistant_text = content
+    if last_result is not None:
+        return last_result
+    return last_assistant_text or ""
+
+
+def _run_claude(
+    prompt: str,
+    cwd: Path,
+    *,
+    resume_session_id: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
+    timeout: Optional[int] = None,
+) -> AgentResult:
+    timeout = timeout or config.AGENT_TIMEOUT
+
+    cmd = [
+        config.CLAUDE_BIN,
+        "-p",
+        "--dangerously-skip-permissions",
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+    ]
+    if resume_session_id:
+        cmd += ["--resume", resume_session_id]
+    cmd.append(prompt)
+
+    env = _agent_env(extra_env)
+    log.info(
+        "claude spawn: cwd=%s resume=%s timeout=%ss",
+        cwd, bool(resume_session_id), timeout,
+    )
+
+    stdout, stderr, exit_code, timed_out = _run_subprocess(cmd, cwd, env, timeout)
+
+    sid = resume_session_id or parse_session_id(stdout)
+    last_msg = _claude_last_message(stdout)
+
+    return AgentResult(
+        session_id=sid,
+        last_message=last_msg,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def run_agent(
+    backend: str,
+    prompt: str,
+    cwd: Path,
+    *,
+    resume_session_id: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
+    timeout: Optional[int] = None,
+) -> AgentResult:
+    """Dispatch to the per-backend runner. Config validates `backend` at
+    import time, but we re-check here so a misuse from non-config call sites
+    fails loudly instead of silently no-opping.
+    """
+    if backend == "codex":
+        runner = _run_codex
+    elif backend == "claude":
+        runner = _run_claude
+    else:
+        raise ValueError(
+            f"unknown agent backend {backend!r}; expected 'codex' or 'claude'"
+        )
+    return runner(
+        prompt,
+        cwd,
+        resume_session_id=resume_session_id,
+        extra_env=extra_env,
+        timeout=timeout,
     )

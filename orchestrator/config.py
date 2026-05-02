@@ -110,10 +110,26 @@ HITL_MENTIONS: str = " ".join(f"@{handle}" for handle in HITL_HANDLES)
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 CLAUDE_BIN: str = os.environ.get("CLAUDE_BIN", "claude")
 
-# git identity injected into each codex spawn via GIT_AUTHOR_*/GIT_COMMITTER_*
-# env vars (see agents.run_codex). Env vars take precedence over user.name and
-# user.email from any config scope, so agent commits are attributable to the
-# orchestrator without touching the host's git config or the shared repo
+
+def _parse_backend(name: str, value: str) -> str:
+    v = (value or "").strip().lower()
+    if v not in ("codex", "claude"):
+        raise SystemExit(
+            f"orchestrator: {name}={value!r} is invalid; "
+            "expected 'codex' or 'claude'"
+        )
+    return v
+
+
+# Default split: claude implements, codex reviews. Validated at import so a
+# typo in the deployment env aborts the process before the first GitHub call.
+DEV_AGENT: str = _parse_backend("DEV_AGENT", os.environ.get("DEV_AGENT", "claude"))
+REVIEW_AGENT: str = _parse_backend("REVIEW_AGENT", os.environ.get("REVIEW_AGENT", "codex"))
+
+# git identity injected into each agent spawn via GIT_AUTHOR_*/GIT_COMMITTER_*
+# env vars (see agents._agent_env). Env vars take precedence over user.name
+# and user.email from any config scope, so agent commits are attributable to
+# the orchestrator without touching the host's git config or the shared repo
 # config. The default email uses the GitHub-recognized noreply form so it
 # won't bounce and won't link to a real user account.
 AGENT_GIT_NAME: str = os.environ.get("AGENT_GIT_NAME", "agent-orchestrator")

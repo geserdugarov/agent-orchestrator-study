@@ -70,6 +70,55 @@ class AgentGitIdentityConfigTest(unittest.TestCase):
         self.assertEqual(config.AGENT_GIT_EMAIL, "bot@example.com")
 
 
+class AgentBackendConfigTest(unittest.TestCase):
+    """`DEV_AGENT` / `REVIEW_AGENT` are validated at import time so a typo
+    aborts the process before the polling loop spins up."""
+
+    def _load_config(self, env: dict[str, str] | None = None):
+        full_env = {
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+        }
+        if env:
+            full_env.update(env)
+        with patch.dict(os.environ, full_env, clear=True):
+            sys.modules.pop("orchestrator.config", None)
+            import orchestrator.config as config
+
+            return config
+
+    def test_defaults_split_claude_dev_codex_review(self) -> None:
+        config = self._load_config()
+        self.assertEqual(config.DEV_AGENT, "claude")
+        self.assertEqual(config.REVIEW_AGENT, "codex")
+
+    def test_env_overrides_invert_split(self) -> None:
+        config = self._load_config({
+            "DEV_AGENT": "codex",
+            "REVIEW_AGENT": "claude",
+        })
+        self.assertEqual(config.DEV_AGENT, "codex")
+        self.assertEqual(config.REVIEW_AGENT, "claude")
+
+    def test_case_and_whitespace_tolerated(self) -> None:
+        config = self._load_config({
+            "DEV_AGENT": "  CODEX ",
+            "REVIEW_AGENT": "Claude",
+        })
+        self.assertEqual(config.DEV_AGENT, "codex")
+        self.assertEqual(config.REVIEW_AGENT, "claude")
+
+    def test_invalid_dev_agent_aborts_at_import(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"DEV_AGENT": "gemini"})
+        self.assertIn("DEV_AGENT", str(cm.exception))
+        self.assertIn("gemini", str(cm.exception))
+
+    def test_invalid_review_agent_aborts_at_import(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REVIEW_AGENT": "qwen"})
+        self.assertIn("REVIEW_AGENT", str(cm.exception))
+
+
 class MaxRetriesPerDayConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {

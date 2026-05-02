@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 from github.Issue import Issue
 
 from . import config
-from .agents import CodexResult, run_codex
+from .agents import AgentResult, run_agent
 from .github import GitHubClient, PinnedState
 
 log = logging.getLogger(__name__)
@@ -41,6 +41,24 @@ _VERDICT_RE = re.compile(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _read_dev_session(state: PinnedState) -> Tuple[str, Optional[str]]:
+    """Return (dev_agent, dev_session_id) for an issue.
+
+    Prefers the new `dev_agent`/`dev_session_id` keys. Falls back to the
+    legacy `codex_session_id` (which is always codex by definition) so
+    in-flight issues written before the configurable-backend rollout keep
+    using codex even if `DEV_AGENT` flips to claude on the next restart.
+    Returns (config.DEV_AGENT, None) when the issue has never been spawned.
+    """
+    if state.get("dev_agent"):
+        sid = state.get("dev_session_id")
+        return str(state.get("dev_agent")), str(sid) if sid is not None else None
+    legacy = state.get("codex_session_id")
+    if legacy is not None:
+        return "codex", str(legacy)
+    return config.DEV_AGENT, None
 
 
 def _branch_name(issue_number: int) -> str:
@@ -418,10 +436,14 @@ def _check_and_increment_retry_budget(
 
 def _resume_developer_on_human_reply(
     gh: GitHubClient, issue: Issue, state: PinnedState
-) -> Optional[Tuple[Path, CodexResult]]:
-    """Resume the developer's codex session with new human comments.
+) -> Optional[Tuple[Path, AgentResult]]:
+    """Resume the developer's agent session with new human comments.
 
-    Returns (worktree, codex_result) on resume, or None if there are no new
+    The backend is locked to whatever wrote `dev_session_id` (or the legacy
+    `codex_session_id`) for this issue -- resuming across backends would need
+    an inter-backend session bridge that does not exist.
+
+    Returns (worktree, agent_result) on resume, or None if there are no new
     comments since the last park (caller should return without writing state).
     """
     last_action_id = state.get("last_action_comment_id")
@@ -435,9 +457,8 @@ def _resume_developer_on_human_reply(
     wt = _worktree_path(issue.number)
     if not wt.exists():
         wt = _ensure_worktree(issue.number)
-    result = run_codex(
-        followup, wt, resume_session_id=state.get("codex_session_id")
-    )
+    dev_agent, dev_sid = _read_dev_session(state)
+    result = run_agent(dev_agent, followup, wt, resume_session_id=dev_sid)
     state.set("awaiting_human", False)
     return wt, result
 
@@ -453,14 +474,15 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
     else:
         wt = _ensure_worktree(issue.number)
         if _has_new_commits(wt):
-            # Recovered worktree: codex already committed on a previous tick;
-            # skip a fresh run and go straight to push to save tokens.
+            # Recovered worktree: the dev agent already committed on a
+            # previous tick; skip a fresh run and go straight to push.
             log.info(
-                "issue=#%d skipping codex; worktree already has commits",
+                "issue=#%d skipping agent; worktree already has commits",
                 issue.number,
             )
-            result = CodexResult(
-                session_id=state.get("codex_session_id"),
+            _, dev_sid = _read_dev_session(state)
+            result = AgentResult(
+                session_id=dev_sid,
                 last_message="(orchestrator restart: pushing previously committed work)",
                 exit_code=0,
                 timed_out=False,
@@ -471,10 +493,12 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
             if not _check_and_increment_retry_budget(gh, issue, state):
                 gh.write_pinned_state(issue, state)
                 return
+            dev_agent, _ = _read_dev_session(state)
             prompt = _build_implement_prompt(issue, _recent_comments_text(issue))
-            result = run_codex(prompt, wt)
+            result = run_agent(dev_agent, prompt, wt)
             if result.session_id:
-                state.set("codex_session_id", result.session_id)
+                state.set("dev_agent", dev_agent)
+                state.set("dev_session_id", result.session_id)
         state.set("branch", _branch_name(issue.number))
 
     state.set("last_agent_action_at", _now_iso())
@@ -509,10 +533,10 @@ def _handle_dev_fix_result(
     issue: Issue,
     state: PinnedState,
     wt: Path,
-    result: CodexResult,
+    result: AgentResult,
     before_sha: str,
 ) -> bool:
-    """Post-codex handling for a dev fix during validating.
+    """Post-agent handling for a dev fix during validating.
 
     Returns True if a fix was committed, pushed, and the loop should re-review
     on the next tick. Returns False if the run produced no fix (timeout,
@@ -587,7 +611,10 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
 
     wt = _ensure_worktree(issue.number)
     review_prompt = _build_review_prompt(issue, _recent_comments_text(issue))
-    review = run_codex(review_prompt, wt, timeout=config.REVIEW_TIMEOUT)
+    review = run_agent(
+        config.REVIEW_AGENT, review_prompt, wt, timeout=config.REVIEW_TIMEOUT
+    )
+    state.set("review_agent", config.REVIEW_AGENT)
     if review.session_id:
         state.set("last_review_session_id", review.session_id)
     state.set("last_review_at", _now_iso())
@@ -647,8 +674,9 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
 
     fix_prompt = _build_fix_prompt(feedback)
     before_sha = _head_sha(wt)
-    dev_result = run_codex(
-        fix_prompt, wt, resume_session_id=state.get("codex_session_id")
+    dev_agent, dev_sid = _read_dev_session(state)
+    dev_result = run_agent(
+        dev_agent, fix_prompt, wt, resume_session_id=dev_sid
     )
     state.set("last_agent_action_at", _now_iso())
 
@@ -661,7 +689,7 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
 
 
 def _on_commits(
-    gh: GitHubClient, issue: Issue, state: PinnedState, result: CodexResult
+    gh: GitHubClient, issue: Issue, state: PinnedState, result: AgentResult
 ) -> None:
     wt = _worktree_path(issue.number)
     branch = _branch_name(issue.number)
@@ -680,10 +708,11 @@ def _on_commits(
     pr = gh.find_open_pr(branch=branch, base=config.BASE_BRANCH)
     if pr is None:
         title = f"#{issue.number}: {issue.title}"
+        dev_agent, dev_sid = _read_dev_session(state)
         body_parts = [
             f"Resolves #{issue.number}",
             "",
-            f"Generated by orchestrator (codex session `{state.get('codex_session_id', '?')}`).",
+            f"Generated by orchestrator ({dev_agent} session `{dev_sid or '?'}`).",
         ]
         if result.last_message.strip():
             body_parts += ["", "---", "_Last agent message:_", "", result.last_message[:2000]]
@@ -706,7 +735,7 @@ def _on_commits(
 
 
 def _on_question(
-    gh: GitHubClient, issue: Issue, state: PinnedState, result: CodexResult
+    gh: GitHubClient, issue: Issue, state: PinnedState, result: AgentResult
 ) -> None:
     raw = result.last_message.strip()
     question = raw or "(agent did not produce a final message)"
@@ -725,10 +754,10 @@ def _on_dirty_worktree(
     gh: GitHubClient,
     issue: Issue,
     state: PinnedState,
-    result: CodexResult,
+    result: AgentResult,
     dirty: list[str],
 ) -> None:
-    """Park instead of pushing when codex left uncommitted changes.
+    """Park instead of pushing when the agent left uncommitted changes.
 
     Pushing here would publish a branch that omits the dirty files, so the PR
     would not match what the agent actually produced. We surface the situation
