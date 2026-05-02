@@ -1,6 +1,6 @@
 # Agent Orchestrator MVP — Implementation Plan
 
-## Status as of 2026-04-26
+## Status as of 2026-05-03
 
 **v0 self-bootstrap path is shipped.** The scaffold, polling loop, codex invocation, hardened push, PR open, and the (no label → `implementing` → `validating` → `in_review`) state machine all exist on `main` (commits `eb87246` … `06c7ea2`, plus the codex-review cycle). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against the bootstrap test issue.
 
