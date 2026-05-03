@@ -1,6 +1,6 @@
 # Architecture of the Current Implementation
 
-Single-process **polling orchestrator** that drives GitHub issues through a label-based state machine, delegating the actual coding work to a configurable coding-agent CLI (`codex` or `claude`) running as a subprocess in isolated git worktrees. The dev/review backends are picked independently via `DEV_AGENT` / `REVIEW_AGENT` (default: claude implements, codex reviews) and validated at config load.
+Single-process **polling orchestrator** that drives GitHub issues through a label-based state machine, delegating the actual coding work to a configurable coding-agent CLI (`codex` or `claude`) running as a subprocess in isolated git worktrees. The dev/review backends are picked independently via `DEV_AGENT` / `REVIEW_AGENT` (default: claude implements, codex reviews) and validated at config load. Once the reviewer approves and the PR is mergeable with green CI, the orchestrator can merge it itself (gated by `AUTO_MERGE`, default off) and close the issue with `done`; PRs closed without merge land on `rejected`.
 
 ## Top-level layout
 
@@ -26,12 +26,14 @@ The coding agent runs as a **transient child subprocess**, not a daemon — spaw
 
 ## Per-tick flow (`workflow.tick`)
 
-For every open non-PR issue:
+Each tick, `gh.list_pollable_issues()` yields all open non-PR issues plus closed non-PR issues still labeled `in_review`. The closed-`in_review` sweep is what makes the manual-merge path land cleanly: a human-merged PR with a `Resolves #N` footer auto-closes issue N before the orchestrator can flip the label, and without the sweep `_handle_in_review` would never run on it.
+
+For every yielded issue:
 
 1. Read its workflow label (one of `decomposing/ready/blocked/implementing/validating/in_review/done/rejected`).
-2. Dispatch by label. v0 implements only the unlabeled → `implementing` → `validating` → `in_review` happy path; other labels are logged and skipped.
+2. Dispatch by label. Currently implements the unlabeled → `implementing` → `validating` → `in_review` → `done`/`rejected` lifecycle; `decomposing` / `ready` / `blocked` are logged and skipped.
 
-Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!--orchestrator-state {...json...}-->`), holding `dev_agent` + `dev_session_id` (the backend that handled this issue and its session), `review_agent`, `branch`, `pr_number`, `review_round`, `retry_window_start` + `retry_count` (per-issue 24h fresh-spawn budget), `awaiting_human`, `last_action_comment_id`, etc. (`github.py:99`). The legacy `codex_session_id` key written before the configurable-backend rollout is still honored on read and treated as codex.
+Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!--orchestrator-state {...json...}-->`), holding `dev_agent` + `dev_session_id` (the backend that handled this issue and its session), `review_agent`, `branch`, `pr_number`, `review_round`, `retry_window_start` + `retry_count` (per-issue 24h fresh-spawn budget), `awaiting_human`, `last_action_comment_id`, `pr_last_comment_id` (in_review high-watermark across the issue thread + PR conversation comments, which share the IssueComment id space; seeded at validating → in_review handoff so the orchestrator's own automated comments don't replay as fresh feedback, and bumped past any park comment so an HITL ping doesn't replay either), `pr_last_review_comment_id` (separate watermark for inline PR review comments, which live in their own id space), `agent_approved_sha` (the head SHA the reviewer agent OK'd; `_handle_in_review` keys AUTO_MERGE on this since the agent posts an issue comment, not a real PR review), `merged_at` / `closed_without_merge_at` (terminal stamps), etc. (`github.py:99`). The legacy `codex_session_id` key written before the configurable-backend rollout is still honored on read and treated as codex.
 
 ## Stage handlers
 
@@ -69,8 +71,22 @@ Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!
      - `changes_requested` → post the feedback to the PR, then **resume the developer's session** on its locked backend with the fix prompt; if it produces a new commit on a clean tree, push and increment `review_round` for next tick.
 - **Output**: label moved to `in_review` (approval) OR a new fix commit + bumped round OR a HITL park.
 
-### `_handle_in_review`
-No-op in v0 — humans own the PR after the reviewer approves.
+### `_handle_in_review` (label `in_review`)
+- **Trigger**: each tick while label is `in_review` (set by `_handle_validating` after `VERDICT: APPROVED`). Also runs on closed-`in_review` issues yielded by the closed-issue sweep, so an external manual merge gets finalized to `done` even when `Resolves #N` already closed the issue.
+- **Input**: pinned `pr_number`, `branch`, `dev_agent`/`dev_session_id` (or legacy `codex_session_id`), and two watermarks: `pr_last_comment_id` (issue thread + PR conversation, shared IssueComment id space; falls back to `last_action_comment_id` for back-compat) and `pr_last_review_comment_id` (separate id space for inline review comments).
+- **Internal flow**:
+  1. If `pr_number` is missing (manual relabel suspected), park awaiting human and return; subsequent ticks no-op until the human relabels.
+  2. Read the PR via `gh.get_pr`. Branch on `gh.pr_state(pr)`:
+     - `merged` → set label `done`, stamp `merged_at`, write pinned state, then `issue.edit(state="closed")`. (Pinned-state write before close so PyGithub caching cannot serve a stale issue body to the writer.)
+     - `closed` (without merge) → set label `rejected`, stamp `closed_without_merge_at`, write state, close.
+     - `open` → fall through.
+  3. **PR-comment debounce → dev resume → bounce back to validating.** Read three sources independently: `gh.comments_after(issue, pr_last_comment_id)` (issue thread), `gh.pr_conversation_comments_after(pr, pr_last_comment_id)` (PR conversation; shares id space with the issue thread, so one watermark suffices), `gh.pr_inline_comments_after(pr, pr_last_review_comment_id)` (inline review comments, separate id space). If any are newer than their watermark and the most recent one is older than `IN_REVIEW_DEBOUNCE_SECONDS` (default 600s, matches `docs/workflow.md:142`), build a follow-up prompt that quotes them and call `_resume_dev_with_text` on the dev's locked backend. On a successful pushed commit (clean tree + push ok), bump each watermark to the newest seen in its own id space, reset `review_round=0`, and flip the label back to `validating` so the reviewer agent re-runs on the new diff next tick. If still inside the debounce window, return — the human may still be typing.
+  4. **Auto-merge gate** (only reached when there are no new comments to act on). Off unless `AUTO_MERGE=on`. Sequence: approval check (either `agent_approved_sha == pr.head.sha`, snapshotted by validating when the reviewer agent emitted `VERDICT: APPROVED`, OR `gh.pr_is_approved(pr, head_sha=pr.head.sha)` — only counts human/bot reviews submitted on the *current* head SHA, so a stale APPROVED from before a later push does not unlock auto-merge); `pr_is_mergeable` (`None` means GitHub still computing — try next tick; `False` parks awaiting human for branch-protection / conflict / out-of-date base); `pr_combined_check_state` (`success` proceeds; `pending` waits; `failure`/`none` parks awaiting human — `none` means no checks at all, ambiguous). Finally `gh.merge_pr(pr, sha=pr.head.sha)` — SHA-pinned so a commit landing between our checks and the merge cannot slip through unreviewed; PyGithub's 405/409/422 are returned as `False` and the next tick retries.
+  5. On a successful merge, set label `done`, stamp `merged_at`, write pinned state, close the issue.
+  6. Every park inside this handler bumps the in_review watermarks past the orchestrator's own park comment via `_bump_in_review_watermarks`, so the next tick does not see the HITL ping as fresh PR feedback and resume the dev agent against it.
+- **Output**: label moved to `done` / `rejected` (terminal) OR a fix push and label bounce to `validating` OR a HITL park OR a no-op tick.
+
+The "back to validating on a new PR comment" arc is intentional: validating is the stage that re-runs the reviewer after a fix is pushed. Staying in `in_review` would skip the automated re-review and rely on humans alone, contradicting the validating loop. `_park_awaiting_human` posts on the issue (not the PR) so the HITL ping appears alongside the rest of orchestrator state. The PR comment that triggers a resume is the human signal; awaiting-human is reserved for *unrecoverable* states (not mergeable / failed checks / push fail / missing pr_number).
 
 ## Agent subprocess (`agents.run_agent`)
 
@@ -154,7 +170,21 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │                       │       UNKNOWN ─► park                 │    │
    │                       └─ round ≥ MAX_REVIEW_ROUNDS ─► park    │    │
    │                                                                │    │
-   │     in_review ──► no-op (human owns the PR)                   │    │
+   │     in_review ──► _handle_in_review                           │    │
+   │                       │                                       │    │
+   │                       ├─ pr merged externally ─► label=done,  │    │
+   │                       │     stamp merged_at, close issue      │    │
+   │                       ├─ pr closed unmerged ─► label=rejected,│    │
+   │                       │     stamp closed_without_merge_at,    │    │
+   │                       │     close issue                       │    │
+   │                       ├─ new PR/issue comment past debounce:  │    │
+   │                       │     resume dev (locked backend) ──────┘    │
+   │                       │     push, ++pr_last_comment_id,            │
+   │                       │     label=validating, review_round=0       │
+   │                       └─ AUTO_MERGE on, approved, mergeable,       │
+   │                           green checks ─► merge_pr (sha pin),      │
+   │                           label=done, close                        │
+   │                          unmergeable / failed checks ─► park       │
    │                                                                │    │
    │   awaiting_human + new comment ─► resume dev (locked backend) ─┘    │
    │                                                                     │
@@ -194,17 +224,24 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
 | **config.py** | env + token loading (token kept outside REPO_ROOT), backend validation |
 | **codex / claude** | the only things that write code; run in isolated worktree |
 
-### State transition (label lifecycle, v0)
+### State transition (label lifecycle)
 
 ```
-   (none) ──► implementing ──► validating ──► in_review
-                  ▲                │
-                  │   CHANGES_     │
-                  └── REQUESTED ───┘   (until APPROVED or MAX_REVIEW_ROUNDS)
+   (none) ──► implementing ──► validating ──► in_review ──► done | rejected
+                  ▲                │              ▲ │
+                  │   CHANGES_     │              │ │  PR comment past
+                  └── REQUESTED ───┘              │ │  debounce ─► resume
+                  (APPROVED or MAX_REVIEW_ROUNDS) │ │  dev, push, label
+                                                  └─┘  back to validating
+
+   in_review terminals:
+     pr merged (externally or by AUTO_MERGE) ─► done   (issue closed)
+     pr closed without merge                  ─► rejected (issue closed)
 
    any stage ──► [park: awaiting_human=true]  (timeout, dirty tree,
                        │                       question, push fail,
                        │                       unknown verdict, max rounds,
-                       ▼                       retry budget exhausted)
+                       │                       retry budget exhausted,
+                       ▼                       not mergeable, failed checks)
                  wait for new human comment ──► resume dev (locked backend)
 ```
