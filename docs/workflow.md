@@ -1,159 +1,159 @@
-# Оркестратор
+# Orchestrator
 
-У нас есть репозиторий для оркестратора на GitHub.
+We have a repository for the orchestrator on GitHub.
 
-Составные части оркестратора:
+Components of the orchestrator:
 
-1. Issue tracker - откуда-то нужно брать задачи для реализации
-2. Где будет крутиться агент
+1. Issue tracker — we need a source of tasks to implement
+2. Where the agent will run
 
-# Выбор issue tracker
+# Choice of issue tracker
 
-Что хотелось бы:
-1. Выстроить асинхронную работу команды через Telegram-чат и GitHub Issues
-2. Как можно скорее начать делать оркестратор через него же самого (как раскрутка компилятора).
+What we want:
+1. Build asynchronous team work via a Telegram chat and GitHub Issues
+2. Start building the orchestrator through itself as soon as possible (like compiler bootstrapping).
 
-Из этого следует, что в качестве таск-трекера для оркестратора стоит взять GitHub Issues.
+It follows that we should use GitHub Issues as the task tracker for the orchestrator.
 
-Будем стараться оркестратор делать stateless, с минимумом данных во внутренней БД. Пусть его данные хранятся на виду у пользователя
-в GitHub Issues. Это позволит наблюдать за работой оркестратора, понимать на каком этапе он сейчас находится.
+We will try to keep the orchestrator stateless, with a minimum of data in its internal DB. Let its data live in plain sight in
+GitHub Issues. This will let us observe the orchestrator's work and understand what stage it is currently in.
 
-## Альтернативы
+## Alternatives
 
 ### beads-rust
 
-Хорошее решение для внутренних подзадач оркестратора. Можем использовать комбинацию GitHub Issues для взаимодействия с человеком,
-а beads для коммуникации между суб-агентами внутри оркестратора. Пока что предлагаю точно начать с GitHub Issues. К нему тоже можно дать доступ агенту для создания своих служебных тасок.
+A good solution for the orchestrator's internal subtasks. We could use a combination of GitHub Issues for human interaction
+and beads for communication between sub-agents inside the orchestrator. For now I propose to definitely start with GitHub Issues. We can also give the agent access to it for creating its own service tasks.
 
-### Самописный issue-tracker, встроенный в оркестратор
+### A custom issue tracker built into the orchestrator
 
-Лишняя работа. У нас ограничено время (2 недели). Нужно срезать скоуп до самого необходимого. Лишнего не разрабатываем.
+Wasted effort. We have limited time (2 weeks). We need to cut scope to the bare minimum. We don't build anything extra.
 
 
-# Где будет крутиться агент
+# Where the agent will run
 
-В процессе разработки на машинах разработчиков.
-Целевое решение: задеплоить его на VPS, чтобы он работал как фоновый агент.
+During development — on the developers' machines.
+Target solution: deploy it to a VPS so it runs as a background agent.
 
-Точно понятно, что мы будем запускать агентов с флагом `--dangerously-skip-permissions` или подобным, потому что агент автономный и
-давать ему разрешения на каждый чих никто не будет. Нужно его изолировать, но пока не понятно как. В зависимости от развертывания есть
-следующие варианты:
+It is clear we will run agents with the `--dangerously-skip-permissions` flag or similar, because the agent is autonomous and
+nobody is going to grant it permissions for every little action. We need to isolate it, but it is not yet clear how. Depending on the deployment, the
+options are:
 
-1. Никак - например, на машине разработчика или на отдельной VPS
+1. No isolation — e.g. on the developer's machine or on a dedicated VPS
 2. Docker container
 3. Virtual machine
 
 # Human-in-the-loop
 
-Не будем стремиться к полной автономии агента. Лучше призвать человека, чем автономно сделать херню.
+We are not aiming for full agent autonomy. Better to summon a human than to autonomously do something stupid.
 
-Видение на данный момент: в случае неопределенности призвать человека через GitHub Issues через @mention.
+Current vision: in case of uncertainty, summon a human via GitHub Issues using an @mention.
 
-Ожидаем, что призывов должно быть не слишком много. Нужно настроить так, чтобы агент смог решать мелкие вопросы самостоятельно, но призывал человека в случае важных решений. Нужно определить эту грань.
+We expect that there should not be too many summons. We need to tune things so the agent can resolve small questions on its own but summons a human for important decisions. We need to find that boundary.
 
-# Флоу работы оркестратора
+# Orchestrator workflow
 
-Выбираем фиксированный флоу работы с обязательными этапами:
+We pick a fixed workflow with mandatory stages:
 
-1. Декомпозиция - есть HITL
-2. Имплементация - автономно
-3. Валидация - автономно
-4. Приёмка - есть HITL
+1. Decomposition — has HITL
+2. Implementation — autonomous
+3. Validation — autonomous
+4. Acceptance — has HITL
 
-Взаимодействие пользователя и оркестратора производится через GitHub Issues.
+User-orchestrator interaction happens through GitHub Issues.
 
-## Альтернативы 
+## Alternatives
 
-Динамический флоу. Добавить еще одного агента до выполнения задачи, который будет составлять план, выбирая нужные этапы.
-Например, он может добавить дополнительные этапы (архитектурная проработка, дизайн ревью) или убрать лишние этапы (исключить
-приемку для простых фиксов).
+A dynamic workflow. Add another agent ahead of task execution that builds a plan by selecting the needed stages.
+For example, it could add extra stages (architectural exploration, design review) or remove unnecessary stages (skip
+acceptance for trivial fixes).
 
-Кажется, что это избыточно для нашей задачи. Срок на проект ограничен. Сначала реализуем простое решение.
+That seems excessive for our task. The project deadline is tight. First we implement the simple solution.
 
-# Лейблы
+# Labels
 
-На issue должен быть максимум 1 лейбл. Это по сути статус задачи.
+An issue must have at most 1 label. It is essentially the task status.
 
-* нет лейбла - нужно начать декомпозировать
-* `decomposing` - вешать на задачи, находящиеся в процессе декомпозиции
-* `ready` - вешать на декомпозированные задачи, готовые к разработке
-* `blocked` - вешать на декомпозированные задачи, которые блокируются об другие задачи
-* `implementing` - вешать на задачи, которые находятся в работе у кодовых агентов
-* `validating` - вешать на задачи, проходящие автоматическую валидацию
-* `in_review` - вешать на задачи, по которым готов PR
-* `done` - финальный статус для выполненных задач, код по которым влит в `main` (+ issue должен быть закрыт)
-* `rejected` - статус для задачи, от которых отказались (+ issue должен быть закрыт)
+* no label — needs to start being decomposed
+* `decomposing` — applied to issues currently being decomposed
+* `ready` — applied to decomposed issues ready for development
+* `blocked` — applied to decomposed issues that are blocked by other tasks
+* `implementing` — applied to issues being worked on by code agents
+* `validating` — applied to issues going through automated validation
+* `in_review` — applied to issues for which a PR is ready
+* `done` — terminal status for completed issues whose code is merged into `main` (+ the issue must be closed)
+* `rejected` — status for issues that were declined (+ the issue must be closed)
 
-# Декомпозиция
+# Decomposition
 
-Оркестратор должен заметить появление нового открытого issue без лейблов, повесить лейбл `decomposing` и начать его декомпозировать.
+The orchestrator must notice that a new open issue without labels has appeared, attach the `decomposing` label, and start decomposing it.
 
-Оркестратор должен изучить контекст задачи в GitHub Issue и собрать недостающую информацию через общение в комментариях
-в Issue с человеком.
+The orchestrator must study the task context in the GitHub Issue and gather the missing information by interacting in the comments
+of the issue with a human.
 
-Когда собранной информации будет достаточно, бот может создать вложенные Issue для передачи их кодовым агентам на имплементацию.
+Once enough information has been collected, the bot can create nested issues to hand off to code agents for implementation.
 
-Если задача может быть реализована за 1 контекст агента, то подзадачи создавать не нужно. Текущий критерий, который оркестратор передаёт декомпозеру в промпте: если изменение затрагивает более ~5 файлов или требует более одного логического коммита — предложить разбить, иначе оставить как есть. Критерий несовершенный, но явный, и его легко подкрутить позже.
+If a task can be implemented within a single agent context, then no subtasks need to be created. The current criterion the orchestrator passes to the decomposer in the prompt is: if the change touches more than ~5 files or requires more than one logical commit — propose splitting; otherwise leave it as is. The criterion is imperfect but explicit, and easy to tune later.
 
-Декомпозер возвращает структурированный ответ — единый fenced JSON-блок `orchestrator-manifest` со схемой `decision: "single" | "split"`, опциональным списком `children` и опциональным `depends_on` (массив 0-индексов между детьми, без циклов и self-зависимостей, не более 10 детей). Парсер `_parse_manifest` отклоняет сломанные манифесты и переводит issue в `awaiting_human` для разбора.
+The decomposer returns a structured response — a single fenced JSON block `orchestrator-manifest` with schema `decision: "single" | "split"`, an optional `children` list, and an optional `depends_on` (an array of 0-indexed references between children, with no cycles or self-dependencies, no more than 10 children). The `_parse_manifest` parser rejects malformed manifests and moves the issue into `awaiting_human` for triage.
 
-**TODO:** уточнить критерии (порог по файлам, разделение по слоям) по мере накопления опыта.
+**TODO:** refine the criteria (file threshold, layer-based splitting) as we accumulate experience.
 
-Связанные задачи нужно слинковать друг с другом. На тех, что ожидают реализации других задач, нужно оставить лейбл `blocked`.
-На готовых к реализации задачах, не имеющих блокеров, вешать лейбл `ready`.
+Related tasks need to be linked to each other. Those waiting on other tasks must keep the `blocked` label.
+Tasks that are ready to implement and have no blockers get the `ready` label.
 
-# Имплементация
+# Implementation
 
-При начале имплементации бот должен снимать лейбл `ready` и ставить `implementing`. В комментарий написать, что начал работу.
+When implementation begins, the bot must remove the `ready` label and apply `implementing`. It posts a comment that it has started work.
 
-Просмотреть комментарии в issue. Если там уже есть в комментариях идентификаторы сессий, то вернуться в существующую сессию с контекстом. Прочитать новые комментарии в контекст.
+Review the comments in the issue. If session identifiers are already present in the comments, resume the existing session with its context. Read new comments into the context.
 
-Если есть созданный PR, то прочитать активные дискуссии из него.
+If a PR has already been created, read the active discussions from it.
 
-После завершения имплементации бот должен создать PR с изменениями. В issue оставить комментарий с идентификаторами сессий, чтобы
-можно было при необходимости вернуться в эти сессии с контекстом через `codex resume` или `claude resume`.
+After implementation finishes, the bot must create a PR with the changes. Leave a comment on the issue with the session identifiers so that
+we can return to those sessions with context if needed via `codex resume` or `claude resume`.
 
-После завершения работы нужно убрать лейбл `implementing` и поставить лейбл `validating`. Запушить изменения в ветку.
+After work finishes, remove the `implementing` label and apply the `validating` label. Push the changes to the branch.
 
-Возможно, на этом этапе будут работать несколько агентов параллельно и делать несколько решений задачи. Из них нужно выбрать одно лучшее
-решение, либо смерджить их вместе. В первой версии пусть будет 1 решение.
+Possibly at this stage several agents will work in parallel and produce several solutions for the task. We need to pick one best
+solution out of them, or merge them together. In the first version there will be 1 solution.
 
-# Валидация
+# Validation
 
-Создать новую, чистую сессию кодового агента. Изучить изменения и комментарии в issue.
-По возможности это должен быть другой кодовый агент, не тот же, который писал код. Он будет проверять написанный код на соответствие решаемой задаче. На вердикт `CHANGES_REQUESTED` оркестратор постит фидбек в PR, **резюмит сессию имплементатора (locked backend)** прямо в `validating` с фикс-промптом, пушит коммит и инкрементит `review_round` — issue остаётся в `validating` для следующего прогона ревьювера. Возврата в `ready` нет; `ready` зарезервирован для исходного перехода в имплементацию. После `MAX_REVIEW_ROUNDS` (по умолчанию 3) безуспешных раундов или неразобранного вердикта (`VERDICT:` маркер не найден) — park HITL.
+Create a fresh, clean code-agent session. Study the changes and comments in the issue.
+Where possible this should be a different code agent, not the same one that wrote the code. It will check the written code against the task at hand. On a `CHANGES_REQUESTED` verdict the orchestrator posts feedback into the PR, **resumes the implementer's session (locked backend)** right inside `validating` with a fix prompt, pushes a commit, and increments `review_round` — the issue stays in `validating` for the next reviewer pass. There is no return to `ready`; `ready` is reserved for the initial transition into implementation. After `MAX_REVIEW_ROUNDS` (default 3) unsuccessful rounds or a verdict that could not be parsed (no `VERDICT:` marker found) — park HITL.
 
-Выбор бэкенда (`codex` / `claude`) задаётся переменными окружения `DEV_AGENT` и `REVIEW_AGENT`; по умолчанию имплементирует claude, ревьюит codex.
+The backend choice (`codex` / `claude`) is set via the `DEV_AGENT` and `REVIEW_AGENT` environment variables; by default claude implements and codex reviews.
 
-Можем добавить архитектурное ревью - например, отсутствие больших файлов, которые можно разбить.
+We can add an architectural review — for example, flagging absence of large files that could be split.
 
-**TODO (не реализовано):** прогон тестов, линтеров и прочих проверок, специфичных для проекта, на этапе валидации. Сейчас `_handle_validating` спавнит только ревьювер-агента и больше ничего локально не проверяет; статус GitHub-чеков (`pr_combined_check_state`) консультируется уже позже, в авто-мердж-гейте `_handle_in_review` (под `AUTO_MERGE=on`), а не до перехода в `in_review`.
+**TODO (not implemented):** running tests, linters, and other project-specific checks at the validation stage. Currently `_handle_validating` only spawns the reviewer agent and runs no other local checks; the GitHub checks status (`pr_combined_check_state`) is consulted later, in the auto-merge gate of `_handle_in_review` (under `AUTO_MERGE=on`), not before the transition into `in_review`.
 
-PR на этом этапе уже создан (его открывает имплементатор перед переходом в `validating`). После одобрения ревьювером сменить лейбл на `in_review`.
+By this stage the PR has already been created (the implementer opens it before the transition to `validating`). After reviewer approval, change the label to `in_review`.
 
-# Приёмка (HITL)
+# Acceptance (HITL)
 
-На этом этапе ожидаем созданный PR в GitHub. Пользователь может давать обратную связь через комментарии к PR. Также возможно
-автоматическое ревью другими ботами (Code Rabbit). Оркестратор должен реагировать на комментарии и обновлять ветку
-(возвращаться в сессию имплементатора и фиксить).
+At this stage we expect a created PR on GitHub. The user can give feedback through PR comments. Automated review by other bots
+(Code Rabbit) is also possible. The orchestrator must react to comments and update the branch
+(resume the implementer's session and apply fixes).
 
-PR может прийти к двум терминалам — мердж (issue → `done`) или закрытие без мерджа (issue → `rejected`). Кто инициирует — зависит от настроек и присутствия человека:
+A PR can reach two terminals — merge (issue → `done`) or close without merge (issue → `rejected`). Who initiates depends on settings and human presence:
 
-* **мердж под `AUTO_MERGE=on`** (по умолчанию `off`) — оркестратор вливает PR сам, **без обязательного одобрения человеком**: достаточно одобрения ревьювер-агента (`agent_approved_sha == pr.head.sha`, снапшот делается в `_handle_validating` при вердикте `VERDICT: APPROVED`). Реальный `APPROVED`-review от человека/бота на *текущем* head SHA — отдельный, эквивалентный путь к одобрению; устаревшие APPROVED на старых коммитах не считаются. Гейты в порядке проверки: (0) **standing CHANGES_REQUESTED veto** — `gh.pr_has_changes_requested(pr, head_sha=head_sha)`: если у человека висит `CHANGES_REQUESTED`-ревью на этом коммите, мердж не происходит даже при `agent_approved_sha == head_sha`, mergeable PR и зелёных чеках (silent return до следующего тика, человек должен задизмиссить ревью или запушить фикс); (1) одобрение есть (см. выше); (2) `pr_is_mergeable` истинно; (3) combined CI status `success`. Не каждый незакрытый гейт паркуется: HITL-пинг постится только при `pr_is_mergeable=False` (branch protection / конфликты / устаревший base) и при `pr_combined_check_state` ∈ {`failure`, `none`}. Состояния «standing CHANGES_REQUESTED», «нет одобрения», `pr_is_mergeable=None` (GitHub ещё считает), `pending` чеки и сдвиг `head_sha` посреди тика — это просто silent return до следующего тика, без HITL. После успешного мерджа — лейбл `done`, штамп `merged_at`, issue закрывается.
-* **мердж под `AUTO_MERGE=off`** — оркестратор не мерджит сам и **никаких approval-гейтов не проверяет**: после обработки новых PR-комментариев `_handle_in_review` просто возвращает управление, не вызывая `gh.pr_is_approved` и не реагируя на `APPROVED`-ревью. Мердж делает человек (или внешний бот) руками через UI GitHub; следующий тик увидит `pr_state == merged` и переведёт issue в `done`. Если требование «N approvals» нужно — это обеспечивается **branch protection в GitHub**, а не оркестратором; сам по себе approve без нажатия Merge не двигает issue вперёд.
-* **reject — PR закрыт без мерджа** (человеком в UI, ботом, или CLI) — терминал: оркестратор видит `pr_state == closed`, ставит лейбл `rejected`, штамп `closed_without_merge_at`, и закрывает issue.
-* **reject — issue закрыт вручную при ещё открытом PR** — отдельный путь и важная оговорка: оркестратор ставит лейбл `rejected` и штамп `closed_without_merge_at`, но **PR остаётся открытым** (handler не вызывает `pr.edit(state="closed")` в этой ветке). Это hard-stop сигнал от человека — без этой ветки `AUTO_MERGE` мог бы влить PR поверх человеческого «нет», даже когда issue закрыт. Если PR тоже надо закрыть — это делает человек руками. Возврата на этап декомпозиции нет ни в одном reject-сценарии — если задачу нужно переоткрыть, создавайте новый issue.
+* **merge under `AUTO_MERGE=on`** (default `off`) — the orchestrator merges the PR itself, **without requiring human approval**: a reviewer-agent approval is enough (`agent_approved_sha == pr.head.sha`, the snapshot is taken in `_handle_validating` on a `VERDICT: APPROVED` verdict). A real `APPROVED` review from a human/bot on the *current* head SHA is a separate, equivalent path to approval; stale APPROVEDs on older commits do not count. Gates in evaluation order: (0) **standing CHANGES_REQUESTED veto** — `gh.pr_has_changes_requested(pr, head_sha=head_sha)`: if a human has a standing `CHANGES_REQUESTED` review on this commit, the merge does not happen even with `agent_approved_sha == head_sha`, a mergeable PR, and green checks (silent return until the next tick — the human must dismiss the review or push a fix); (1) approval is present (see above); (2) `pr_is_mergeable` is true; (3) combined CI status is `success`. Not every unmet gate parks: a HITL ping is posted only when `pr_is_mergeable=False` (branch protection / conflicts / out-of-date base) and when `pr_combined_check_state` ∈ {`failure`, `none`}. The states "standing CHANGES_REQUESTED", "no approval", `pr_is_mergeable=None` (GitHub is still computing it), `pending` checks, and a `head_sha` shift mid-tick are just silent returns until the next tick, with no HITL. After a successful merge — the `done` label, the `merged_at` stamp, and the issue is closed.
+* **merge under `AUTO_MERGE=off`** — the orchestrator does not merge itself and **does not check any approval gates**: after processing new PR comments, `_handle_in_review` simply returns control without calling `gh.pr_is_approved` or reacting to `APPROVED` reviews. The merge is performed by a human (or an external bot) by hand through the GitHub UI; the next tick will see `pr_state == merged` and move the issue to `done`. If "N approvals" are required — that is enforced by **GitHub branch protection**, not by the orchestrator; an approve on its own without pressing Merge does not move the issue forward.
+* **reject — PR closed without merge** (by a human in the UI, by a bot, or by CLI) — terminal: the orchestrator sees `pr_state == closed`, applies the `rejected` label, sets the `closed_without_merge_at` stamp, and closes the issue.
+* **reject — issue closed manually while the PR is still open** — a separate path and an important caveat: the orchestrator applies the `rejected` label and the `closed_without_merge_at` stamp, but **the PR stays open** (the handler does not call `pr.edit(state="closed")` in this branch). This is a hard-stop signal from the human — without this branch `AUTO_MERGE` could merge the PR over the human's "no" even when the issue is closed. If the PR also needs to be closed — the human does that by hand. There is no return to the decomposition stage in any reject scenario — if the task needs to be reopened, create a new issue.
 
-Фоновый процесс мониторит появление новых комментариев или ревью на PR. Источников четыре, но *high-watermark*-ов в pinned state три — по одному на каждое id-пространство в GitHub REST API: `pr_last_comment_id` обслуживает сразу issue thread *и* PR conversation comments (оба живут в общем IssueComment id space, поэтому одного watermark достаточно), `pr_last_review_comment_id` — inline review comments (PullRequestComment id space), `pr_last_review_summary_id` — тела PR-ревью в PullRequestReview id space; код пересылает имплементатору только bodies от `CHANGES_REQUESTED` и `COMMENTED`-ревью, **`APPROVED` исключаются как информационные** (фильтр в `gh.pr_reviews_after`), также отбрасываются пустые bodies, dismissed/pending. Если есть новые комментарии и с момента самого свежего из них прошло больше `IN_REVIEW_DEBOUNCE_SECONDS` (по умолчанию 600 с), оркестратор резюмит сессию имплементатора (тот же бэкенд, что писал код) с цитированием новых комментариев, пушит исправление и переводит issue обратно в `validating` (не в `ready`!) — там ревьювер прогонится повторно на новом diff. Если debounce ещё не истёк — ждём следующего тика, человек может ещё печатать.
+A background process monitors for new comments or reviews on the PR. There are four sources, but only three *high-watermarks* in pinned state — one per id namespace in the GitHub REST API: `pr_last_comment_id` covers both the issue thread *and* PR conversation comments (both live in the shared IssueComment id space, so a single watermark suffices), `pr_last_review_comment_id` — inline review comments (PullRequestComment id space), `pr_last_review_summary_id` — PR review bodies in the PullRequestReview id space; the code only forwards bodies from `CHANGES_REQUESTED` and `COMMENTED` reviews to the implementer, **`APPROVED` is excluded as informational** (filter in `gh.pr_reviews_after`); empty bodies and dismissed/pending reviews are also dropped. If there are new comments and more than `IN_REVIEW_DEBOUNCE_SECONDS` (default 600 s) has passed since the most recent of them, the orchestrator resumes the implementer's session (the same backend that wrote the code) with the new comments quoted, pushes a fix, and moves the issue back into `validating` (not `ready`!) — there the reviewer will run again on the new diff. If the debounce window has not yet elapsed — wait for the next tick, the human may still be typing.
 
-При вливании изменения в `main` агент должен пройтись по связанным задачам и при возможности обновить им статус с `blocked` до `ready`.
+When changes are merged into `main`, the agent should walk the related tasks and, where possible, update their status from `blocked` to `ready`.
 
-# Что оркестратору нужно для работы
+# What the orchestrator needs to operate
 
-1. API ключи / подписка к AI, точнее даже просто настроенные, готовые к вызову агенты (`codex` запускается и готов работать)
-2. GitHub API token
+1. API keys / subscriptions for AI, or more precisely just configured, ready-to-call agents (`codex` launches and is ready to work)
+2. A GitHub API token
 
-# Дальнейшие шаги
-1. Добавить этап документирования, чтобы агент поддерживал папку `docs/` в актуальном состоянии.
-2. Добавить несколько параллельных агентов для решения одной задачи, чтобы потом выбрать из них лучшее.
-3. Динамический флоу?
+# Next steps
+1. Add a documentation stage so the agent keeps the `docs/` folder up to date.
+2. Add several parallel agents working on the same task so we can pick the best of them afterwards.
+3. A dynamic workflow?
