@@ -125,6 +125,13 @@ def _parse_backend(name: str, value: str) -> str:
 # typo in the deployment env aborts the process before the first GitHub call.
 DEV_AGENT: str = _parse_backend("DEV_AGENT", os.environ.get("DEV_AGENT", "claude"))
 REVIEW_AGENT: str = _parse_backend("REVIEW_AGENT", os.environ.get("REVIEW_AGENT", "codex"))
+# Decomposer is a separate role from implementing/reviewing -- it reads the
+# issue and produces a structured manifest. Parsed at import time even when
+# DECOMPOSE=off so flipping the kill switch back on does not introduce a
+# fresh "that env var was always invalid" failure.
+DECOMPOSE_AGENT: str = _parse_backend(
+    "DECOMPOSE_AGENT", os.environ.get("DECOMPOSE_AGENT", "claude")
+)
 
 # git identity injected into each agent spawn via GIT_AUTHOR_*/GIT_COMMITTER_*
 # env vars (see agents._agent_env). Env vars take precedence over user.name
@@ -153,4 +160,12 @@ AUTO_MERGE: bool = os.environ.get("AUTO_MERGE", "off").strip().lower() in (
 # session in `in_review`. Matches the 10-minute target in docs/workflow.md.
 IN_REVIEW_DEBOUNCE_SECONDS: int = int(
     os.environ.get("IN_REVIEW_DEBOUNCE_SECONDS", "600")
+)
+
+# Kill switch for the entire `decomposing` stage. off -> revert to the
+# legacy "no label -> implementing" pickup, no children, no manifest. The
+# rollout safety valve so the user can disable decomposition if manifest
+# output proves unreliable, without redeploying old binaries.
+DECOMPOSE: bool = os.environ.get("DECOMPOSE", "on").strip().lower() in (
+    "1", "true", "on", "yes",
 )

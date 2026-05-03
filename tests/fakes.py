@@ -149,11 +149,17 @@ class FakeGitHubClient:
         self._pinned: dict[int, PinnedState] = {}
         self._comment_id = count(start=1000)
         self._pr_id = count(start=1)
+        # New issues created via `create_child_issue` get sequential numbers
+        # well above any number the test seeded so collisions are impossible.
+        self._next_issue_number = count(
+            start=max((i.number for i in self._issues.values()), default=0) + 100
+        )
         # Recorders for assertions.
         self.posted_comments: list[tuple[int, str]] = []
         self.posted_pr_comments: list[tuple[int, str]] = []
         self.label_history: list[tuple[int, Optional[str]]] = []
         self.opened_prs: list[FakePR] = []
+        self.created_child_issues: list[FakeIssue] = []
         self.write_state_calls: int = 0
         # Configurable: what find_open_pr returns (per-branch).
         self.existing_open_pr: dict[str, FakePR] = {}
@@ -215,6 +221,28 @@ class FakeGitHubClient:
         issue.comments.append(c)
         self.posted_comments.append((issue.number, body))
         return c
+
+    def get_issue(self, number: int) -> FakeIssue:
+        return self._issues[int(number)]
+
+    def create_child_issue(
+        self,
+        *,
+        title: str,
+        body: str,
+        parent_number: int,
+        labels: list[str],
+    ) -> FakeIssue:
+        full_body = f"{(body or '').rstrip()}\n\nParent: #{parent_number}"
+        child = FakeIssue(
+            number=next(self._next_issue_number),
+            title=title,
+            body=full_body,
+            labels=[FakeLabel(l) for l in labels],
+        )
+        self._issues[child.number] = child
+        self.created_child_issues.append(child)
+        return child
 
     def read_pinned_state(self, issue: FakeIssue) -> PinnedState:
         existing = self._pinned.get(issue.number)

@@ -140,6 +140,29 @@ class GitHubClient:
     def comment(self, issue: Issue, body: str) -> IssueComment:
         return issue.create_comment(body)
 
+    def get_issue(self, number: int) -> Issue:
+        return self.repo.get_issue(number)
+
+    def create_child_issue(
+        self,
+        *,
+        title: str,
+        body: str,
+        parent_number: int,
+        labels: list[str],
+    ) -> Issue:
+        """Create a sub-issue in the same repo, with a `Parent: #<n>` link.
+
+        Deliberately does NOT use a `Resolves #<parent>` keyword: GitHub
+        would auto-close the parent the moment the child PR merges (when
+        the parent has only this one open child reference), bypassing
+        `_handle_blocked`'s aggregation across siblings. A plain
+        `Parent: #<n>` line keeps the parent open until every child
+        resolves and `_handle_blocked` flips the parent to `ready`.
+        """
+        full_body = f"{(body or '').rstrip()}\n\nParent: #{parent_number}"
+        return self.repo.create_issue(title=title, body=full_body, labels=labels)
+
     def read_pinned_state(self, issue: Issue) -> PinnedState:
         for c in issue.get_comments():
             body = c.body or ""

@@ -118,6 +118,73 @@ class AgentBackendConfigTest(unittest.TestCase):
             self._load_config({"REVIEW_AGENT": "qwen"})
         self.assertIn("REVIEW_AGENT", str(cm.exception))
 
+    def test_default_decompose_agent_is_claude(self) -> None:
+        config = self._load_config()
+        self.assertEqual(config.DECOMPOSE_AGENT, "claude")
+
+    def test_decompose_agent_env_override(self) -> None:
+        config = self._load_config({"DECOMPOSE_AGENT": "codex"})
+        self.assertEqual(config.DECOMPOSE_AGENT, "codex")
+
+    def test_invalid_decompose_agent_aborts_at_import(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"DECOMPOSE_AGENT": "gemini"})
+        self.assertIn("DECOMPOSE_AGENT", str(cm.exception))
+
+    def test_decompose_agent_validated_even_when_decompose_off(self) -> None:
+        # Toggling DECOMPOSE back on later must not surface a fresh
+        # "that env var was always invalid" failure.
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({
+                "DECOMPOSE": "off",
+                "DECOMPOSE_AGENT": "gemini",
+            })
+        self.assertIn("DECOMPOSE_AGENT", str(cm.exception))
+
+
+class DecomposeKillSwitchConfigTest(unittest.TestCase):
+    """The DECOMPOSE kill switch defaults on; truthy spellings keep it on,
+    explicit off / typos disable it. Mirrors AUTO_MERGE's strict parser
+    semantics so a typo doesn't silently flip the user's intent.
+    """
+
+    def _load_config(self, env: dict[str, str] | None = None):
+        full_env = {
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+        }
+        if env:
+            full_env.update(env)
+        with patch.dict(os.environ, full_env, clear=True):
+            sys.modules.pop("orchestrator.config", None)
+            import orchestrator.config as config
+
+            return config
+
+    def test_default_is_on(self) -> None:
+        config = self._load_config()
+        self.assertTrue(config.DECOMPOSE)
+
+    def test_explicit_off(self) -> None:
+        config = self._load_config({"DECOMPOSE": "off"})
+        self.assertFalse(config.DECOMPOSE)
+
+    def test_truthy_spellings_keep_on(self) -> None:
+        for value in ("on", "ON", " on ", "1", "true", "True", "yes"):
+            with self.subTest(value=value):
+                config = self._load_config({"DECOMPOSE": value})
+                self.assertTrue(config.DECOMPOSE)
+
+    def test_falsy_spellings_disable(self) -> None:
+        for value in ("0", "false", "no", "off"):
+            with self.subTest(value=value):
+                config = self._load_config({"DECOMPOSE": value})
+                self.assertFalse(config.DECOMPOSE)
+
+    def test_typo_defaults_to_off(self) -> None:
+        # Strict parser: any unrecognized value disables decomposition.
+        config = self._load_config({"DECOMPOSE": "enabled"})
+        self.assertFalse(config.DECOMPOSE)
+
 
 class AutoMergeConfigTest(unittest.TestCase):
     """Default off; only an explicit truthy spelling flips it on. A typo

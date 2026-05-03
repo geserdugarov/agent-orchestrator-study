@@ -10,6 +10,7 @@ are observed and logged as not-yet-implemented.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -222,6 +223,61 @@ def _worktree_dirty_files(worktree: Path) -> list[str]:
     return paths
 
 
+# The decomposer needs a working directory to run `git ls-files` / `wc -l`
+# against, but it must never touch the implementer's per-issue branch. If
+# it shared `_worktree_path(issue)`, the local `orchestrator/issue-<n>`
+# branch would get anchored at whatever `origin/<base>` snapshot the
+# decomposer saw -- and a `split` decision parks the parent on `blocked`
+# for the duration of its children's lifecycle. By the time the parent
+# flips to `ready` and the implementer takes over, `origin/<base>` has
+# advanced (children's PRs merged), but `_ensure_worktree` would re-add
+# the worktree pointing at that stale branch and the implementer would
+# commit on the old base. A separate detached-HEAD checkout sidesteps the
+# problem entirely: the implementer's `_ensure_worktree` always sees a
+# fresh per-issue branch created from the current `origin/<base>`.
+def _decompose_worktree_path(issue_number: int) -> Path:
+    return config.WORKTREES_DIR / f"decompose-{issue_number}"
+
+
+def _ensure_decompose_worktree(issue_number: int) -> Path:
+    """Create the decomposer's worktree fresh from current origin/<base>.
+
+    Force-removes any existing decomposer worktree first; the decomposer
+    is read-only and stateless across runs, so we always want it to see
+    the current base, not whatever was left over from a prior run.
+    """
+    config.WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
+    wt = _decompose_worktree_path(issue_number)
+    if wt.exists():
+        _git("worktree", "remove", "--force", str(wt), cwd=config.REPO_ROOT)
+    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.REPO_ROOT)
+    result = _git(
+        "worktree", "add", "--detach", str(wt),
+        f"origin/{config.BASE_BRANCH}",
+        cwd=config.REPO_ROOT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {result.stderr}")
+    return wt
+
+
+def _cleanup_decompose_worktree(issue_number: int) -> None:
+    """Remove the decomposer's worktree if it exists.
+
+    Called at every `_handle_decomposing` exit except the dirty/commits
+    park (where the operator may want to inspect before resuming). Failures
+    are logged but never raised -- cleanup must not mask the real exit.
+    """
+    try:
+        wt = _decompose_worktree_path(issue_number)
+        if wt.exists():
+            _git("worktree", "remove", "--force", str(wt), cwd=config.REPO_ROOT)
+    except Exception:
+        log.exception(
+            "issue=#%d failed to clean up decomposer worktree", issue_number,
+        )
+
+
 def _push_branch(worktree: Path, branch: str) -> bool:
     """Push via GIT_ASKPASS so the token never appears in argv.
 
@@ -401,12 +457,20 @@ def _process_issue(gh: GitHubClient, issue: Issue) -> None:
     log.info("issue=#%s label=%r", issue.number, label)
     if label is None:
         _handle_pickup(gh, issue)
+    elif label == "decomposing":
+        _handle_decomposing(gh, issue)
+    elif label == "ready":
+        _handle_ready(gh, issue)
+    elif label == "blocked":
+        _handle_blocked(gh, issue)
     elif label == "implementing":
         _handle_implementing(gh, issue)
     elif label == "validating":
         _handle_validating(gh, issue)
     elif label == "in_review":
         _handle_in_review(gh, issue)
+    elif label in ("done", "rejected"):
+        return
     else:
         log.warning(
             "issue=#%s label=%r not implemented yet; leaving alone",
@@ -417,10 +481,27 @@ def _process_issue(gh: GitHubClient, issue: Issue) -> None:
 def _handle_pickup(gh: GitHubClient, issue: Issue) -> None:
     state = PinnedState()
     state.set("created_at", _now_iso())
+    if config.DECOMPOSE:
+        pickup = _post_issue_comment(
+            gh, issue, state,
+            ":robot: orchestrator picking this up; decomposing.",
+        )
+        # Anchor the validating-handoff seed-watermark on the exact pickup
+        # comment id (see legacy branch comment).
+        pickup_id = getattr(pickup, "id", None)
+        if pickup_id is not None:
+            state.set("pickup_comment_id", int(pickup_id))
+        gh.set_workflow_label(issue, "decomposing")
+        gh.write_pinned_state(issue, state)
+        _handle_decomposing(gh, issue)
+        return
+    # Legacy path with DECOMPOSE=off: skip decomposition entirely and route
+    # the unlabeled issue straight to implementing, exactly as the
+    # bootstrap-milestone code did.
     pickup = _post_issue_comment(
         gh, issue, state,
-        ":robot: orchestrator picking this up. Decomposition stage is not yet "
-        "wired; going straight to implementation.",
+        ":robot: orchestrator picking this up. Decomposition stage is "
+        "disabled; going straight to implementation.",
     )
     # Anchor the validating-handoff seed-watermark on the exact pickup
     # comment id. Without this, an issue that started under an older
@@ -435,6 +516,765 @@ def _handle_pickup(gh: GitHubClient, issue: Issue) -> None:
     gh.set_workflow_label(issue, "implementing")
     gh.write_pinned_state(issue, state)
     _handle_implementing(gh, issue)
+
+
+# Captures the JSON payload between a fenced ```orchestrator-manifest block.
+# We deliberately match everything up to the next ``` rather than trying to
+# bound braces in the regex itself: nested objects in the JSON body would
+# trip a `\{.*?\}` non-greedy match without rescuing well, while a fence
+# delimiter is a single token that the agent prompt forces it to emit.
+_MANIFEST_RE = re.compile(
+    r"```orchestrator-manifest\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+# Hard cap on children per parent. A buggy decomposer that emits 100 children
+# would otherwise create 100 GitHub issues before anyone notices. Configurable
+# later if needed; not surfaced as an env var initially.
+_MAX_CHILDREN = 10
+
+
+def _parse_manifest(
+    last_message: str,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Parse a fenced `orchestrator-manifest` block.
+
+    Returns `(manifest, error_reason)`:
+      * `(dict, None)` -- a valid manifest. `decision` is `"single"` or
+        `"split"`; for `"split"`, `children` is non-empty and each entry has
+        `title`/`body` and a structurally-valid `depends_on` index list.
+      * `(None, error)` -- a fence was present but the payload was invalid.
+        `error` is a short human-readable reason (used in the HITL park
+        message).
+      * `(None, None)` -- no fenced block at all. The caller treats this as
+        "agent ended without a manifest" and parks as a question.
+    """
+    if not last_message:
+        return None, None
+    matches = list(_MANIFEST_RE.finditer(last_message))
+    if not matches:
+        return None, None
+    # The decompose prompt mandates "EXACTLY ONE fenced JSON block ...
+    # and nothing else after it". `re.search` would silently accept the
+    # first fence and ignore the rest, so a decomposer that quotes a
+    # sample/template manifest before its real final answer would have
+    # the orchestrator act on the sample -- creating wrong child issues
+    # or routing the parent on a stale decision. Reject multiple fences
+    # and require the accepted one to be the final block (whitespace
+    # after the closing fence only).
+    if len(matches) > 1:
+        return None, (
+            f"expected exactly one orchestrator-manifest block, "
+            f"found {len(matches)}"
+        )
+    m = matches[0]
+    if last_message[m.end():].strip():
+        return None, (
+            "orchestrator-manifest must be the final block; "
+            "found content after the closing fence"
+        )
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        return None, f"invalid JSON: {e.msg}"
+    if not isinstance(data, dict):
+        return None, "manifest is not a JSON object"
+    decision = data.get("decision")
+    if decision not in ("single", "split"):
+        return None, "decision must be 'single' or 'split'"
+    if decision == "single":
+        return data, None
+    children = data.get("children")
+    if not isinstance(children, list) or not children:
+        return None, "split decision requires non-empty children list"
+    if len(children) > _MAX_CHILDREN:
+        return None, (
+            f"too many children ({len(children)} > {_MAX_CHILDREN})"
+        )
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict):
+            return None, f"child {idx} is not an object"
+        title = child.get("title")
+        body = child.get("body")
+        # Truthiness alone is not enough: `"body": 42` is truthy but
+        # would later blow up `create_child_issue` (which calls
+        # `body.rstrip()`) AFTER `expected_children_count` is persisted,
+        # forcing the half-finished-recovery path. Reject non-string
+        # values up front so the standard "invalid manifest" HITL/resume
+        # loop handles it cleanly.
+        if (
+            not isinstance(title, str) or not title
+            or not isinstance(body, str) or not body
+        ):
+            return None, f"child {idx} missing title or body"
+        # Treat missing key and explicit JSON null as "no dependencies"
+        # (same intent), but reject any other non-list value. The
+        # earlier `child.get("depends_on") or []` collapsed every
+        # falsy scalar (0, False, "") to [] before the list-type
+        # check, so a manifest like `{"depends_on": 0}` -- a clear
+        # malformed list -- was silently accepted as no-deps and the
+        # child activated out of dependency order.
+        deps = child.get("depends_on")
+        if deps is None:
+            deps = []
+        elif not isinstance(deps, list):
+            return None, f"child {idx} depends_on must be a list"
+        for d in deps:
+            if (
+                not isinstance(d, int)
+                or isinstance(d, bool)
+                or d < 0
+                or d >= len(children)
+                or d == idx
+            ):
+                return None, f"child {idx} has invalid dependency {d!r}"
+    if _has_dep_cycle(children):
+        return None, "dependency graph has a cycle"
+    return data, None
+
+
+def _has_dep_cycle(children: list[dict]) -> bool:
+    """DFS for back-edges in the children dep graph (white/gray/black)."""
+    n = len(children)
+    color = [0] * n  # 0=unvisited, 1=on-stack, 2=finished
+
+    def visit(u: int) -> bool:
+        color[u] = 1
+        for v in (children[u].get("depends_on") or []):
+            if color[v] == 1:
+                return True
+            if color[v] == 0 and visit(v):
+                return True
+        color[u] = 2
+        return False
+
+    for u in range(n):
+        if color[u] == 0 and visit(u):
+            return True
+    return False
+
+
+def _build_decompose_prompt(issue: Issue, comments_text: str) -> str:
+    body = issue.body or "(no body)"
+    convo = comments_text or "(no prior comments)"
+    return (
+        f"You are the decomposer for GitHub issue #{issue.number}: {issue.title!r}.\n\n"
+        f"Issue body:\n{body}\n\n"
+        f"Conversation so far:\n{convo}\n\n"
+        "Decide whether this issue can be implemented in ONE coding-agent "
+        "context window. If yes, return decision='single'. If no, propose a "
+        "list of smaller child issues each one-shottable on its own.\n\n"
+        "Sizing rule of thumb: if the change touches more than ~5 files or "
+        "needs more than one logical commit, propose splitting; otherwise "
+        "keep it as a single child. Use `git ls-files`, `wc -l`, or other "
+        "read-only commands to inspect the codebase. You MUST NOT commit, "
+        "push, or modify any file -- you are read-only.\n\n"
+        "If you genuinely need a clarification, end your message with a "
+        "question for the human and DO NOT emit a manifest. Otherwise, end "
+        "your final message with EXACTLY ONE fenced JSON block in this "
+        "format (and nothing else after it):\n\n"
+        "```orchestrator-manifest\n"
+        "{\n"
+        "  \"decision\": \"split\",\n"
+        "  \"rationale\": \"<<= 2 sentences why>\",\n"
+        "  \"children\": [\n"
+        "    {\"title\": \"...\", \"body\": \"...\", \"depends_on\": []}\n"
+        "  ]\n"
+        "}\n"
+        "```\n\n"
+        "The block must be valid JSON parseable by `json.loads`. The "
+        "`decision` value must be exactly the string `\"single\"` or "
+        "`\"split\"` (no other values, no union syntax). On `\"single\"`, "
+        "omit the `children` field entirely.\n\n"
+        "Rules for the children list (omit entirely on 'single'):\n"
+        f"- At most {_MAX_CHILDREN} children.\n"
+        "- `depends_on` is a list of 0-based indexes into THIS children "
+        "array (not GitHub issue numbers; the orchestrator allocates those).\n"
+        "- Self-dependencies and cycles are rejected.\n"
+        "- Each child must be small enough to implement in one context "
+        "(do not propose a child that itself needs decomposition)."
+    )
+
+
+def _read_decomposer_session(
+    state: PinnedState,
+) -> Tuple[str, Optional[str]]:
+    """Return (decomposer_agent, decomposer_session_id) for an issue.
+
+    Mirrors `_read_dev_session`: once `decomposer_agent` is written by a
+    fresh spawn, the backend is locked for any future resumes on this issue
+    so flipping `DECOMPOSE_AGENT` mid-flight cannot strand the session.
+    """
+    if state.get("decomposer_agent"):
+        sid = state.get("decomposer_session_id")
+        return (
+            str(state.get("decomposer_agent")),
+            str(sid) if sid is not None else None,
+        )
+    return config.DECOMPOSE_AGENT, None
+
+
+def _resume_decomposer_on_human_reply(
+    gh: GitHubClient, issue: Issue, state: PinnedState
+) -> Optional[AgentResult]:
+    """Resume the decomposer's locked-backend session with new comments.
+
+    Returns the agent result, or None if there are no new comments since
+    the last park (caller should return without writing state).
+
+    Mirrors `_resume_developer_on_human_reply` but on the decomposer
+    session. The backend is locked to whichever wrote
+    `decomposer_session_id`; resuming across backends would need an
+    inter-backend session bridge that does not exist.
+    """
+    last_action_id = state.get("last_action_comment_id")
+    new_comments = gh.comments_after(issue, last_action_id)
+    if not new_comments:
+        return None
+    consumed_max = max(c.id for c in new_comments)
+    state.set("last_action_comment_id", consumed_max)
+    followup = "\n\n".join(
+        f"@{c.user.login if c.user else 'user'}: {c.body}"
+        for c in new_comments if c.body
+    )
+    wt = _decompose_worktree_path(issue.number)
+    if not wt.exists():
+        wt = _ensure_decompose_worktree(issue.number)
+    decomposer_agent, decomposer_sid = _read_decomposer_session(state)
+    result = run_agent(
+        decomposer_agent, followup, wt, resume_session_id=decomposer_sid
+    )
+    state.set("awaiting_human", False)
+    return result
+
+
+def _handle_decomposing(gh: GitHubClient, issue: Issue) -> None:
+    state = gh.read_pinned_state(issue)
+
+    # Track whether to keep the decomposer worktree past this tick. Set
+    # True only in the dirty/commits park, where the operator may want to
+    # inspect what the agent did. Every other exit (success or park)
+    # cleans up via the finally below so the next consumer of this issue
+    # number starts from current `origin/<base>`.
+    keep_worktree = False
+    try:
+        # Half-finished decomposition recovery. Two persistent markers
+        # signal a prior tick crashed mid-split:
+        #   * `expected_children_count` is written BEFORE any child is
+        #     created, so a SIGKILL after `create_child_issue` returns
+        #     but before the parent records the new child number leaves
+        #     the parent with this marker AND zero recorded children
+        #     while an orphan child issue exists on GitHub. Re-running
+        #     the decomposer here would emit a different manifest and
+        #     create duplicate children alongside the orphan.
+        #   * `children` is written incrementally after each successful
+        #     create + parent-state flush. Its presence covers a crash
+        #     after at least one child was recorded.
+        # Either marker present without the parent label having flipped
+        # to `blocked` means we cannot safely respawn the decomposer.
+        # Branch by whether the recorded count matches expectations:
+        # equal -> finalize to `blocked`; less -> park awaiting human.
+        # Legacy state from a deploy that pre-dates
+        # `expected_children_count` still routes through the
+        # `children`-only branch and finalizes.
+        expected_raw = state.get("expected_children_count")
+        children_recorded = state.get("children") or []
+        if expected_raw is not None or children_recorded:
+            if state.get("awaiting_human"):
+                return
+            if expected_raw is not None and len(children_recorded) < int(
+                expected_raw
+            ):
+                _park_awaiting_human(
+                    gh, issue, state,
+                    f"{config.HITL_MENTIONS} decomposition crashed mid-way: "
+                    f"{len(children_recorded)} of {expected_raw} children "
+                    "recorded (an orphan child issue may exist on GitHub if "
+                    "the crash landed between `create_child_issue` returning "
+                    "and the parent state write); manual intervention needed "
+                    "(close any partial children and re-decompose, or finish "
+                    "creating the missing ones).",
+                )
+                gh.write_pinned_state(issue, state)
+                return
+            # Before finalizing to `blocked`, repair any child whose pinned
+            # state was never seeded. A SIGKILL between the parent's
+            # incremental `children` write and the child-state write at
+            # the LAST child satisfies `len(children) == expected_children_count`
+            # but leaves that child orphaned: no `parent_number`, and likely
+            # already parked with `awaiting_human=True` by a prior
+            # `_handle_blocked` tick that saw it as "unattributed blocked".
+            # Without repair, the parent's later walk flips the orphan to
+            # `ready`, but `_handle_implementing` reads the stale park and
+            # sits waiting for a human reply that never comes.
+            for child_number in children_recorded:
+                try:
+                    child_issue = gh.get_issue(int(child_number))
+                    child_state = gh.read_pinned_state(child_issue)
+                    if not child_state.get("parent_number"):
+                        child_state.set("parent_number", issue.number)
+                        if not child_state.get("created_at"):
+                            child_state.set("created_at", _now_iso())
+                        child_state.set("awaiting_human", False)
+                        child_state.set("park_reason", None)
+                        gh.write_pinned_state(child_issue, child_state)
+                except Exception:
+                    log.exception(
+                        "issue=#%s could not repair orphan child #%s during "
+                        "decomposition recovery", issue.number, child_number,
+                    )
+                    _park_awaiting_human(
+                        gh, issue, state,
+                        f"{config.HITL_MENTIONS} could not repair child "
+                        f"#{child_number} during decomposition recovery "
+                        "(seed `parent_number` on its pinned state); manual "
+                        "intervention needed (check orchestrator logs).",
+                    )
+                    gh.write_pinned_state(issue, state)
+                    return
+            gh.set_workflow_label(issue, "blocked")
+            gh.write_pinned_state(issue, state)
+            return
+
+        # DECOMPOSE kill-switch bailout. Every path below this point
+        # spawns the decomposer (fresh or via the awaiting_human
+        # resume), so an operator who restarts with DECOMPOSE=off after
+        # `_handle_pickup` already labeled the issue `decomposing` --
+        # or while it is parked there awaiting a human -- would still
+        # see the disabled rollout create manifests and child issues.
+        # Drop into the legacy implementing flow exactly as
+        # `_handle_pickup` does on a freshly unlabeled issue. The
+        # half-finished recovery above must keep running regardless of
+        # the flag: abandoning orphan children (already on GitHub)
+        # because new decompositions are now disabled would strand
+        # work, which is not what a kill switch should do.
+        if not config.DECOMPOSE:
+            _post_issue_comment(
+                gh, issue, state,
+                ":robot: decomposition is disabled; routing this issue "
+                "to implementation.",
+            )
+            # Clear decomposer-side park state. Without this,
+            # `_handle_implementing` reads `awaiting_human=True` and
+            # tries to resume a dev session that was never spawned --
+            # at best it stalls on `comments_after`, at worst the
+            # follow-up text becomes the sole prompt instead of the
+            # real implement prompt.
+            state.set("awaiting_human", False)
+            state.set("park_reason", None)
+            # Mark every comment visible at this transition as
+            # "already consumed", mirroring `_handle_ready`'s ratchet.
+            # `_handle_implementing` will read the full issue thread
+            # via `_recent_comments_text` when it builds the implement
+            # prompt, so the dev sees any decomposing-era human
+            # feedback at spawn. Without this bump, the
+            # validating->in_review watermark seed later sees those
+            # same comments as fresh PR feedback (because they sit
+            # AFTER the now-stale `last_action_comment_id` from the
+            # decomposer-era park) and bounces the dev unnecessarily.
+            # One-way ratchet so we never lower a higher prior value.
+            latest = gh.latest_comment_id(issue)
+            if isinstance(latest, int):
+                prior = state.get("last_action_comment_id")
+                if not isinstance(prior, int) or latest > prior:
+                    state.set("last_action_comment_id", latest)
+            gh.set_workflow_label(issue, "implementing")
+            gh.write_pinned_state(issue, state)
+            _handle_implementing(gh, issue)
+            return
+
+        if state.get("awaiting_human"):
+            result = _resume_decomposer_on_human_reply(gh, issue, state)
+            if result is None:
+                # No human reply yet. Keep the worktree intact -- if a
+                # prior tick parked on the dirty/commits reason, the
+                # HITL message explicitly asks the operator to inspect
+                # and reset it before resuming, and cleanup here would
+                # silently delete that state on every subsequent poll.
+                keep_worktree = True
+                return
+        else:
+            if not _check_and_increment_retry_budget(
+                gh, issue, state, stage="decomposing"
+            ):
+                gh.write_pinned_state(issue, state)
+                return
+            wt = _ensure_decompose_worktree(issue.number)
+            decomposer_agent, _ = _read_decomposer_session(state)
+            prompt = _build_decompose_prompt(issue, _recent_comments_text(issue))
+            result = run_agent(decomposer_agent, prompt, wt)
+            if result.session_id:
+                state.set("decomposer_agent", decomposer_agent)
+                state.set("decomposer_session_id", result.session_id)
+
+        state.set("last_agent_action_at", _now_iso())
+
+        if result.timed_out:
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} decomposer timed out after "
+                f"{config.AGENT_TIMEOUT}s, manual intervention needed.",
+            )
+            gh.write_pinned_state(issue, state)
+            return
+
+        # The decomposer is supposed to be read-only. If it committed or
+        # left uncommitted changes, something has gone wrong (prompt
+        # ignored, agent misbehaving, operator scratch). Park awaiting
+        # human and KEEP the worktree past this tick so the operator can
+        # inspect what the decomposer actually produced before resetting.
+        wt = _decompose_worktree_path(issue.number)
+        if _has_new_commits(wt) or _worktree_dirty_files(wt):
+            keep_worktree = True
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} decomposer left commits or uncommitted "
+                "changes in the worktree, but it must be read-only. Reset the "
+                "worktree before resuming.",
+            )
+            gh.write_pinned_state(issue, state)
+            return
+
+        last_msg = result.last_message or ""
+        parsed, error = _parse_manifest(last_msg)
+
+        if parsed is None:
+            # Either malformed manifest OR no manifest at all (question /
+            # silence). Both park awaiting human; resume on the next
+            # comment runs through the awaiting_human branch above.
+            if error is not None:
+                quoted = "> " + last_msg.strip().replace("\n", "\n> ")
+                _park_awaiting_human(
+                    gh, issue, state,
+                    f"{config.HITL_MENTIONS} decomposer manifest invalid "
+                    f"({error}); manual adjudication needed.\n\n"
+                    f"_Last decomposer message:_\n\n{quoted}",
+                )
+            else:
+                raw = last_msg.strip() or "(decomposer produced no final message)"
+                quoted = "> " + raw.replace("\n", "\n> ")
+                _park_awaiting_human(
+                    gh, issue, state,
+                    f"{config.HITL_MENTIONS} decomposer needs your input to "
+                    f"proceed:\n\n{quoted}",
+                )
+            gh.write_pinned_state(issue, state)
+            return
+
+        if parsed["decision"] == "single":
+            # `_parse_manifest` only checks the decision string for the
+            # single branch, so `rationale` may be any JSON value (or
+            # missing). Coerce non-strings to the placeholder rather than
+            # crashing the handler at `.strip()` after the agent already ran.
+            raw_rationale = parsed.get("rationale")
+            if not isinstance(raw_rationale, str):
+                raw_rationale = ""
+            rationale = raw_rationale.strip() or "(no rationale provided)"
+            _post_issue_comment(
+                gh, issue, state,
+                f":mag: decomposer says this fits one context: {rationale}",
+            )
+            state.set("decomposed_at", _now_iso())
+            gh.set_workflow_label(issue, "ready")
+            gh.write_pinned_state(issue, state)
+            return
+
+        # decision == "split". Crash-safe sequence:
+        #   1. Persist `expected_children_count` BEFORE creating any
+        #      child. The half-finished recovery uses this to tell a
+        #      partial loop apart from a completed one.
+        #   2. For each child: create the GitHub issue, then
+        #      IMMEDIATELY record its number in parent state (before
+        #      any further non-idempotent work). A SIGKILL between
+        #      these two steps is unavoidable; persisting first means
+        #      the worst case is an orphan child without seeded
+        #      `parent_number`, not a duplicate child created by a
+        #      decomposer respawn.
+        #   3. Seed child pinned state. Failure here parks but parent
+        #      state already records the child, so no respawn happens.
+        #   4. After the loop: post the summary, label parent
+        #      `blocked`. Activation (children blocked -> ready) only
+        #      runs AFTER this final write, so a crash here cannot
+        #      leave a runnable orphan child against a
+        #      `decomposing`-labeled parent.
+        children_manifest = parsed["children"]
+        created: list[Tuple[int, dict]] = []
+        dep_graph: dict[str, list[int]] = {}
+        state.set("expected_children_count", len(children_manifest))
+        gh.write_pinned_state(issue, state)
+        for idx, child in enumerate(children_manifest):
+            depends_on = list(child.get("depends_on") or [])
+            try:
+                new_issue = gh.create_child_issue(
+                    title=child["title"],
+                    body=child["body"],
+                    parent_number=issue.number,
+                    labels=["blocked"],
+                )
+            except Exception:
+                log.exception(
+                    "issue=#%s could not create child %d (%r)",
+                    issue.number, idx, child.get("title"),
+                )
+                _park_awaiting_human(
+                    gh, issue, state,
+                    f"{config.HITL_MENTIONS} could not create child issue "
+                    f"index={idx} ({child.get('title')!r}); manual intervention "
+                    "needed (check orchestrator logs).",
+                )
+                gh.write_pinned_state(issue, state)
+                return
+
+            # Persist the child number on the parent BEFORE doing any
+            # further work for this child. A SIGKILL between
+            # `create_child_issue` returning and this write would leave
+            # an orphan child on GitHub that the parent does not know
+            # about; the next tick would re-spawn the decomposer and
+            # create duplicates.
+            created.append((new_issue.number, child))
+            if depends_on:
+                dep_graph[str(idx)] = depends_on
+            state.set("children", [n for n, _ in created])
+            if dep_graph:
+                state.set("dep_graph", dep_graph)
+            state.set("decomposed_at", _now_iso())
+            gh.write_pinned_state(issue, state)
+
+            # Seed `parent_number` on the child. Mandatory: without
+            # it `_handle_blocked` parks the child as "manual relabel
+            # suspected" and that park leaves `awaiting_human=True`
+            # behind even after the parent later flips the child's
+            # label to `ready` -- the child's `_handle_implementing`
+            # would then sit waiting for a human comment instead of
+            # starting work.
+            try:
+                child_state = PinnedState()
+                child_state.set("parent_number", issue.number)
+                child_state.set("created_at", _now_iso())
+                gh.write_pinned_state(new_issue, child_state)
+            except Exception:
+                log.exception(
+                    "issue=#%s could not seed pinned state on child #%d",
+                    issue.number, new_issue.number,
+                )
+                # Parent already records the child (no duplicate
+                # risk). Park so a human can either seed the child
+                # manually or close it.
+                _park_awaiting_human(
+                    gh, issue, state,
+                    f"{config.HITL_MENTIONS} created child #{new_issue.number} "
+                    f"({child.get('title')!r}) but could not seed its pinned "
+                    "state with `parent_number`; manual intervention needed "
+                    "(seed parent_number on the child or close it).",
+                )
+                gh.write_pinned_state(issue, state)
+                return
+
+        # children/dep_graph/decomposed_at are already durable from the
+        # incremental writes in the loop above. Post the summary, flip
+        # the parent label to `blocked`, and persist the new
+        # orchestrator_comment_id. Activation (children blocked -> ready)
+        # only runs AFTER this final write, so a crash here cannot leave
+        # a runnable orphan child against a `decomposing`-labeled parent.
+        summary = "\n".join(
+            f"- #{n}: {child['title']}" for n, child in created
+        )
+        _post_issue_comment(
+            gh, issue, state,
+            f":bookmark_tabs: decomposer split this into {len(created)} "
+            f"child issue(s):\n\n{summary}",
+        )
+        gh.set_workflow_label(issue, "blocked")
+        gh.write_pinned_state(issue, state)
+
+        # Activation: flip no-dep children from `blocked` to `ready`.
+        # Best-effort -- if any flip fails the parent's `_handle_blocked`
+        # walk handles it on the next tick (the walk treats a child with
+        # no recorded deps as deps-satisfied).
+        for idx, (child_number, _) in enumerate(created):
+            if str(idx) in dep_graph:
+                continue
+            try:
+                child_issue = gh.get_issue(child_number)
+                gh.set_workflow_label(child_issue, "ready")
+            except Exception:
+                log.exception(
+                    "issue=#%s could not flip child #%d to ready; the parent's "
+                    "_handle_blocked walk will retry on the next tick",
+                    issue.number, child_number,
+                )
+    finally:
+        if not keep_worktree:
+            _cleanup_decompose_worktree(issue.number)
+
+
+def _handle_ready(gh: GitHubClient, issue: Issue) -> None:
+    """`ready` is the entry point for an auto-created child or for a parent
+    whose decomposer voted `single`. Both cases need the same pickup-state
+    seeding the legacy `_handle_pickup` did before flipping to
+    `implementing`, so the validating handoff watermark and the in_review
+    legacy migration have an anchor comment they can key on.
+    """
+    state = gh.read_pinned_state(issue)
+    if state.get("pickup_comment_id") is None:
+        if not state.get("created_at"):
+            state.set("created_at", _now_iso())
+        pickup = _post_issue_comment(
+            gh, issue, state,
+            ":robot: orchestrator picking this up; starting implementation.",
+        )
+        pickup_id = getattr(pickup, "id", None)
+        if pickup_id is not None:
+            state.set("pickup_comment_id", int(pickup_id))
+    # Mark every comment visible right now as "already consumed". For a
+    # parent that came through `decomposing` / `blocked`, `pickup_comment_id`
+    # was anchored on the original "decomposing" comment, so any human
+    # feedback posted while children were resolving sits AFTER pickup and
+    # would be classified as post-pickup, unconsumed feedback by the
+    # in_review watermark seed. The implementer reads the full thread via
+    # `_recent_comments_text` at spawn, so by the time the PR reaches
+    # `in_review` those comments have been incorporated; replaying them
+    # would resume the dev and bounce the PR back to validating instead
+    # of allowing merge. Bumping `last_action_comment_id` lets
+    # `_seed_watermark_past_self`'s `consumed_through` walk advance past
+    # them. The next park (or the validating handoff) will overwrite this
+    # value, so it's a transient marker for the in-progress handoff only.
+    latest = gh.latest_comment_id(issue)
+    if isinstance(latest, int):
+        prior = state.get("last_action_comment_id")
+        if not isinstance(prior, int) or latest > prior:
+            state.set("last_action_comment_id", latest)
+    gh.set_workflow_label(issue, "implementing")
+    gh.write_pinned_state(issue, state)
+    _handle_implementing(gh, issue)
+
+
+def _handle_blocked(gh: GitHubClient, issue: Issue) -> None:
+    """Poll children to decide whether the parent unblocks (or one of the
+    children unblocks).
+
+    Workers run sequentially in the polling loop today, so the child's
+    `in_review -> done` label flip and this tick cannot truly race; we read
+    each child's current label fresh here.
+    """
+    state = gh.read_pinned_state(issue)
+    children = state.get("children") or []
+    if not children:
+        # A blocked issue with `parent_number` recorded is a child waiting
+        # on a sibling. The parent's `_handle_blocked` walks the dep graph
+        # and flips the child to `ready` when its dependencies finish; this
+        # tick has nothing to do. Without this branch the polling loop
+        # would route every `blocked` child here, treat it as a parent
+        # missing its `children` list, and park it as "manual relabel
+        # suspected" -- leaving `awaiting_human=True` on the child even
+        # after the parent later relabels it `ready`.
+        if state.get("parent_number"):
+            return
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} `blocked` without recorded children; "
+            "manual relabel suspected.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    child_labels: dict[int, Optional[str]] = {}
+    child_issues: dict[int, Issue] = {}
+    for child_number in children:
+        try:
+            child_issue = gh.get_issue(int(child_number))
+        except Exception:
+            log.exception(
+                "issue=#%s could not read child #%d", issue.number, child_number,
+            )
+            return
+        child_issues[int(child_number)] = child_issue
+        child_labels[int(child_number)] = gh.workflow_label(child_issue)
+
+    rejected = [n for n, lbl in child_labels.items() if lbl == "rejected"]
+    if rejected:
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} child issue(s) rejected: "
+            f"{', '.join(f'#{n}' for n in rejected)}; "
+            "decide whether to re-decompose or close.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    # A child closed manually (e.g. via the GitHub UI) before reaching
+    # `in_review` is invisible to `list_pollable_issues`, which only
+    # sweeps closed issues for `in_review` (the externally-merged
+    # path). Its workflow label stays frozen at whatever it was at
+    # close -- ready/blocked/implementing/validating, or none at all
+    # -- so without this branch the parent would read the stale label,
+    # neither the rejected nor the all-done branch would fire, and the
+    # parent would wait forever for a child that is gone. Treat it
+    # like a rejected child so the operator can adjudicate. `in_review`
+    # is intentionally allowed: a state=closed/label=in_review child is
+    # the externally-merged transient that the closed-in_review sweep
+    # finalizes on the next tick, NOT a manual override.
+    manually_closed = [
+        n for n, ci in child_issues.items()
+        if getattr(ci, "state", "open") == "closed"
+        and child_labels.get(n) not in ("done", "rejected", "in_review")
+    ]
+    if manually_closed:
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} child issue(s) closed without reaching "
+            f"`done` or `rejected`: "
+            f"{', '.join(f'#{n}' for n in manually_closed)}; "
+            "decide whether to re-decompose or close.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    if all(lbl == "done" for lbl in child_labels.values()):
+        _post_issue_comment(
+            gh, issue, state,
+            ":white_check_mark: all children resolved; ready for "
+            "implementation.",
+        )
+        # Clear any stale park left by a prior `rejected`-child tick: the
+        # operator may have re-implemented the rejected child since, and
+        # the parent now reaches `ready` legitimately. Without this clear,
+        # `awaiting_human=True` survives into `_handle_implementing`,
+        # which would route through `_resume_developer_on_human_reply`
+        # and either replay long-stale comments or sit silent until a new
+        # human reply arrives -- instead of just starting the parent's
+        # implementation.
+        state.set("awaiting_human", False)
+        state.set("park_reason", None)
+        gh.set_workflow_label(issue, "ready")
+        gh.write_pinned_state(issue, state)
+        return
+
+    # Walk children: any `blocked` child whose recorded dependencies are
+    # all `done` gets relabeled `ready`. A child with no recorded deps
+    # also flips (vacuous all-done over an empty list) -- this recovers
+    # any no-dep child that the decomposer's same-tick activation step
+    # left as `blocked` (network blip, label-flip failure, etc.).
+    dep_graph = state.get("dep_graph") or {}
+    relabeled = False
+    for idx, child_number in enumerate(children):
+        cn = int(child_number)
+        if child_labels.get(cn) != "blocked":
+            continue
+        deps = dep_graph.get(str(idx), [])
+        dep_numbers = [
+            int(children[int(d)]) for d in deps if int(d) < len(children)
+        ]
+        if all(child_labels.get(dn) == "done" for dn in dep_numbers):
+            gh.set_workflow_label(child_issues[cn], "ready")
+            relabeled = True
+    if relabeled:
+        gh.write_pinned_state(issue, state)
 
 
 def _park_awaiting_human(
@@ -460,13 +1300,19 @@ def _park_awaiting_human(
 
 
 def _check_and_increment_retry_budget(
-    gh: GitHubClient, issue: Issue, state: PinnedState
+    gh: GitHubClient,
+    issue: Issue,
+    state: PinnedState,
+    *,
+    stage: str = "implementing",
 ) -> bool:
-    """Gate fresh implementing-codex spawns by a per-issue 24h retry cap.
+    """Gate fresh agent spawns by a per-issue 24h retry cap.
 
     The window starts at the first counted attempt and resets once 24h after
     that start has elapsed -- a fixed window per issue, not a true rolling
     window, but enough to stop a stuck issue from burning tokens for a day.
+    Implementing and decomposing share the same per-issue counter on
+    purpose: both consume the issue's daily spawn budget.
 
     Returns True if the spawn is allowed (and the budget was incremented);
     False if the cap is exhausted (and the issue was parked on awaiting_human).
@@ -500,7 +1346,7 @@ def _check_and_increment_retry_budget(
         _park_awaiting_human(
             gh, issue, state,
             f"{config.HITL_MENTIONS} hit retry cap ({cap}/day) for "
-            f"implementing; manual intervention needed. "
+            f"{stage}; manual intervention needed. "
             f"Window opened at {window_start_raw}.",
         )
         return False
