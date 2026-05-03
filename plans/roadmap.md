@@ -2,7 +2,7 @@
 
 ## Status as of 2026-05-03
 
-**v0 self-bootstrap path is shipped.** The scaffold, polling loop, codex invocation, hardened push, PR open, and the (no label → `implementing` → `validating` → `in_review`) state machine all exist on `main` (commits `eb87246` … `06c7ea2`, plus the codex-review cycle). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against the bootstrap test issue.
+**Self-bootstrap path is shipped.** The scaffold, polling loop, codex invocation, hardened push, PR open, and the (no label → `implementing` → `validating` → `in_review`) state machine all exist on `main` (commits `eb87246` … `06c7ea2`, plus the codex-review cycle). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against the bootstrap test issue.
 
 Done:
 
@@ -47,24 +47,35 @@ Done in Day 6 (validating stage):
 - `_park_awaiting_human` extracted from the existing inline parking blocks; `_resume_developer_on_human_reply` extracted so both `implementing` and `validating` share the human-reply resume path.
 - **Configurable dev/review backends (`8f91df5`).** `DEV_AGENT` (default `claude`) and `REVIEW_AGENT` (default `codex`) route each spawn through `run_agent` to either `_run_codex` or `_run_claude`; both backends return a unified `AgentResult` (with `CodexResult` kept as a one-release alias). Both values are validated at config load — a typo aborts startup. `CLAUDE_BIN` is no longer dormant. Pinned state grew `dev_agent` + `dev_session_id` (replacing `codex_session_id`); the legacy key is still honored on read and treated as codex, so in-flight issues stay locked to whichever backend started them across a `DEV_AGENT` flip.
 
+Done in Day 9–10 (in_review terminals + auto-merge):
+
+- `_handle_in_review` covers the four terminal arcs out of `in_review`: PR merged externally → `done` (issue closed, `merged_at` stamped); PR closed without merge → `rejected` (issue closed, `closed_without_merge_at` stamped); PR open with new comments past a 10-minute debounce → resume the dev's locked-backend session on the comment text, push the fix, bounce the issue back to `validating` so the reviewer re-runs, reset `review_round`; PR open with no comments + `AUTO_MERGE=on` + reviewer-approved-on-current-head + GitHub-mergeable + green CI → SHA-pinned `pr.merge()` → `done`. Park awaiting human on unmergeable / failed checks / failed push / missing pr_number.
+- Polling switched from `list_open_issues` to `list_pollable_issues`, which also yields closed issues still labeled `in_review`. Without that, an external manual merge (which auto-closes the linked issue via `Resolves #N`) would never reach `_handle_in_review` and the issue would stay closed-but-`in_review` forever.
+- `GitHubClient` extended with `get_pr`, `pr_state`, `pr_is_mergeable` (refresh-once on a None mergeable; treats None as "still computing"), `pr_combined_check_state` (combines legacy combined-status + check-runs APIs), `pr_is_approved(pr, *, head_sha=...)` (only counts reviews submitted on the *current* head SHA so a stale human approval cannot let later commits auto-merge), `merge_pr` (sha-pinned, returns False on 405/409/422 instead of raising), and split comment-watermark methods `pr_conversation_comments_after` / `pr_inline_comments_after` (issue+PR-conversation comments share an id space; inline review comments live in a separate id space, so the orchestrator tracks two independent watermarks).
+- New env knobs: `AUTO_MERGE` (default `off`; truthy spellings 1/true/on/yes; typo defaults safely to off) and `IN_REVIEW_DEBOUNCE_SECONDS` (default 600s, matches `docs/workflow.md:142`).
+- Pinned state grew `pr_last_comment_id` (issue + PR-conversation high-watermark, seeded at the validating → in_review handoff so the orchestrator's own automated comments don't replay as fresh PR feedback once the debounce expires; bumped past any park comment in `_handle_in_review` so an HITL ping doesn't replay either), `pr_last_review_comment_id` (separate watermark for inline review comments since their ids live in a different namespace), `agent_approved_sha` (the head SHA the reviewer agent OK'd, used by the AUTO_MERGE gate since the agent posts an issue comment rather than a real PR review and `pr_is_approved` alone would never fire for the agent flow), `merged_at`, `closed_without_merge_at`.
+- `_resume_dev_with_text` extracted from `_resume_developer_on_human_reply` so the in_review path can resume on PR-comment text without overloading the issue-only helper. `_bump_in_review_watermarks` ratchets the in_review comment watermarks forward whenever the handler parks, so the next tick does not see the orchestrator's own park comment as fresh PR feedback.
+- `tests/fakes.py` extended with `FakePR` PR-state surface (merged / state / mergeable / head.sha / approved / approval_head_sha / check_state / issue_comments / review_comments) plus `FakePRRef`; `FakeIssue` learned `closed` + `edit(state="closed")`; `FakeGitHubClient` got `add_pr` / `get_pr` / `pr_state` / `pr_is_mergeable` / `pr_is_approved(pr, *, head_sha)` / `pr_combined_check_state` / `merge_pr` / `pr_conversation_comments_after` / `pr_inline_comments_after`; `list_open_issues` renamed to `list_pollable_issues` (closed-in_review sweep included).
+- 13 base `_handle_in_review` cases plus follow-ups for closed-issue external-merge finalization, stale-human-approval gating, park-comment replay prevention, and split-watermark comment routing in `tests/test_workflow.py`; 7 new `tests/test_config.py` cases for `AUTO_MERGE` / `IN_REVIEW_DEBOUNCE_SECONDS`.
+
 Not yet done:
 
-- Auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, Dockerfile / systemd / GitHub App migration.
+- `decomposing`, `blocked` flows, Dockerfile / systemd / GitHub App migration.
 
 ## Context
 
 The goal documented in `docs/workflow.md` is an "orchestrator": a long-running process that watches GitHub Issues, drives them through a fixed 4-stage workflow (Decompose → Implement → Validate → Accept), and uses local AI coding-agent CLIs (`codex`, `claude`) to do the actual work. State lives in GitHub Issues themselves (one label per issue, plus pinned JSON state in a comment) so the orchestrator stays stateless and the user can watch progress on github.com.
 
-The driver of this plan is the user's twin constraint: **2-week total budget** and "switch to self-development as soon as possible" — i.e. the orchestrator has to become useful for resolving issues in *its own repo* well before the 2 weeks are up, so the rest of the build can itself be done by the orchestrator (compiler-bootstrap principle). The intended outcome is a v0 by **Day 3** that handles the (no-label → implementing → in_review) happy path end-to-end against this very repo, with the documented `decomposing` and `validating` stages added in the second week.
+The driver of this plan is the user's twin constraint: **2-week total budget** and "switch to self-development as soon as possible" — i.e. the orchestrator has to become useful for resolving issues in *its own repo* well before the 2 weeks are up, so the rest of the build can itself be done by the orchestrator (compiler-bootstrap principle). The intended outcome is a self-bootstrap milestone by **Day 3** that handles the (no-label → implementing → in_review) happy path end-to-end against this very repo, with the documented `decomposing` and `validating` stages added in the second week.
 
-User-confirmed decisions: **aggressive scope cut** for v0, **Python 3.12**, **fine-grained PAT scoped to this repo only** for GitHub auth.
+User-confirmed decisions: **aggressive scope cut** for the bootstrap milestone, **Python 3.12**, **fine-grained PAT scoped to this repo only** for GitHub auth.
 
-## v0 scope (Day 1–3, self-bootstrap milestone)
+## Bootstrap milestone scope (Day 1–3)
 
 Ship only the critical path; everything else is iteration:
 
-- New issue with no label → orchestrator picks it up → labels `implementing` → spawns `codex` in a worktree → pushes branch → opens PR → labels `in_review`. **`decomposing` and `validating` stages are skipped entirely in v0.**
-- Human reviews PR on github.com and merges manually. No auto-merge in v0.
+- New issue with no label → orchestrator picks it up → labels `implementing` → spawns `codex` in a worktree → pushes branch → opens PR → labels `in_review`. **`decomposing` and `validating` stages are skipped entirely at this stage.**
+- Human reviews PR on github.com and merges manually. No auto-merge initially.
 - HITL: when codex output indicates it's blocked / needs input, the orchestrator posts the question as an issue comment, leaves the issue at `implementing`, and waits for a fresh human comment before resuming the codex session.
 - Concurrency: **one agent at a time** (a `Lock` in `main.py`). Issues queue.
 
@@ -79,7 +90,7 @@ Defer to Week 2 (Day 6–14): ~~`validating` stage with claude PR review~~ (now 
 
 ## File layout
 
-Flat package, ~5 files for v0. No premature abstraction. Current shape on disk:
+Flat package, ~5 files for the bootstrap milestone. No premature abstraction. Current shape on disk:
 
 ```
 /home/geserdugarov/git/agent-orchestrator-study/
@@ -88,7 +99,7 @@ Flat package, ~5 files for v0. No premature abstraction. Current shape on disk:
 ├── orchestrator/
 │   ├── __init__.py
 │   ├── main.py                     # polling loop, --once, --log-level, SIGTERM/SIGINT, ancestry-aware self-update detection
-│   ├── workflow.py                 # state machine + worktree mgmt + hardened push (heart of v0)
+│   ├── workflow.py                 # state machine + worktree mgmt + hardened push (state machine core)
 │   ├── github.py                   # PyGithub wrapper: issues, labels, comments, pinned-state JSON, open/find PR, label bootstrap
 │   ├── agents.py                   # codex spawn/resume, session-ID walker, env scrub, last-message capture
 │   └── config.py                   # .env loader (rejects secrets), token resolution from env or ~/.config/<owner>/<repo>/token, HITL parsing
@@ -102,7 +113,7 @@ Flat package, ~5 files for v0. No premature abstraction. Current shape on disk:
                                     # test_workflow.py — TODO (Day 4)
 ```
 
-## State machine (v0)
+## State machine (bootstrap milestone)
 
 | From label | Trigger | To label | Handler |
 |---|---|---|---|
@@ -111,7 +122,7 @@ Flat package, ~5 files for v0. No premature abstraction. Current shape on disk:
 | `implementing` | codex returned a blocked/question signal | (stays) | post the question as a normal comment, write `awaiting_human=true` into pinned-state, do nothing further this tick |
 | `implementing` (awaiting_human) | new human comment arrived after agent's last action | (stays) | `codex resume --session <id>` with the new comment text, clear `awaiting_human` |
 | `implementing` | PR opened successfully | `in_review` | flip label, post comment with PR link |
-| `in_review` | (v0) | (terminal) | wait for human to merge or close manually; orchestrator does nothing |
+| `in_review` | (bootstrap) | (terminal) | wait for human to merge or close manually; orchestrator does nothing |
 
 Defer to Week 2 transitions: `(none) → decomposing`, `decomposing → ready/blocked`, `ready → implementing` (split out from pickup), `implementing → validating`, `validating → in_review` / `validating → ready`, `in_review → done` (auto-merge), `in_review → rejected`.
 
@@ -137,7 +148,7 @@ Tick (every 60s, configurable via `POLL_INTERVAL`):
 
 ## Agent invocation
 
-`agents.py` exposes one function for v0: `run_codex(prompt: str, cwd: Path, resume_session_id: str | None) -> CodexResult`.
+`agents.py` initially exposes one function: `run_codex(prompt: str, cwd: Path, resume_session_id: str | None) -> CodexResult`.
 
 ```
 codex exec \
@@ -159,7 +170,7 @@ Implementation (current state in `agents.py` / `workflow.py`):
 
 ## Self-modification safety (R2 in agent's risk list)
 
-Because the orchestrator is editing its own code, when a self-touching PR merges to `main` the running process is stale. v0 mitigation:
+Because the orchestrator is editing its own code, when a self-touching PR merges to `main` the running process is stale. Bootstrap-milestone mitigation:
 
 - Detect "self-touching merge" by checking if the merged PR modified any file under `orchestrator/`.
 - On such a merge being detected at the start of a tick, log "exiting for self-update" and `sys.exit(0)`.
@@ -182,7 +193,7 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 | **Day 3** | **Self-bootstrap milestone.** Polling loop end-to-end. | ✅ Done. Polling loop, signal handling, ancestry-aware self-update detection, and `run.sh` wrapper all merged (eb87246, 9e5eac6). |
 | **Day 4–5** | HITL + harden | 🟢 Done. Question detection (no-commits heuristic), resume on human follow-up, pinned-state JSON, dirty-tree refusal, push-failure parking, comprehensive HITL mention plumbing all in place; per-issue retry budget (`MAX_RETRIES_PER_DAY`, 24h window) and agent commit-identity stamping landed in `7f9c6e2`; `tests/fakes.py` + an expanded `tests/test_workflow.py` now cover state transitions against an in-memory fake `Github`. |
 | **Day 6–8** | `validating` stage | 🟢 Done. `_handle_validating` runs a fresh review, posts feedback to the PR, resumes the dev session for fixes, re-reviews, and caps at `MAX_REVIEW_ROUNDS` rounds before parking on `awaiting_human`. Transitions to `in_review` on `VERDICT: APPROVED`. The dev/review backend split is now config-driven (`DEV_AGENT` / `REVIEW_AGENT`), defaults to claude implements + codex reviews, and `CLAUDE_BIN` is no longer dormant. The dev backend for an in-flight issue is locked in pinned state (`dev_agent`/`dev_session_id`, with legacy `codex_session_id` falling back to codex). |
-| **Day 9–10** | Auto-merge + `rejected` | ⬜ Not started. Add `in_review` handler that watches PR state + check runs, auto-merges on approve+green, transitions to `done`. Add `rejected` on PR close-without-merge. PR-comment-resume during `in_review` with 10-min debounce. |
+| **Day 9–10** | Auto-merge + `rejected` | 🟢 Done. `_handle_in_review` covers merged → `done`, closed-unmerged → `rejected`, PR-comment-past-debounce → resume dev + bounce to `validating`, and `AUTO_MERGE`-gated SHA-pinned merge on approved + mergeable + green CI. Park awaiting human on unmergeable / failed checks / push fail / missing pr_number. New `GitHubClient` PR helpers, new pinned-state keys (`pr_last_comment_id`, `merged_at`, `closed_without_merge_at`), 13 new workflow + 7 new config tests. |
 | **Day 11–12** | `decomposing` stage | ⬜ Not started. New `_handle_decomposing` driving codex with a decomposition prompt; sub-issues created via PyGithub; `blocked` label + dependency linking when sub-issues exist. |
 | **Day 13** | VPS prep | ⬜ Not started. Dockerfile, systemd unit (`Restart=always` replaces `run.sh`), GitHub App migration to drop the PAT, structured logging, `--status` CLI flag listing in-flight issues. |
 | **Day 14** | Buffer / dogfood / docs | ⬜ Not started. Update `docs/workflow.md` to reflect what actually shipped (incl. the inline pinned-state marker change and the new token-storage rules). |
@@ -194,7 +205,7 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 > **Title:** Add a `hello()` function to the orchestrator package
 > **Body:** Add `hello()` to `orchestrator/__init__.py` returning the literal string `"hello, world"`. Add `tests/test_hello.py` asserting the return value. Don't change anything else.
 
-This exercises the entire v0 path: pickup → branch → codex run → push → PR → human merge. It edits the orchestrator's own code (true self-bootstrap), is too small to need decomposition, and is trivially verifiable.
+This exercises the entire bootstrap path: pickup → branch → codex run → push → PR → human merge. It edits the orchestrator's own code (true self-bootstrap), is too small to need decomposition, and is trivially verifiable.
 
 **End-to-end test sequence:**
 
@@ -219,4 +230,4 @@ This exercises the entire v0 path: pickup → branch → codex run → push → 
 - **R4 — Host sleep on WSL2.** Acceptable for Week 1; Day 13 moves to VPS.
 - **R5 — GitHub rate limits.** PyGithub handles backoff; 60s ticks are well under 5000 req/hr.
 - **R6 — Race between human comments and orchestrator action.** Re-fetch issue + pinned-state immediately before each transition; treat any human comment newer than agent's last action as a pause signal.
-- **R7 — Decomposition criteria unsolved in the design doc.** Don't try to solve in v0. Day 11–12 uses an "ask the LLM, take its word" heuristic.
+- **R7 — Decomposition criteria unsolved in the design doc.** Don't try to solve at the bootstrap stage. Day 11–12 uses an "ask the LLM, take its word" heuristic.
