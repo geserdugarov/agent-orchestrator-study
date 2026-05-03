@@ -5,7 +5,7 @@ Orchestrator for automatic issues resolving utilizing agents.
 The orchestrator watches GitHub Issues, drives them through a label-based state machine, and spawns local CLI agents (`codex`, `claude`) to implement them and open PRs. State lives in GitHub Issues themselves (one workflow label + one pinned JSON comment), so the orchestrator stays stateless and progress is observable on github.com.
 
 For the design and stage definitions, see [`docs/workflow.md`](docs/workflow.md) (in Russian).
-For the implementation roadmap and v0 scope cut, see [`plans/roadmap.md`](plans/roadmap.md).
+For the implementation roadmap, see [`plans/roadmap.md`](plans/roadmap.md).
 
 ## Requirements
 
@@ -30,6 +30,7 @@ The orchestrator spawns these as subprocesses; both must be installed and authen
   - **Contents**: Read and write — push branches
   - **Issues**: Read and write — read issues, post comments, set/create labels
   - **Pull requests**: Read and write — open PRs
+  - **Checks**: Read-only — required for `AUTO_MERGE` to evaluate Actions-only PRs (without it, the orchestrator sees `check_state='none'` and parks waiting for a human even when CI is green)
   - **Metadata**: Read-only — required and forced on
 
   Generate at <https://github.com/settings/personal-access-tokens>.
@@ -108,7 +109,7 @@ Pinned in [`pyproject.toml`](pyproject.toml):
    > **Title:** Add a `hello()` function to the orchestrator package
    > **Body:** Add `hello()` to `orchestrator/__init__.py` returning the string `"hello, world"`. Add `tests/test_hello.py` asserting the return value. Don't change anything else.
 
-   Within ~1 minute the orchestrator should comment "picking this up", label the issue `implementing`, run the dev agent (`DEV_AGENT`, default `claude`) in a fresh worktree at `../wt-orchestrator/issue-N`, push the branch, open a PR, label the issue `validating`, run a fresh reviewer session (`REVIEW_AGENT`, default `codex`) against the diff, and on `VERDICT: APPROVED` move the issue to `in_review`. Review the PR and merge manually (auto-merge is still on the Week 2 list).
+   Within ~1 minute the orchestrator should comment "picking this up", label the issue `implementing`, run the dev agent (`DEV_AGENT`, default `claude`) in a fresh worktree at `../wt-orchestrator/issue-N`, push the branch, open a PR, label the issue `validating`, run a fresh reviewer session (`REVIEW_AGENT`, default `codex`) against the diff, and on `VERDICT: APPROVED` move the issue to `in_review`. With `AUTO_MERGE=on`, the orchestrator then merges the PR itself once GitHub reports it mergeable with green checks, flips the label to `done`, and closes the issue. With `AUTO_MERGE=off` (the default), review and merge the PR manually.
 
 ## Run modes
 
@@ -139,7 +140,9 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | `AGENT_GIT_NAME`          | `agent-orchestrator`                          | `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` injected into agent spawns |
 | `AGENT_GIT_EMAIL`         | `agent-orchestrator@users.noreply.github.com` | `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` injected into agent spawns |
 | `BASE_BRANCH`             | `main`                                        | branch PRs target                                         |
+| `AUTO_MERGE`              | `off`                                         | merge approved PRs (green CI + mergeable) from `in_review`; flip to `on` once dogfooded |
+| `IN_REVIEW_DEBOUNCE_SECONDS` | `600`                                       | quiet window after the latest PR/issue comment before resuming the dev session |
 
-## v0 scope
+## Current scope
 
-The orchestrator currently drives (no label) → `implementing` → `validating` → `in_review`, with a configurable dev/review backend split, a per-issue retry budget (`MAX_RETRIES_PER_DAY`), and a review/fix loop capped by `MAX_REVIEW_ROUNDS`. Still on the Week 2 list: `decomposing`, auto-merge on approve+green-CI, and `blocked`/`rejected` flows. See [`plans/roadmap.md`](plans/roadmap.md).
+The orchestrator currently drives (no label) → `implementing` → `validating` → `in_review` → `done`/`rejected`, with a configurable dev/review backend split, a per-issue retry budget (`MAX_RETRIES_PER_DAY`), a review/fix loop capped by `MAX_REVIEW_ROUNDS`, and a debounced PR-comment-resume loop in `in_review`. Auto-merge on approve+green-CI is gated by `AUTO_MERGE` (default `off`); enable it once dogfooded. Still on the Week 2 list: `decomposing` and `blocked` flows. See [`plans/roadmap.md`](plans/roadmap.md).

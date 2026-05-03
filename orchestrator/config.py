@@ -142,3 +142,15 @@ WORKTREES_DIR: Path = Path(
 )
 
 BASE_BRANCH: str = os.environ.get("BASE_BRANCH", "main")
+
+# When `in_review` and the reviewer (and any branch protections GitHub knows
+# about) are happy, the orchestrator can merge the PR itself. Default off so
+# the legacy "humans merge" behavior keeps working until users opt in.
+AUTO_MERGE: bool = os.environ.get("AUTO_MERGE", "off").strip().lower() in (
+    "1", "true", "on", "yes",
+)
+# Quiet window after the most recent PR/issue comment before resuming the dev
+# session in `in_review`. Matches the 10-minute target in docs/workflow.md.
+IN_REVIEW_DEBOUNCE_SECONDS: int = int(
+    os.environ.get("IN_REVIEW_DEBOUNCE_SECONDS", "600")
+)
