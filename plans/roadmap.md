@@ -30,7 +30,7 @@ Open items from the Day-1 checklist:
 
 1. **Codex flag name & JSON output shape** — resolved during Day 2 (`--dangerously-bypass-approvals-and-sandbox`, `--json`, last-message-via-`-o`, UUID walker for session ID).
 2. **Commit identity for agent commits** — resolved in `7f9c6e2`. `agents._agent_env` injects `GIT_AUTHOR_*` / `GIT_COMMITTER_*` from `AGENT_GIT_NAME` / `AGENT_GIT_EMAIL` (default `agent-orchestrator <agent-orchestrator@users.noreply.github.com>`) into every spawn, overriding any `~/.gitconfig` without touching it.
-3. **HITL @mention handle** — resolved as a configurable list (`HITL_HANDLE`, default `geserdugarov,and-semakin,garudainfo55`).
+3. **HITL @mention handle** — resolved as a configurable list (`HITL_HANDLE`, default `geserdugarov`).
 
 Done in Day 4–5 (post-original-plan, shipped together as `7f9c6e2`):
 
@@ -230,7 +230,7 @@ This exercises the entire bootstrap path: pickup → branch → codex run → pu
 
 1. **Codex flag name & JSON output shape.** ✅ Resolved during Day 2: `codex exec [-C <cwd>] --dangerously-bypass-approvals-and-sandbox --json -o <last-message-file> "<prompt>"` (resume variant: `codex exec resume <session-id> "<follow-up>"` — does **not** accept `-C`, so we rely on `subprocess` cwd).
 2. **Commit identity for agent commits.** ✅ Resolved in `7f9c6e2` via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env injection from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` (default `agent-orchestrator <agent-orchestrator@users.noreply.github.com>`). Env vars beat `git config user.{name,email}` at every scope, so the host's `~/.gitconfig` and the per-worktree config are both left untouched.
-3. **HITL @mention handle.** ✅ Resolved as a configurable comma-separated list (`HITL_HANDLE`); current default is `geserdugarov,and-semakin,garudainfo55`.
+3. **HITL @mention handle.** ✅ Resolved as a configurable comma-separated list (`HITL_HANDLE`); current default is `geserdugarov`.
 
 ## Risks (carry-over from agent design)
 
