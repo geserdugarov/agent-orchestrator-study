@@ -172,80 +172,80 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
                      └──────────────┬───────────────────────┘
                                     │ PyGithub (token)
                                     │
-   ┌────────────────────────────────┴───────────────────────────────────┐
-   │  orchestrator process  (python -m orchestrator.main)               │
-   │  ───────────────────────────────────────────────────               │
-   │   main.py                                                          │
-   │     loop every POLL_INTERVAL s:                                    │
-   │       1. self-restart check (origin/main moved & touches orch/?)   │
-   │       2. workflow.tick(gh)                                         │
-   │                    │                                               │
-   │                    ▼                                               │
-   │   workflow.tick → for each open issue → dispatch by label:         │
-   │                                                                    │
-   │     (no label) ──► _handle_pickup                          │       │
-   │                       ├─ DECOMPOSE=on  ─► decomposing      │       │
-   │                       └─ DECOMPOSE=off ─► implementing     │       │
-   │                                                            │       │
-   │     decomposing ──► _handle_decomposing                    │       │
-   │                       ├─ retry budget? ─► park if exhausted│       │
-   │                       ├─ ensure worktree (read-only)       │       │
-   │                       ├─ run_agent(DECOMPOSE_AGENT, prompt)│       │
-   │                       ├─ decision=single ─► label=ready    │       │
-   │                       ├─ decision=split  ─► create children│       │
-   │                       │     parent=blocked, child=blocked, │       │
-   │                       │     no-dep child ─► child=ready    │       │
-   │                       └─ invalid / question / dirty ─► park│       │
-   │                                                            │       │
-   │     ready ──► _handle_ready ──► label=implementing         │       │
-   │                                                            │       │
-   │     blocked ──► _handle_blocked                            │       │
-   │                       ├─ all children done ─► parent=ready │       │
-   │                       ├─ any child rejected ─► park HITL   │       │
-   │                       └─ unblock siblings (dep_graph walk) │       │
-   │                                                            │       │
-   │     implementing ──► _handle_implementing ─────────────────┤       │
-   │                       │                                    │       │
-   │                       ├─ ensure worktree                   │       │
-   │                       ├─ retry budget? ─► park if exhausted│       │
-   │                       ├─ run_agent(DEV_AGENT, prompt) ◄────┼──┐    │
-   │                       ├─ commits+clean? push, open PR,     │  │    │
-   │                       │     label=validating               │  │    │
-   │                       ├─ dirty?  ─► park awaiting human ───┤  │    │
-   │                       ├─ no commit? ─► park (question) ────┤  │    │
-   │                       └─ timeout? ─► park ─────────────────┤  │    │
-   │                                                            │  │    │
-   │     validating ──► _handle_validating                      │  │    │
-   │                       │                                    │  │    │
-   │                       ├─ run_agent(REVIEW_AGENT, fresh)    │  │    │
-   │                       │     parse VERDICT marker           │  │    │
-   │                       │       APPROVED ─► label=in_review  │  │    │
-   │                       │       CHANGES_REQUESTED:           │  │    │
-   │                       │         post feedback on PR        │  │    │
+   ┌────────────────────────────────┴─────────────────────────────────────┐
+   │  orchestrator process  (python -m orchestrator.main)                 │
+   │  ───────────────────────────────────────────────────                 │
+   │   main.py                                                            │
+   │     loop every POLL_INTERVAL s:                                      │
+   │       1. self-restart check (origin/main moved & touches orch/?)     │
+   │       2. workflow.tick(gh)                                           │
+   │                    │                                                 │
+   │                    ▼                                                 │
+   │   workflow.tick → for each open issue → dispatch by label:           │
+   │                                                                      │
+   │     (no label) ──► _handle_pickup                            │       │
+   │                       ├─ DECOMPOSE=on  ─► decomposing        │       │
+   │                       └─ DECOMPOSE=off ─► implementing       │       │
+   │                                                              │       │
+   │     decomposing ──► _handle_decomposing                      │       │
+   │                       ├─ retry budget? ─► park if exhausted  │       │
+   │                       ├─ ensure worktree (read-only)         │       │
+   │                       ├─ run_agent(DECOMPOSE_AGENT, prompt)  │       │
+   │                       ├─ decision=single ─► label=ready      │       │
+   │                       ├─ decision=split  ─► create children  │       │
+   │                       │     parent=blocked, child=blocked,   │       │
+   │                       │     no-dep child ─► child=ready      │       │
+   │                       └─ invalid / question / dirty ─► park  │       │
+   │                                                              │       │
+   │     ready ──► _handle_ready ──► label=implementing           │       │
+   │                                                              │       │
+   │     blocked ──► _handle_blocked                              │       │
+   │                       ├─ all children done ─► parent=ready   │       │
+   │                       ├─ any child rejected ─► park HITL     │       │
+   │                       └─ unblock siblings (dep_graph walk)   │       │
+   │                                                              │       │
+   │     implementing ──► _handle_implementing ───────────────────┤       │
+   │                       │                                      │       │
+   │                       ├─ ensure worktree                     │       │
+   │                       ├─ retry budget? ─► park if exhausted  │       │
+   │                       ├─ run_agent(DEV_AGENT, prompt) ◄──────┼──┐    │
+   │                       ├─ commits+clean? push, open PR,       │  │    │
+   │                       │     label=validating                 │  │    │
+   │                       ├─ dirty?  ─► park awaiting human ─────┤  │    │
+   │                       ├─ no commit? ─► park (question) ──────┤  │    │
+   │                       └─ timeout? ─► park ───────────────────┤  │    │
+   │                                                              │  │    │
+   │     validating ──► _handle_validating                        │  │    │
+   │                       │                                      │  │    │
+   │                       ├─ run_agent(REVIEW_AGENT, fresh)      │  │    │
+   │                       │     parse VERDICT marker             │  │    │
+   │                       │       APPROVED ─► label=in_review    │  │    │
+   │                       │       CHANGES_REQUESTED:             │  │    │
+   │                       │         post feedback on PR          │  │    │
    │                       │         run_agent(dev, fix, resume) ─┘  │    │
-   │                       │         push, ++review_round          │    │
-   │                       │       UNKNOWN ─► park                 │    │
-   │                       └─ round ≥ MAX_REVIEW_ROUNDS ─► park    │    │
-   │                                                                │    │
-   │     in_review ──► _handle_in_review                           │    │
-   │                       │                                       │    │
-   │                       ├─ pr merged externally ─► label=done,  │    │
-   │                       │     stamp merged_at, close issue      │    │
-   │                       ├─ pr closed unmerged ─► label=rejected,│    │
-   │                       │     stamp closed_without_merge_at,    │    │
-   │                       │     close issue                       │    │
-   │                       ├─ new PR/issue comment past debounce:  │    │
-   │                       │     resume dev (locked backend) ──────┘    │
-   │                       │     push, ++pr_last_*_id watermarks,       │
-   │                       │     label=validating, review_round=0       │
-   │                       └─ AUTO_MERGE on, approved, mergeable,       │
-   │                           green checks ─► merge_pr (sha pin),      │
-   │                           label=done, close                        │
-   │                          unmergeable / failed checks ─► park       │
-   │                                                                │    │
-   │   awaiting_human + new comment ─► resume dev (locked backend) ─┘    │
-   │                                                                     │
-   └─────────┬───────────────────────────────────────┬───────────────────┘
+   │                       │         push, ++review_round            │    │
+   │                       │       UNKNOWN ─► park                   │    │
+   │                       └─ round ≥ MAX_REVIEW_ROUNDS ─► park      │    │
+   │                                                                 │    │
+   │     in_review ──► _handle_in_review                             │    │
+   │                       │                                         │    │
+   │                       ├─ pr merged externally ─► label=done,    │    │
+   │                       │     stamp merged_at, close issue        │    │
+   │                       ├─ pr closed unmerged ─► label=rejected,  │    │
+   │                       │     stamp closed_without_merge_at,      │    │
+   │                       │     close issue                         │    │
+   │                       ├─ new PR/issue comment past debounce:    │    │
+   │                       │     resume dev (locked backend) ────────┘    │
+   │                       │     push, ++pr_last_*_id watermarks,         │
+   │                       │     label=validating, review_round=0         │
+   │                       └─ AUTO_MERGE on, approved, mergeable,         │
+   │                           green checks ─► merge_pr (sha pin),        │
+   │                           label=done, close                          │
+   │                          unmergeable / failed checks ─► park         │
+   │                                                                 │    │
+   │   awaiting_human + new comment ─► resume dev (locked backend) ──┘    │
+   │                                                                      │
+   └─────────┬───────────────────────────────────────┬────────────────────┘
              │ subprocess                            │ subprocess (hardened)
              ▼                                       ▼
    ┌─────────────────────────────┐         ┌─────────────────────────────┐
