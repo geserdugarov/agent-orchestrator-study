@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -143,45 +144,56 @@ def _run_codex(
     timeout: Optional[int] = None,
 ) -> AgentResult:
     timeout = timeout or config.AGENT_TIMEOUT
-    last_msg_path = cwd / ".codex-last-message.txt"
-    if last_msg_path.exists():
-        last_msg_path.unlink()
+    # The -o file lives outside the worktree (per-spawn tempfile) so the
+    # target repo's `git status` never sees it as untracked. Putting it
+    # inside cwd worked when the orchestrator managed its own repo (whose
+    # .gitignore covers `.codex-*`), but broke `_worktree_dirty_files` on
+    # any target repo without that rule -- the orchestrator would park
+    # awaiting_human on its own scratch on every codex review pass.
+    fd, last_msg_path_str = tempfile.mkstemp(prefix="codex-last-", suffix=".txt")
+    os.close(fd)
+    last_msg_path = Path(last_msg_path_str)
+    try:
+        # `codex exec resume` does not accept -C; we rely on subprocess cwd for it.
+        common = [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--json",
+            "-o", str(last_msg_path),
+        ]
+        if resume_session_id:
+            cmd = [config.CODEX_BIN, "exec", "resume", *common, resume_session_id, prompt]
+        else:
+            cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
 
-    # `codex exec resume` does not accept -C; we rely on subprocess cwd for it.
-    common = [
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--json",
-        "-o", str(last_msg_path),
-    ]
-    if resume_session_id:
-        cmd = [config.CODEX_BIN, "exec", "resume", *common, resume_session_id, prompt]
-    else:
-        cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
+        env = _agent_env(extra_env)
+        log.info(
+            "codex spawn: cwd=%s resume=%s timeout=%ss",
+            cwd, bool(resume_session_id), timeout,
+        )
 
-    env = _agent_env(extra_env)
-    log.info(
-        "codex spawn: cwd=%s resume=%s timeout=%ss",
-        cwd, bool(resume_session_id), timeout,
-    )
+        stdout, stderr, exit_code, timed_out = _run_subprocess(cmd, cwd, env, timeout)
 
-    stdout, stderr, exit_code, timed_out = _run_subprocess(cmd, cwd, env, timeout)
+        sid = resume_session_id or parse_session_id(stdout)
+        last_msg = ""
+        if last_msg_path.exists():
+            try:
+                last_msg = last_msg_path.read_text(errors="replace")
+            except OSError:
+                last_msg = ""
 
-    sid = resume_session_id or parse_session_id(stdout)
-    last_msg = ""
-    if last_msg_path.exists():
+        return AgentResult(
+            session_id=sid,
+            last_message=last_msg,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    finally:
         try:
-            last_msg = last_msg_path.read_text(errors="replace")
-        except OSError:
-            last_msg = ""
-
-    return AgentResult(
-        session_id=sid,
-        last_message=last_msg,
-        exit_code=exit_code,
-        timed_out=timed_out,
-        stdout=stdout,
-        stderr=stderr,
-    )
+            last_msg_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _claude_last_message(jsonl_output: str) -> str:

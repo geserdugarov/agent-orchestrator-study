@@ -202,9 +202,9 @@ def _worktree_dirty_files(worktree: Path) -> list[str]:
 
     Used to refuse opening a PR when codex committed only part of its work and
     left other modifications behind -- the push would publish an incomplete
-    branch. Ignored files are excluded by default in porcelain mode, so the
-    orchestrator scratch (`.codex-last-message.txt`, matched by `.codex-*` in
-    .gitignore) does not surface here.
+    branch. The orchestrator's own scratch (codex's `-o` file) lives outside
+    the worktree (a per-spawn tempfile in `_run_codex`), so it never surfaces
+    here regardless of the target repo's .gitignore.
     """
     r = _git("status", "--porcelain", cwd=worktree)
     if r.returncode != 0:
