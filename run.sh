@@ -4,13 +4,13 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-# Read BASE_BRANCH from .env so the wrapper pulls the same branch the Python
-# code uses for worktrees and self-update detection. Without this, configuring
-# BASE_BRANCH=foo would still pull origin main here and merge stale or wrong
-# code on restart.
-base_branch="${BASE_BRANCH:-}"
+# Read ORCHESTRATOR_BASE_BRANCH from .env so the wrapper pulls the orchestrator
+# repo's own branch (REPO_ROOT) for self-update -- not BASE_BRANCH, which is
+# the *target* repo's base branch and may differ (e.g. target=`master` while
+# the orchestrator itself ships from `main`).
+base_branch="${ORCHESTRATOR_BASE_BRANCH:-}"
 if [ -z "$base_branch" ] && [ -f .env ]; then
-    base_branch=$(sed -n 's/^[[:space:]]*BASE_BRANCH[[:space:]]*=[[:space:]]*//p' .env \
+    base_branch=$(sed -n 's/^[[:space:]]*ORCHESTRATOR_BASE_BRANCH[[:space:]]*=[[:space:]]*//p' .env \
         | head -n1 | tr -d '"' | tr -d "'")
 fi
 base_branch="${base_branch:-main}"

@@ -144,11 +144,29 @@ AGENT_GIT_EMAIL: str = os.environ.get(
     "AGENT_GIT_EMAIL", "agent-orchestrator@users.noreply.github.com"
 )
 
-WORKTREES_DIR: Path = Path(
-    os.environ.get("WORKTREES_DIR", str(REPO_ROOT.parent / "wt-orchestrator"))
+# The repository whose issues / PRs this orchestrator manages. Defaults to
+# REPO_ROOT (self-bootstrap: orchestrator manages its own repo). Override when
+# the orchestrator code is installed in one clone but drives PRs into another.
+# Worktrees are `git worktree add`-ed from this path, so commits land on its
+# git history -- not the orchestrator's own.
+TARGET_REPO_ROOT: Path = Path(
+    os.environ.get("TARGET_REPO_ROOT", str(REPO_ROOT))
 )
 
+WORKTREES_DIR: Path = Path(
+    os.environ.get("WORKTREES_DIR", str(TARGET_REPO_ROOT.parent / "wt-orchestrator"))
+)
+
+# Base branch in the *target* repo: where worktrees branch from and where PRs
+# are opened against.
 BASE_BRANCH: str = os.environ.get("BASE_BRANCH", "main")
+
+# Base branch of the orchestrator's *own* repo (REPO_ROOT). Used only by the
+# self-update path: `_self_modifying_merge_happened` watches `origin/<this>`
+# for new commits under `orchestrator/`, and `run.sh` fast-forwards to it on
+# every restart. Decoupled from BASE_BRANCH so the target repo can have a
+# different default branch (e.g. `master`) without breaking self-update.
+ORCHESTRATOR_BASE_BRANCH: str = os.environ.get("ORCHESTRATOR_BASE_BRANCH", "main")
 
 # When `in_review` and the reviewer (and any branch protections GitHub knows
 # about) are happy, the orchestrator can merge the PR itself. Default off so

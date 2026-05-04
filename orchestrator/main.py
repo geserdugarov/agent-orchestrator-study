@@ -44,12 +44,13 @@ def _own_head_sha() -> Optional[str]:
 
 
 def _self_modifying_merge_happened(start_sha: str) -> bool:
-    """Detect that origin/main has moved FORWARD from start_sha and the new
-    commits touch orchestrator/. Local-only commits (start_sha ahead of or
-    divergent from origin/main) are not a merge and must not trigger an exit.
+    """Detect that origin/<orchestrator-base> has moved FORWARD from start_sha
+    and the new commits touch orchestrator/. Watches the orchestrator's own
+    repo (REPO_ROOT), not the target repo, so a separately-configured target
+    branch (e.g. `master`) does not interfere with self-update detection.
     """
-    _git("fetch", "--quiet", "origin", config.BASE_BRANCH)
-    cur = _git("rev-parse", f"origin/{config.BASE_BRANCH}").stdout.strip()
+    _git("fetch", "--quiet", "origin", config.ORCHESTRATOR_BASE_BRANCH)
+    cur = _git("rev-parse", f"origin/{config.ORCHESTRATOR_BASE_BRANCH}").stdout.strip()
     if not cur or cur == start_sha:
         return False
     # start_sha must be an ancestor of origin/main for this to be a merge that

@@ -153,20 +153,20 @@ def _ensure_worktree(issue_number: int) -> Path:
         if _has_new_commits(wt):
             log.info("issue=#%d worktree has unpushed commits; reusing", issue_number)
             return wt
-        _git("worktree", "remove", "--force", str(wt), cwd=config.REPO_ROOT)
+        _git("worktree", "remove", "--force", str(wt), cwd=config.TARGET_REPO_ROOT)
 
-    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.REPO_ROOT)
+    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.TARGET_REPO_ROOT)
 
     have_branch = _git(
-        "rev-parse", "--verify", branch, cwd=config.REPO_ROOT
+        "rev-parse", "--verify", branch, cwd=config.TARGET_REPO_ROOT
     ).returncode == 0
     if have_branch:
-        result = _git("worktree", "add", str(wt), branch, cwd=config.REPO_ROOT)
+        result = _git("worktree", "add", str(wt), branch, cwd=config.TARGET_REPO_ROOT)
     else:
         result = _git(
             "worktree", "add", "-b", branch, str(wt),
             f"origin/{config.BASE_BRANCH}",
-            cwd=config.REPO_ROOT,
+            cwd=config.TARGET_REPO_ROOT,
         )
     if result.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {result.stderr}")
@@ -249,12 +249,12 @@ def _ensure_decompose_worktree(issue_number: int) -> Path:
     config.WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
     wt = _decompose_worktree_path(issue_number)
     if wt.exists():
-        _git("worktree", "remove", "--force", str(wt), cwd=config.REPO_ROOT)
-    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.REPO_ROOT)
+        _git("worktree", "remove", "--force", str(wt), cwd=config.TARGET_REPO_ROOT)
+    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.TARGET_REPO_ROOT)
     result = _git(
         "worktree", "add", "--detach", str(wt),
         f"origin/{config.BASE_BRANCH}",
-        cwd=config.REPO_ROOT,
+        cwd=config.TARGET_REPO_ROOT,
     )
     if result.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {result.stderr}")
@@ -271,7 +271,7 @@ def _cleanup_decompose_worktree(issue_number: int) -> None:
     try:
         wt = _decompose_worktree_path(issue_number)
         if wt.exists():
-            _git("worktree", "remove", "--force", str(wt), cwd=config.REPO_ROOT)
+            _git("worktree", "remove", "--force", str(wt), cwd=config.TARGET_REPO_ROOT)
     except Exception:
         log.exception(
             "issue=#%d failed to clean up decomposer worktree", issue_number,
