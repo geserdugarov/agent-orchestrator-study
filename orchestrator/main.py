@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import logging.handlers
 import signal
 import subprocess
 import sys
@@ -27,6 +28,33 @@ def _shutdown(signum, _frame) -> None:
     global _running
     log.info("signal %s received; will stop after this tick", signum)
     _running = False
+
+
+def _configure_logging(level: str) -> None:
+    # stderr stays for live tailing in `run.sh`'s terminal; the file handler
+    # is what survives terminal close. RotatingFileHandler caps disk use
+    # without needing logrotate on the host.
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                config.LOG_DIR / "orchestrator.log",
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+        )
+    except OSError as e:
+        # Don't refuse to start just because the log dir is unwritable;
+        # stderr alone keeps the loop usable. Surface the reason once.
+        logging.basicConfig(level=level, format=fmt, handlers=handlers)
+        logging.getLogger("orchestrator").warning(
+            "file logging disabled: %s (%s)", config.LOG_DIR, e
+        )
+        return
+    logging.basicConfig(level=level, format=fmt, handlers=handlers)
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -67,10 +95,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
 
-    logging.basicConfig(
-        level=args.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _configure_logging(args.log_level)
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 

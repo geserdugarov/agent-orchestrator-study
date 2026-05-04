@@ -18,10 +18,13 @@ _CWD = Path("/tmp/agent-orchestrator-test-cwd-doesnt-matter")
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> MagicMock:
+    # _run_subprocess uses Popen + communicate(timeout=...). The mock returns
+    # (stdout, stderr) from communicate and exposes .returncode -- enough to
+    # let tests assert on argv passed to Popen without spawning anything.
     proc = MagicMock()
-    proc.stdout = stdout
-    proc.stderr = stderr
+    proc.communicate.return_value = (stdout, stderr)
     proc.returncode = returncode
+    proc.pid = 12345
     return proc
 
 
@@ -118,7 +121,7 @@ class RunAgentDispatchTest(unittest.TestCase):
         # find; the codex runner doesn't care about claude shape.
         sid = "abcdef12-3456-7890-abcd-ef1234567890"
         with patch(
-            "orchestrator.agents.subprocess.run",
+            "orchestrator.agents.subprocess.Popen",
             return_value=_completed(stdout=json.dumps({"session_id": sid})),
         ) as run_mock:
             result = run_agent("codex", "p", _CWD)
@@ -135,7 +138,7 @@ class RunAgentDispatchTest(unittest.TestCase):
             json.dumps({"type": "result", "result": "shipped"}),
         ]
         with patch(
-            "orchestrator.agents.subprocess.run",
+            "orchestrator.agents.subprocess.Popen",
             return_value=_completed(stdout="\n".join(events)),
         ) as run_mock:
             result = run_agent("claude", "p", _CWD)
@@ -160,7 +163,7 @@ class RunCodexEnvScrubTest(unittest.TestCase):
             "PATH": "/usr/bin",
         }
         with patch.dict("os.environ", env, clear=True), patch(
-            "orchestrator.agents.subprocess.run",
+            "orchestrator.agents.subprocess.Popen",
             return_value=_completed(),
         ) as run_mock:
             _run_codex("p", _CWD)
@@ -174,7 +177,7 @@ class RunClaudeResumeTest(unittest.TestCase):
     def test_resume_passes_resume_session_id_arg(self) -> None:
         sid = "deadbeef-1234-1234-1234-1234deadbeef"
         with patch(
-            "orchestrator.agents.subprocess.run",
+            "orchestrator.agents.subprocess.Popen",
             return_value=_completed(),
         ) as run_mock:
             _run_claude("followup", _CWD, resume_session_id=sid)

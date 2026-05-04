@@ -94,6 +94,11 @@ REPO: str = os.environ.get("REPO", "podlodka-ai-club/spark-gap")
 GITHUB_TOKEN: str = _resolve_github_token(REPO)
 POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "60"))
 AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))
+
+# Persistent log location. main.py attaches a FileHandler here in addition to
+# the existing stderr stream, so post-mortems don't depend on the terminal
+# `run.sh` was started in. Already covered by the `*.log` .gitignore rule.
+LOG_DIR: Path = Path(os.environ.get("LOG_DIR", str(REPO_ROOT / "logs")))
 REVIEW_TIMEOUT: int = int(os.environ.get("REVIEW_TIMEOUT", str(AGENT_TIMEOUT)))
 MAX_REVIEW_ROUNDS: int = int(os.environ.get("MAX_REVIEW_ROUNDS", "3"))
 # Cap on how many fresh implementing-codex spawns one issue can use within a

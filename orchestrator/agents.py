@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -121,18 +122,48 @@ def _run_subprocess(
     env: dict[str, str],
     timeout: int,
 ) -> tuple[str, str, int, bool]:
-    timed_out = False
+    # Spawn the agent in its own process group (start_new_session=True =>
+    # setsid). On timeout we send SIGTERM to the whole group, not just the
+    # direct child, so that grandchildren the agent forked (Maven, gradle,
+    # JVM test runners, ...) are also reaped. Without this, a 30-min build
+    # the agent kicked off keeps running for hours after the agent itself
+    # was killed -- we hit exactly that with a hudi-spark scalatest sweep.
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), env=env,
-            capture_output=True, text=True, timeout=timeout,
-        )
-        return proc.stdout, proc.stderr, proc.returncode, False
-    except subprocess.TimeoutExpired as e:
-        timed_out = True
-        stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        stderr = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
-        return stdout, stderr, -1, timed_out
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return stdout or "", stderr or "", proc.returncode, False
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return stdout or "", stderr or "", -1, True
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the whole process group, then SIGKILL after a grace window.
+
+    ProcessLookupError races are expected (the leader may have exited between
+    the Python-side timeout firing and our killpg call) -- swallow them.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def _run_codex(
