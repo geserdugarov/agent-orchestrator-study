@@ -2362,6 +2362,48 @@ class SquashHelperRealGitTest(unittest.TestCase):
         self.assertTrue((self.work / "scratch.txt").exists())
         pm.assert_not_called()
 
+    def test_dirty_worktree_with_single_commit_still_fails(self) -> None:
+        # The dirty-tree refusal is a precondition for the whole helper,
+        # not just the rewrite path. A one-commit branch (squash would
+        # be a no-op) with an uncommitted file must still fail so the
+        # caller parks awaiting_human; otherwise AUTO_MERGE could land
+        # the head with the operator's scratch invisible on the PR.
+        self._git("reset", "--hard", "origin/main", cwd=self.work)
+        author_env = {
+            "GIT_AUTHOR_NAME": "Dev", "GIT_AUTHOR_EMAIL": "dev@example.com",
+            "GIT_COMMITTER_NAME": "Dev", "GIT_COMMITTER_EMAIL": "dev@example.com",
+        }
+        (self.work / "only.txt").write_text("only\n")
+        self._git("add", ".", cwd=self.work)
+        self._git(
+            "commit", "-m", "feat: only one", cwd=self.work,
+            env_extra=author_env,
+        )
+        original_head = self._git(
+            "rev-parse", "HEAD", cwd=self.work,
+        ).strip()
+        (self.work / "scratch.txt").write_text("uncommitted\n")
+
+        issue = self._make_issue()
+        with patch.object(config, "BASE_BRANCH", "main"), \
+             patch.object(workflow, "_push_branch", return_value=True) as pm:
+            success, sha, count, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertFalse(success)
+        self.assertIsNone(sha)
+        self.assertEqual(count, 0)
+        self.assertIn("uncommitted", (err or ""))
+        # Single-commit + dirty path must NOT short-circuit to the
+        # no-op success branch. HEAD untouched, dirty file preserved,
+        # no push attempted.
+        self.assertEqual(
+            self._git("rev-parse", "HEAD", cwd=self.work).strip(),
+            original_head,
+        )
+        self.assertTrue((self.work / "scratch.txt").exists())
+        pm.assert_not_called()
+
 
 class ListPollableIssuesTest(unittest.TestCase):
     """Closed-but-`in_review` issues must still be picked up so external

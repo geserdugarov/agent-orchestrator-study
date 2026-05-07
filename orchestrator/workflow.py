@@ -596,6 +596,17 @@ def _squash_and_force_push(
     if not original_head:
         return False, None, 0, "could not read original HEAD"
 
+    # Dirty-tree refusal is a hard precondition for the whole helper, NOT
+    # just the rewrite path: the issue spec lists "dirty tree" alongside
+    # push rejection / lease violation as a failure that must park
+    # awaiting_human and leave the original commits in place. A
+    # one-commit branch whose worktree happens to carry uncommitted
+    # changes (operator scratch, agent side-effect) must still surface
+    # to a human -- handing off to in_review with the dirty state
+    # invisible would let AUTO_MERGE land an incomplete head.
+    if _worktree_dirty_files(worktree):
+        return False, None, 0, "worktree has uncommitted changes"
+
     log_r = _git(
         "log", "--reverse", "--pretty=%s", f"{base_sha}..HEAD",
         cwd=worktree,
@@ -612,9 +623,6 @@ def _squash_and_force_push(
         # Nothing to squash; the caller can still record original_head
         # as agent_approved_sha if it wants.
         return True, original_head, 0, None
-
-    if _worktree_dirty_files(worktree):
-        return False, None, 0, "worktree has uncommitted changes"
 
     if _is_conventional_subject(subjects[0]):
         subject = subjects[0]
