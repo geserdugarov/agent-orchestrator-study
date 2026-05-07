@@ -134,8 +134,42 @@ def _branch_name(issue_number: int) -> str:
     return f"orchestrator/issue-{issue_number}"
 
 
-def _worktree_path(issue_number: int) -> Path:
-    return config.WORKTREES_DIR / f"issue-{issue_number}"
+# Allowed characters in a worktree directory segment: alphanumerics plus
+# `_`, `.`, `-`. `/` is excluded so the slug stays a single path segment;
+# anything else is replaced with `_`. A leading `.` is also escaped so the
+# per-repo subdir is never a hidden directory.
+_SLUG_SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _sanitize_slug(slug: str) -> str:
+    """Turn an `owner/name` repo slug into a single filesystem-safe segment.
+
+    `/` collapses to `__` so two repos with the same issue number cannot
+    share a worktree path. Any other character outside `[A-Za-z0-9_.-]`
+    becomes `_`. A leading `.` is escaped to `_.` so the per-repo subdir
+    is never a dotfile-hidden directory. An empty/all-stripped input
+    falls back to `_` rather than collapsing into the bare WORKTREES_DIR.
+    """
+    cleaned = _SLUG_SAFE_RE.sub("_", (slug or "").replace("/", "__"))
+    if not cleaned:
+        return "_"
+    if cleaned.startswith("."):
+        cleaned = "_" + cleaned
+    return cleaned
+
+
+def _repo_worktrees_root(spec: RepoSpec) -> Path:
+    """Per-repo subdirectory under WORKTREES_DIR for this spec.
+
+    Two specs with the same issue number must not collide on disk, so the
+    issue-N / decompose-N segments live inside a sanitized-slug parent
+    instead of directly under WORKTREES_DIR.
+    """
+    return config.WORKTREES_DIR / _sanitize_slug(spec.slug)
+
+
+def _worktree_path(spec: RepoSpec, issue_number: int) -> Path:
+    return _repo_worktrees_root(spec) / f"issue-{issue_number}"
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
@@ -155,8 +189,8 @@ def _ensure_worktree(spec: RepoSpec, issue_number: int) -> Path:
     committing and the orchestrator pushing -- without it, the next tick would
     wipe the worktree and we'd burn another codex run on the same prompt.
     """
-    config.WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
-    wt = _worktree_path(issue_number)
+    _repo_worktrees_root(spec).mkdir(parents=True, exist_ok=True)
+    wt = _worktree_path(spec, issue_number)
     branch = _branch_name(issue_number)
 
     if wt.exists():
@@ -291,8 +325,8 @@ def _worktree_dirty_files(worktree: Path) -> list[str]:
 # commit on the old base. A separate detached-HEAD checkout sidesteps the
 # problem entirely: the implementer's `_ensure_worktree` always sees a
 # fresh per-issue branch created from the current `origin/<base>`.
-def _decompose_worktree_path(issue_number: int) -> Path:
-    return config.WORKTREES_DIR / f"decompose-{issue_number}"
+def _decompose_worktree_path(spec: RepoSpec, issue_number: int) -> Path:
+    return _repo_worktrees_root(spec) / f"decompose-{issue_number}"
 
 
 def _ensure_decompose_worktree(spec: RepoSpec, issue_number: int) -> Path:
@@ -302,8 +336,8 @@ def _ensure_decompose_worktree(spec: RepoSpec, issue_number: int) -> Path:
     is read-only and stateless across runs, so we always want it to see
     the current base, not whatever was left over from a prior run.
     """
-    config.WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
-    wt = _decompose_worktree_path(issue_number)
+    _repo_worktrees_root(spec).mkdir(parents=True, exist_ok=True)
+    wt = _decompose_worktree_path(spec, issue_number)
     if wt.exists():
         _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
     _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
@@ -325,7 +359,7 @@ def _cleanup_decompose_worktree(spec: RepoSpec, issue_number: int) -> None:
     are logged but never raised -- cleanup must not mask the real exit.
     """
     try:
-        wt = _decompose_worktree_path(issue_number)
+        wt = _decompose_worktree_path(spec, issue_number)
         if wt.exists():
             _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
     except Exception:
@@ -803,7 +837,7 @@ def _resume_decomposer_on_human_reply(
         f"@{c.user.login if c.user else 'user'}: {c.body}"
         for c in new_comments if c.body
     )
-    wt = _decompose_worktree_path(issue.number)
+    wt = _decompose_worktree_path(spec, issue.number)
     if not wt.exists():
         wt = _ensure_decompose_worktree(spec, issue.number)
     decomposer_agent, decomposer_sid = _read_decomposer_session(state)
@@ -989,7 +1023,7 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # ignored, agent misbehaving, operator scratch). Park awaiting
         # human and KEEP the worktree past this tick so the operator can
         # inspect what the decomposer actually produced before resetting.
-        wt = _decompose_worktree_path(issue.number)
+        wt = _decompose_worktree_path(spec, issue.number)
         if _has_new_commits(spec, wt) or _worktree_dirty_files(wt):
             keep_worktree = True
             _park_awaiting_human(
@@ -1437,7 +1471,7 @@ def _resume_dev_with_text(
     `awaiting_human` flag because the caller is reacting to a fresh human
     signal (issue or PR comment) by spawning the agent.
     """
-    wt = _worktree_path(issue.number)
+    wt = _worktree_path(spec, issue.number)
     if not wt.exists():
         wt = _ensure_worktree(spec, issue.number)
     dev_agent, dev_sid = _read_dev_session(state)
@@ -1533,7 +1567,7 @@ def _handle_implementing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None
         gh.write_pinned_state(issue, state)
         return
 
-    wt = _worktree_path(issue.number)
+    wt = _worktree_path(spec, issue.number)
     if _has_new_commits(spec, wt):
         dirty = _worktree_dirty_files(wt)
         if dirty:
@@ -1601,7 +1635,7 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # but on success we stay in validating and bump the round so the reviewer
     # runs again on the next tick.
     if state.get("awaiting_human"):
-        wt = _worktree_path(issue.number)
+        wt = _worktree_path(spec, issue.number)
         if not wt.exists():
             wt = _ensure_worktree(spec, issue.number)
         before_sha = _head_sha(wt)
@@ -2273,7 +2307,7 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 return  # human may still be typing; wait a tick
 
         followup = _build_pr_comment_followup(new_comments)
-        wt = _worktree_path(issue.number)
+        wt = _worktree_path(spec, issue.number)
         if not wt.exists():
             wt = _ensure_worktree(spec, issue.number)
         before_sha = _head_sha(wt)
@@ -2406,7 +2440,7 @@ def _on_commits(
     state: PinnedState,
     result: AgentResult,
 ) -> None:
-    wt = _worktree_path(issue.number)
+    wt = _worktree_path(spec, issue.number)
     branch = _branch_name(issue.number)
     if not _push_branch(spec, wt, branch):
         # Park on awaiting_human like the timeout/question paths. Otherwise the
