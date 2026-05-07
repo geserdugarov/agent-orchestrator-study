@@ -1,5 +1,5 @@
 [project]
-name = "agent-orchestrator-study"
+name = "agent-orchestrator"
 version = "0.0.1"
 description = "GitHub-Issue-driven AI agent workflow."
 requires-python = ">=3.12"

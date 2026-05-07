@@ -2,7 +2,7 @@
 
 ## Status as of 2026-05-03
 
-**Self-bootstrap path is shipped, with the full lifecycle now wired.** The scaffold, polling loop, codex/claude invocation, hardened push, PR open, and the (no label → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `done`/`rejected`) state machine all exist on `main` (commits `eb87246` … `029b08f`, plus the decomposition stage). The orchestrator can be pointed at `podlodka-ai-club/spark-gap` and run end-to-end against any bootstrap or oversized test issue.
+**Self-bootstrap path is shipped, with the full lifecycle now wired.** The scaffold, polling loop, codex/claude invocation, hardened push, PR open, and the (no label → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `done`/`rejected`) state machine all exist on `main` (commits `eb87246` … `029b08f`, plus the decomposition stage). The orchestrator can be pointed at `geserdugarov/agent-orchestrator` and run end-to-end against any bootstrap or oversized test issue.
 
 Done:
 
@@ -103,7 +103,7 @@ Defer to Week 2 (Day 6–14): ~~`validating` stage with claude PR review~~ (now 
 Flat package, ~5 files for the bootstrap milestone. No premature abstraction. Current shape on disk:
 
 ```
-/home/geserdugarov/git/agent-orchestrator-study/
+/home/geserdugarov/git/agent-orchestrator/
 ├── README.md
 ├── docs/workflow.md                (Russian-language source of truth for label/stage semantics)
 ├── orchestrator/
@@ -188,7 +188,7 @@ Because the orchestrator is editing its own code, when a self-touching PR merges
 
 ## GitHub auth
 
-- **Fine-grained PAT scoped to `podlodka-ai-club/spark-gap` only**, with read/write on Contents, Issues, Pull requests, Metadata.
+- **Fine-grained PAT scoped to `geserdugarov/agent-orchestrator` only**, with read/write on Contents, Issues, Pull requests, Metadata.
 - **Token storage (revised from original plan).** The PAT is **not** stored in `.env` — that file is reachable from the agent's worktree via relative path. It must come from either the orchestrator's process environment (`GITHUB_TOKEN=…` exported before launch) or a file outside `REPO_ROOT`. Default file path is `~/.config/<owner>/<repo>/token`, derived from `REPO`; override with `ORCHESTRATOR_TOKEN_FILE`. `config._load_dotenv` actively rejects `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_TOKEN`/etc. found in `.env` with a clear stderr message.
 - `config.py` reads `.env` manually (no dep). The agent process never receives `GITHUB_TOKEN` (or any `GH_*` / `GIT_TOKEN` synonym) — `agents.run_codex` strips them from the inherited environment.
 - The orchestrator does the `git push` itself via an askpass tempscript (token in env, never in argv) and does the PR open via PyGithub. The agent only edits files and commits inside its worktree. See "Done beyond the original plan" above for the full list of push hardening.

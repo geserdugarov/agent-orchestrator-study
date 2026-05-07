@@ -1,4 +1,4 @@
-# agent-orchestrator-study
+# Agent orchestration
 
 Orchestrator for automatic issues resolving utilizing agents.
 
@@ -46,8 +46,8 @@ Pinned in [`pyproject.toml`](pyproject.toml):
 1. **Clone and enter the repo**
 
    ```sh
-   git clone https://github.com/podlodka-ai-club/spark-gap.git
-   cd spark-gap
+   git clone https://github.com/geserdugarov/agent-orchestrator.git
+   cd agent-orchestrator
    ```
 
 2. **Create a venv and install dependencies**
@@ -75,9 +75,9 @@ Pinned in [`pyproject.toml`](pyproject.toml):
    For the default repo:
 
    ```sh
-   install -d -m 700 ~/.config/podlodka-ai-club/spark-gap
-   printf %s "$YOUR_PAT" > ~/.config/podlodka-ai-club/spark-gap/token
-   chmod 600 ~/.config/podlodka-ai-club/spark-gap/token
+   install -d -m 700 ~/.config/geserdugarov/agent-orchestrator
+   printf %s "$YOUR_PAT" > ~/.config/geserdugarov/agent-orchestrator/token
+   chmod 600 ~/.config/geserdugarov/agent-orchestrator/token
    ```
 
    Or export `GITHUB_TOKEN` in the orchestrator's launch environment. Putting
@@ -125,7 +125,7 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | ------------------------- | --------------------------------------------- | --------------------------------------------------------- |
 | `GITHUB_TOKEN`            | _(required, env-only — not read from `.env`)_ | fine-grained PAT                                          |
 | `ORCHESTRATOR_TOKEN_FILE` | `~/.config/<owner>/<repo>/token` (from `REPO`) | path to PAT file (used when `GITHUB_TOKEN` is not in env) |
-| `REPO`                    | `podlodka-ai-club/spark-gap`       | `owner/name` of the repo to manage                        |
+| `REPO`                    | `geserdugarov/agent-orchestrator`  | `owner/name` of the repo to manage                        |
 | `POLL_INTERVAL`           | `60`                                          | seconds between polling ticks                             |
 | `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
 | `REVIEW_TIMEOUT`          | (= `AGENT_TIMEOUT`)                           | wall-clock cap per reviewer invocation, seconds           |

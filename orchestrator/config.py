@@ -3,7 +3,7 @@
 Secrets are deliberately NOT loaded from REPO_ROOT/.env. The implementer agent
 runs in a sibling worktree with sandbox bypass, so anything readable inside
 REPO_ROOT (including .env) is recoverable by a prompt-injected agent via a
-relative-path read like `cat ../agent-orchestrator-study/.env`. GITHUB_TOKEN is
+relative-path read like `cat ../agent-orchestrator/.env`. GITHUB_TOKEN is
 only read from the process environment or from a token file outside REPO_ROOT
 (default `~/.config/<owner>/<repo>/token` derived from REPO, override with
 ORCHESTRATOR_TOKEN_FILE).
@@ -90,7 +90,7 @@ def _parse_hitl_handles(raw: str) -> tuple[str, ...]:
         seen.add(handle)
     return tuple(handles)
 
-REPO: str = os.environ.get("REPO", "podlodka-ai-club/spark-gap")
+REPO: str = os.environ.get("REPO", "geserdugarov/agent-orchestrator")
 GITHUB_TOKEN: str = _resolve_github_token(REPO)
 POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "60"))
 AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))

@@ -10,7 +10,7 @@ class HitlHandleConfigTest(unittest.TestCase):
     def _load_config(self, hitl_handle: str):
         env = {
             "HITL_HANDLE": hitl_handle,
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         with patch.dict(os.environ, env, clear=True):
             sys.modules.pop("orchestrator.config", None)
@@ -41,7 +41,7 @@ class HitlHandleConfigTest(unittest.TestCase):
 class AgentGitIdentityConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
             full_env.update(env)
@@ -76,7 +76,7 @@ class AgentBackendConfigTest(unittest.TestCase):
 
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
             full_env.update(env)
@@ -150,7 +150,7 @@ class DecomposeKillSwitchConfigTest(unittest.TestCase):
 
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
             full_env.update(env)
@@ -194,7 +194,7 @@ class AutoMergeConfigTest(unittest.TestCase):
 
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
             full_env.update(env)
@@ -238,7 +238,7 @@ class AutoMergeConfigTest(unittest.TestCase):
 class InReviewDebounceConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
             full_env.update(env)
@@ -261,7 +261,7 @@ class InReviewDebounceConfigTest(unittest.TestCase):
 class MaxRetriesPerDayConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
-            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-study-token-missing",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
             full_env.update(env)
