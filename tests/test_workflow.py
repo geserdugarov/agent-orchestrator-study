@@ -166,6 +166,131 @@ class ParseReviewVerdictTest(unittest.TestCase):
         self.assertEqual(_parse_review_verdict(""), ("unknown", ""))
 
 
+class PushBranchTest(unittest.TestCase):
+    """`_push_branch` handles the divergence cases that bit issue-5.
+
+    A self-restart can leave the local worktree on a different SHA than the
+    one already pushed (e.g. codex `resume=False` rerun produced equivalent
+    work with new committer dates). A plain push then fails non-fast-forward
+    and parks the issue. The function uses ls-remote + --force-with-lease so
+    the retry succeeds, and the lease still blocks unobserved updates.
+    """
+
+    @staticmethod
+    def _ok(stdout: str = "", stderr: str = "") -> "object":
+        from unittest.mock import MagicMock
+
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = stdout
+        r.stderr = stderr
+        return r
+
+    @staticmethod
+    def _fail(stderr: str = "boom") -> "object":
+        from unittest.mock import MagicMock
+
+        r = MagicMock()
+        r.returncode = 128
+        r.stdout = ""
+        r.stderr = stderr
+        return r
+
+    def _patch(self, run_results: list) -> "tuple":
+        from unittest.mock import MagicMock
+
+        run_mock = MagicMock(side_effect=run_results)
+        token_patch = patch.object(
+            workflow.config, "GITHUB_TOKEN", "ghp-test-secret"
+        )
+        run_patch = patch.object(workflow.subprocess, "run", run_mock)
+        return run_mock, token_patch, run_patch
+
+    def test_existing_remote_branch_force_with_lease_uses_observed_sha(
+        self,
+    ) -> None:
+        # rewrite check (clean), ls-remote (returns sha), push (ok)
+        sha = "87b2bc94b03a1729ef8b8145836d0959f433600e"
+        ls_stdout = f"{sha}\trefs/heads/orchestrator/issue-5\n"
+        run_mock, token_patch, run_patch = self._patch(
+            [self._ok(), self._ok(stdout=ls_stdout), self._ok()]
+        )
+        with token_patch, run_patch:
+            ok = workflow._push_branch(
+                _TEST_SPEC, _FAKE_WT, "orchestrator/issue-5"
+            )
+        self.assertTrue(ok)
+        push_cmd = run_mock.call_args_list[2].args[0]
+        self.assertIn("push", push_cmd)
+        self.assertIn(
+            f"--force-with-lease=refs/heads/orchestrator/issue-5:{sha}",
+            push_cmd,
+        )
+        self.assertIn("HEAD:refs/heads/orchestrator/issue-5", push_cmd)
+
+    def test_missing_remote_branch_uses_empty_lease(self) -> None:
+        # First push ever for this branch -- ls-remote returns nothing, the
+        # lease becomes "expect ref to not exist" so a concurrent create still
+        # fails the lease.
+        run_mock, token_patch, run_patch = self._patch(
+            [self._ok(), self._ok(stdout=""), self._ok()]
+        )
+        with token_patch, run_patch:
+            ok = workflow._push_branch(
+                _TEST_SPEC, _FAKE_WT, "orchestrator/issue-9"
+            )
+        self.assertTrue(ok)
+        push_cmd = run_mock.call_args_list[2].args[0]
+        self.assertIn(
+            "--force-with-lease=refs/heads/orchestrator/issue-9:",
+            push_cmd,
+        )
+
+    def test_ls_remote_failure_aborts_without_pushing(self) -> None:
+        run_mock, token_patch, run_patch = self._patch(
+            [self._ok(), self._fail("network down")]
+        )
+        with token_patch, run_patch:
+            ok = workflow._push_branch(
+                _TEST_SPEC, _FAKE_WT, "orchestrator/issue-5"
+            )
+        self.assertFalse(ok)
+        # Only rewrite-check + ls-remote ran; the push subprocess.run was not
+        # invoked.
+        self.assertEqual(run_mock.call_count, 2)
+
+    def test_push_failure_returns_false(self) -> None:
+        ls_stdout = "abc123\trefs/heads/orchestrator/issue-5\n"
+        run_mock, token_patch, run_patch = self._patch(
+            [self._ok(), self._ok(stdout=ls_stdout), self._fail("rejected")]
+        )
+        with token_patch, run_patch:
+            ok = workflow._push_branch(
+                _TEST_SPEC, _FAKE_WT, "orchestrator/issue-5"
+            )
+        self.assertFalse(ok)
+
+    def test_url_rewrite_in_local_config_refuses_push(self) -> None:
+        # Local .git/config carrying a url.<host>.insteadOf rewrite is the
+        # exfil vector the security hardening guards against; ls-remote and
+        # push must never run.
+        from unittest.mock import MagicMock
+
+        rewrite_hit = MagicMock()
+        rewrite_hit.returncode = 0
+        rewrite_hit.stdout = (
+            "url.https://evil.example.com/.insteadof https://github.com/\n"
+        )
+        rewrite_hit.stderr = ""
+        run_mock, token_patch, run_patch = self._patch([rewrite_hit])
+        with token_patch, run_patch:
+            ok = workflow._push_branch(
+                _TEST_SPEC, _FAKE_WT, "orchestrator/issue-5"
+            )
+        self.assertFalse(ok)
+        self.assertEqual(run_mock.call_count, 1)
+
+
 class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_pickup_with_decompose_off_routes_straight_to_implementing(
         self,

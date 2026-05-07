@@ -343,6 +343,16 @@ def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
     world-readable on Linux. We also use an explicit `HEAD:refs/heads/<branch>`
     refspec so no upstream is set and no remote URL is stored in .git/config.
 
+    The push uses `--force-with-lease` against the SHA observed by `ls-remote`
+    on this same call. The orchestrator owns the `orchestrator/issue-<n>`
+    namespace, but a self-restart between commit and push can leave the
+    worktree on a different SHA than what was already pushed -- e.g. a
+    `resume=False` rerun of codex amending equivalent work, or a previous
+    push that succeeded silently. A plain push then fails non-fast-forward
+    and parks the issue. The lease lets the retry succeed while still
+    refusing to clobber a concurrent foreign update (the lease check
+    compares against what we observed, not a stale remote-tracking ref).
+
     The worktree is shared with the codex agent, so anything in `.git/hooks/`
     or `.git/config` is attacker-controlled. The agent also writes as the same
     OS user, so it can plant `~/.gitconfig` (or anything pointed at by
@@ -394,13 +404,38 @@ def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
             "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
         }
+        git_prefix = [
+            "git",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "credential.helper=",
+            "-c", "core.fsmonitor=",
+        ]
+        ref = f"refs/heads/{branch}"
+        ls = subprocess.run(
+            [*git_prefix, "ls-remote", auth_url, ref],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if ls.returncode != 0:
+            scrubbed = (ls.stderr or "").replace(config.GITHUB_TOKEN, "***")
+            log.error("git ls-remote failed for %s: %s", branch, scrubbed)
+            return False
+        remote_sha = ""
+        for line in (ls.stdout or "").splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == ref:
+                remote_sha = parts[0]
+                break
+        # An empty <expected> in --force-with-lease means "expect the ref to
+        # not exist", which is the right lease for the create-branch case.
         r = subprocess.run(
             [
-                "git",
-                "-c", "core.hooksPath=/dev/null",
-                "-c", "credential.helper=",
-                "-c", "core.fsmonitor=",
-                "push", auth_url, f"HEAD:refs/heads/{branch}",
+                *git_prefix,
+                "push",
+                f"--force-with-lease={ref}:{remote_sha}",
+                auth_url, f"HEAD:{ref}",
             ],
             cwd=str(worktree),
             capture_output=True,
