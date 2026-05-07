@@ -535,6 +535,110 @@ def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
     return True
 
 
+def _squash_and_force_push(
+    spec: RepoSpec, worktree: Path, branch: str, issue: Issue,
+) -> Tuple[bool, Optional[str], int, Optional[str]]:
+    """Squash all commits since `origin/<base>` into one, force-push with lease.
+
+    Returns `(success, new_head_sha, squashed_count, error_message)`:
+      * `(True, sha, 0, None)` — nothing to squash (zero or one commit on top
+        of base). Caller should leave state alone; agent_approved_sha keeps
+        pointing at the SHA the reviewer ran against.
+      * `(True, sha, N, None)` — squashed N>1 commits into one. `sha` is the
+        new local HEAD; the remote was force-pushed to match.
+      * `(False, _, _, error)` — squash or push failed. Caller parks
+        awaiting_human; the original commits remain on the local branch
+        (we abort before resetting if any check fails) and the remote was
+        not updated.
+
+    The squash commit subject reuses the first commit's subject when it
+    already matches conventional-commit form; otherwise it builds one from
+    the issue title with a `feat:` prefix. Body aggregates the prior
+    subjects so reviewers see what landed in the squash. The commit is
+    authored under the AGENT_GIT_* identity (via env vars) so attribution
+    matches the per-step commits this squash replaces.
+    """
+    base_ref = f"origin/{spec.base_branch}"
+    mb = _git("merge-base", base_ref, "HEAD", cwd=worktree)
+    if mb.returncode != 0:
+        return False, None, 0, f"merge-base failed: {(mb.stderr or '').strip()}"
+    base_sha = (mb.stdout or "").strip()
+    if not base_sha:
+        return False, None, 0, "merge-base returned empty"
+
+    log_r = _git(
+        "log", "--reverse", "--pretty=%s", f"{base_sha}..HEAD",
+        cwd=worktree,
+    )
+    if log_r.returncode != 0:
+        return (
+            False, None, 0,
+            f"git log failed: {(log_r.stderr or '').strip()}",
+        )
+    subjects = [
+        line for line in (log_r.stdout or "").splitlines() if line.strip()
+    ]
+    if len(subjects) <= 1:
+        # Nothing to squash. Return the current HEAD so the caller can
+        # still record agent_approved_sha if it wants.
+        return True, _head_sha(worktree) or None, 0, None
+
+    if _worktree_dirty_files(worktree):
+        return False, None, 0, "worktree has uncommitted changes"
+
+    if _is_conventional_subject(subjects[0]):
+        subject = subjects[0]
+    else:
+        title = (issue.title or "").strip() or f"resolve issue #{issue.number}"
+        subject = f"feat: {title}"
+
+    body_lines = [
+        "Squashed commits:",
+        *(f"- {s}" for s in subjects),
+    ]
+    message = subject + "\n\n" + "\n".join(body_lines) + "\n"
+
+    reset_r = _git("reset", "--soft", base_sha, cwd=worktree)
+    if reset_r.returncode != 0:
+        return (
+            False, None, 0,
+            f"reset --soft failed: {(reset_r.stderr or '').strip()}",
+        )
+
+    commit_env = {
+        **os.environ,
+        **_GIT_NO_PROMPT_ENV,
+        "GIT_AUTHOR_NAME": config.AGENT_GIT_NAME,
+        "GIT_AUTHOR_EMAIL": config.AGENT_GIT_EMAIL,
+        "GIT_COMMITTER_NAME": config.AGENT_GIT_NAME,
+        "GIT_COMMITTER_EMAIL": config.AGENT_GIT_EMAIL,
+    }
+    commit_r = subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        env=commit_env,
+    )
+    if commit_r.returncode != 0:
+        return (
+            False, None, 0,
+            f"squash commit failed: {(commit_r.stderr or '').strip()}",
+        )
+
+    new_sha = _head_sha(worktree)
+    if not new_sha:
+        return False, None, 0, "could not read new HEAD after squash"
+
+    if not _push_branch(spec, worktree, branch):
+        return False, new_sha, len(subjects), (
+            "force-push with lease rejected (concurrent update or "
+            "lease violation); see orchestrator logs"
+        )
+
+    return True, new_sha, len(subjects), None
+
+
 def _build_implement_prompt(issue: Issue, comments_text: str) -> str:
     body = issue.body or "(no body)"
     convo = comments_text or "(no prior comments)"
@@ -1905,6 +2009,41 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                     "issue=#%s could not post approval to PR #%s",
                     issue.number, pr_number,
                 )
+
+        # Squash before seeding the in_review handoff. If the squash or
+        # force-push fails we park awaiting_human and STAY in `validating`
+        # (no relabel), so the original commits remain on the branch and a
+        # human can adjudicate. On success the new local HEAD becomes the
+        # SHA AUTO_MERGE will gate on; the existing
+        # `agent_approved_sha == pr.head.sha` invariant then keeps holding
+        # because the remote also points at the new SHA after the
+        # force-push, and `_latest_review_states_for_head` naturally
+        # invalidates any stale GitHub review (its `commit_id` no longer
+        # matches the new head), leaving the agent's `agent_approved_sha`
+        # as the only thing keeping AUTO_MERGE viable -- which is exactly
+        # the point.
+        new_head_sha = reviewed_sha
+        squashed_count = 0
+        if config.SQUASH_ON_APPROVAL:
+            success, sha_after, n_squashed, err = _squash_and_force_push(
+                spec, wt, _branch_name(issue.number), issue,
+            )
+            if not success:
+                _park_awaiting_human(
+                    gh, issue, state,
+                    f"{config.HITL_MENTIONS} squash-on-approval failed "
+                    f"({err}); the original commits are still on the "
+                    "branch and the PR was not relabeled. Manual "
+                    "intervention needed (squash + force-push by hand, "
+                    "or set `SQUASH_ON_APPROVAL=off` and re-run the "
+                    "reviewer).",
+                )
+                gh.write_pinned_state(issue, state)
+                return
+            if sha_after:
+                new_head_sha = sha_after
+            squashed_count = n_squashed
+
         if pr_number is not None:
             # Snapshot what the reviewer agent approved and seed the
             # in_review comment watermark. Without these, `_handle_in_review`
@@ -1926,14 +2065,33 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                     "handoff: %s", issue.number, pr_number, e,
                 )
             else:
-                # Persist the local SHA the reviewer ran against, not the
-                # current remote head. The auto-merge gate's existing
-                # `agent_approved_sha == head_sha` check then naturally
-                # rejects the branch-update race: if pr.head.sha has moved
-                # past `reviewed_sha`, agent_approved_sha won't match the
-                # new head and AUTO_MERGE waits for a fresh review round.
-                if reviewed_sha:
-                    state.set("agent_approved_sha", reviewed_sha)
+                # Post the squash PR comment BEFORE seeding watermarks so
+                # the seed walks past it (its id lands in
+                # `orchestrator_comment_ids` via `_post_pr_comment`).
+                # Without that ordering, the next in_review tick treats
+                # the squash comment as fresh PR feedback once the
+                # debounce expires and resumes the dev session over an
+                # informational orchestrator post.
+                if squashed_count > 1:
+                    try:
+                        _post_pr_comment(
+                            gh, int(pr_number), state,
+                            f":package: squashed {squashed_count} commits "
+                            "to 1 after approval",
+                        )
+                    except Exception:
+                        log.exception(
+                            "issue=#%s could not post squash notice to "
+                            "PR #%s", issue.number, pr_number,
+                        )
+                # Persist the local SHA the reviewer (or the squash)
+                # produced, not the current remote head. The auto-merge
+                # gate's existing `agent_approved_sha == head_sha` check
+                # then naturally rejects the branch-update race: if the
+                # remote moves past this SHA, agent_approved_sha won't
+                # match and AUTO_MERGE waits for a fresh review round.
+                if new_head_sha:
+                    state.set("agent_approved_sha", new_head_sha)
                 issue_wm, review_wm = _latest_pr_comment_ids(
                     gh, issue, pr, state
                 )

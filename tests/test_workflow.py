@@ -79,6 +79,7 @@ class _PatchedWorkflowMixin:
         push_branch=True,
         head_shas=("",),
         first_commit_subject="",
+        squash_result=(True, None, 0, None),
     ):
         from unittest.mock import MagicMock
 
@@ -104,6 +105,10 @@ class _PatchedWorkflowMixin:
         # the PR title; mock it so tests don't shell out to git.
         first_subject_mock = MagicMock(return_value=first_commit_subject)
         cleanup_merged_mock = MagicMock()
+        # Squash helper would otherwise shell out to `git merge-base` etc.
+        # against `_FAKE_WT`. Default: success-no-op, so tests not exercising
+        # the squash path see no agent_approved_sha override.
+        squash_mock = MagicMock(return_value=tuple(squash_result))
 
         with patch.object(workflow, "run_agent", rc_mock), \
              patch.object(workflow, "_ensure_worktree", wt_mock), \
@@ -115,7 +120,8 @@ class _PatchedWorkflowMixin:
              patch.object(workflow, "_worktree_dirty_files", df_mock), \
              patch.object(workflow, "_push_branch", push_mock), \
              patch.object(workflow, "_head_sha", head_mock), \
-             patch.object(workflow, "_first_commit_subject", first_subject_mock):
+             patch.object(workflow, "_first_commit_subject", first_subject_mock), \
+             patch.object(workflow, "_squash_and_force_push", squash_mock):
             callable_()
 
         return {
@@ -130,6 +136,7 @@ class _PatchedWorkflowMixin:
             "_push_branch": push_mock,
             "_head_sha": head_mock,
             "_first_commit_subject": first_subject_mock,
+            "_squash_and_force_push": squash_mock,
         }
 
 
@@ -1877,6 +1884,230 @@ class ValidatingToInReviewHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
             f"watermark must not regress past consumed PR feedback (got {wm})",
         )
         self.assertEqual(data.get("pr_last_review_comment_id"), 4242)
+
+
+class SquashOnApprovalTest(unittest.TestCase, _PatchedWorkflowMixin):
+    """After the reviewer agent emits VERDICT: APPROVED, the orchestrator
+    squashes the dev's commits on the PR branch into one and force-pushes
+    so the resulting PR is a single conventional-commit-shaped commit. The
+    new local HEAD is recorded as `agent_approved_sha`; watermarks advance
+    past the squash notice; and the next in_review tick must merge
+    (AUTO_MERGE on) WITHOUT re-running the reviewer on the rewritten head.
+
+    Failures (push rejected, lease violation, dirty tree) park
+    awaiting_human and leave the original commits in place; SQUASH_ON_APPROVAL
+    off preserves the legacy "leave the dev's commits as-is" behavior.
+    """
+
+    PR_NUMBER = 31
+    BRANCH = "orchestrator/issue-5"
+    REVIEWED_SHA = "reviewedAA"
+    SQUASHED_SHA = "squashedBB"
+
+    def _setup(self):
+        gh = FakeGitHubClient()
+        long_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+        issue = make_issue(5, label="validating", title="add a feature", comments=[
+            FakeComment(
+                id=900, body=":robot: orchestrator picking this up.",
+                user=FakeUser("orchestrator"), created_at=long_ago,
+            ),
+            FakeComment(
+                id=901, body=":sparkles: PR opened: #31",
+                user=FakeUser("orchestrator"), created_at=long_ago,
+            ),
+        ])
+        gh.add_issue(issue)
+        # PR head SHA mirrors the post-squash remote head -- the force-push
+        # inside the squash helper updates the remote, so by the time the
+        # next gh.get_pr() is taken (inside _handle_validating's seeding
+        # block, AND on the next in_review tick) the remote head matches
+        # the new local SHA.
+        pr = FakePR(
+            number=self.PR_NUMBER, head_branch=self.BRANCH,
+            head=FakePRRef(sha=self.SQUASHED_SHA),
+            mergeable=True, check_state="success",
+        )
+        gh.add_pr(pr)
+        gh.seed_state(
+            5,
+            pr_number=self.PR_NUMBER,
+            branch=self.BRANCH,
+            dev_agent="claude",
+            dev_session_id="dev-sess",
+            review_round=0,
+            orchestrator_comment_ids=[900, 901],
+            pickup_comment_id=900,
+        )
+        return gh, issue, pr
+
+    def test_approval_squashes_and_lands_in_review_without_re_review(
+        self,
+    ) -> None:
+        # End-to-end: validating approves, squash + force-push runs (mocked
+        # to succeed), the squash PR comment is posted, the issue lands in
+        # in_review, and the next in_review tick auto-merges WITHOUT
+        # spawning the reviewer on the rewritten head.
+        gh, issue, pr = self._setup()
+
+        with patch.object(config, "SQUASH_ON_APPROVAL", True):
+            mocks_v = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
+                head_shas=(self.REVIEWED_SHA,),
+                # Squash: success, new local HEAD = SQUASHED_SHA, 3 commits
+                # collapsed to 1.
+                squash_result=(True, self.SQUASHED_SHA, 3, None),
+            )
+
+        # Squash helper was called exactly once on the approval path.
+        self.assertEqual(mocks_v["_squash_and_force_push"].call_count, 1)
+        # Reviewer ran once -- the only run_agent call on the approval path.
+        self.assertEqual(mocks_v["run_agent"].call_count, 1)
+        # Issue handed off to in_review.
+        self.assertIn((5, "in_review"), gh.label_history)
+        data = gh.pinned_data(5)
+        # agent_approved_sha must be the post-squash SHA, not the SHA the
+        # reviewer ran against. Without this, AUTO_MERGE's
+        # `agent_approved_sha == head_sha` gate would reject the rewritten
+        # head and the PR would sit forever waiting for a fresh review.
+        self.assertEqual(data.get("agent_approved_sha"), self.SQUASHED_SHA)
+        # The squash notice was posted to the PR conversation.
+        squash_notice_posted = any(
+            ":package: squashed 3 commits to 1" in body
+            for _, body in gh.posted_pr_comments
+        )
+        self.assertTrue(
+            squash_notice_posted,
+            f"squash notice not posted; got: {gh.posted_pr_comments}",
+        )
+        # Watermark must include the squash comment so the next in_review
+        # tick does not see it as fresh PR feedback once debounce expires.
+        approval_and_squash_ids = [c.id for c in pr.issue_comments]
+        self.assertTrue(approval_and_squash_ids)
+        self.assertGreaterEqual(
+            data.get("pr_last_comment_id"), max(approval_and_squash_ids),
+            "pr_last_comment_id must advance past both the approval and "
+            "the squash PR comments",
+        )
+
+        # Step 2: in_review tick. AUTO_MERGE on, all gates pass; the merge
+        # MUST NOT re-run the reviewer agent (its run_agent call would
+        # otherwise be visible in mocks_r below) and must land on the
+        # post-squash SHA.
+        long_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+        for c in list(issue.comments) + list(pr.issue_comments):
+            if c.created_at is None:
+                c.created_at = long_ago
+        if not any(l.name == "in_review" for l in issue.labels):
+            issue.labels = [FakeLabel("in_review")]
+
+        with patch.object(config, "AUTO_MERGE", True), \
+             patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks_r = self._run(
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+            )
+
+        mocks_r["run_agent"].assert_not_called()
+        self.assertEqual(
+            gh.merge_calls, [(self.PR_NUMBER, self.SQUASHED_SHA, "squash")],
+            "AUTO_MERGE must land the post-squash SHA exactly once, "
+            "without re-running the reviewer",
+        )
+        self.assertIn((5, "done"), gh.label_history)
+
+    def test_squash_failure_parks_awaiting_human_without_relabel(self) -> None:
+        # Push rejected / lease violation / dirty tree all surface as
+        # `success=False`. The orchestrator parks awaiting_human, leaves
+        # the issue in `validating`, and does NOT seed agent_approved_sha
+        # or watermarks (the original commits remain on the branch and a
+        # human can decide what to do).
+        gh, issue, pr = self._setup()
+
+        with patch.object(config, "SQUASH_ON_APPROVAL", True):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
+                head_shas=(self.REVIEWED_SHA,),
+                squash_result=(
+                    False, None, 0,
+                    "force-push with lease rejected (concurrent update)",
+                ),
+            )
+
+        self.assertEqual(mocks["_squash_and_force_push"].call_count, 1)
+        # Park happened: awaiting_human flag set, HITL message posted to
+        # the issue thread.
+        data = gh.pinned_data(5)
+        self.assertTrue(data.get("awaiting_human"))
+        park_posted = any(
+            "squash-on-approval failed" in body
+            for _, body in gh.posted_comments
+        )
+        self.assertTrue(
+            park_posted,
+            f"HITL park message not posted; got: {gh.posted_comments}",
+        )
+        # No relabel to in_review -- the issue stays in `validating`.
+        self.assertNotIn(
+            (5, "in_review"), gh.label_history,
+            "park must NOT relabel to in_review on squash failure",
+        )
+        # No agent_approved_sha seeded; AUTO_MERGE cannot fire on the
+        # original (now-stale) commits even if the human relabels later.
+        self.assertIsNone(data.get("agent_approved_sha"))
+
+    def test_squash_off_preserves_legacy_behavior(self) -> None:
+        # Kill switch: with SQUASH_ON_APPROVAL=off the squash helper must
+        # NOT be called, agent_approved_sha is the SHA the reviewer ran
+        # against (not any squashed SHA), and no squash notice is posted.
+        gh, issue, pr = self._setup()
+        # Make pr.head.sha match REVIEWED_SHA -- legacy path: the local
+        # HEAD the reviewer saw is what the remote PR points at, since no
+        # force-push happened.
+        pr.head = FakePRRef(sha=self.REVIEWED_SHA)
+
+        with patch.object(config, "SQUASH_ON_APPROVAL", False):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
+                head_shas=(self.REVIEWED_SHA,),
+            )
+
+        # Helper not called at all.
+        mocks["_squash_and_force_push"].assert_not_called()
+        # Legacy path: agent_approved_sha == reviewed_sha.
+        data = gh.pinned_data(5)
+        self.assertEqual(data.get("agent_approved_sha"), self.REVIEWED_SHA)
+        # No squash notice posted.
+        for _, body in gh.posted_pr_comments:
+            self.assertNotIn(":package: squashed", body)
+        # And the legacy approval flow still flips to in_review.
+        self.assertIn((5, "in_review"), gh.label_history)
+
+    def test_squash_with_only_one_commit_does_not_post_notice(self) -> None:
+        # The helper returns `squashed_count=0` when there's only one
+        # commit on top of base -- nothing to squash. The orchestrator
+        # must skip the squash PR comment and leave agent_approved_sha
+        # at the reviewed SHA (the helper returns the same SHA back).
+        gh, issue, pr = self._setup()
+        pr.head = FakePRRef(sha=self.REVIEWED_SHA)
+
+        with patch.object(config, "SQUASH_ON_APPROVAL", True):
+            self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
+                head_shas=(self.REVIEWED_SHA,),
+                # Helper success no-op: nothing to squash.
+                squash_result=(True, self.REVIEWED_SHA, 0, None),
+            )
+
+        for _, body in gh.posted_pr_comments:
+            self.assertNotIn(":package: squashed", body)
+        data = gh.pinned_data(5)
+        self.assertEqual(data.get("agent_approved_sha"), self.REVIEWED_SHA)
+        self.assertIn((5, "in_review"), gh.label_history)
 
 
 class ListPollableIssuesTest(unittest.TestCase):

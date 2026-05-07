@@ -225,3 +225,13 @@ IN_REVIEW_DEBOUNCE_SECONDS: int = int(
 DECOMPOSE: bool = os.environ.get("DECOMPOSE", "on").strip().lower() in (
     "1", "true", "on", "yes",
 )
+
+# After the reviewer agent emits VERDICT: APPROVED, squash the dev's commits
+# on the PR branch into a single conventional-commit-shaped commit and
+# force-push (with lease). Default on -- a one-commit PR is what humans
+# expect on merge. Off restores the legacy "leave the dev's commit history
+# as-is" behavior; useful if a workflow downstream (changelog generation,
+# bisect tooling) depends on the per-step commit history.
+SQUASH_ON_APPROVAL: bool = os.environ.get(
+    "SQUASH_ON_APPROVAL", "on"
+).strip().lower() in ("1", "true", "on", "yes")
