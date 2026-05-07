@@ -991,6 +991,48 @@ class HandleValidatingAwaitingHumanResumeTest(unittest.TestCase, _PatchedWorkflo
         self.assertEqual(data.get("review_round"), 2)
         self.assertNotIn((7, "in_review"), gh.label_history)
 
+    def test_successful_dev_fix_resets_silent_park_streak(self) -> None:
+        # The validating / in_review fix paths exit on `_handle_dev_fix_result`
+        # returning True without going through `_on_commits`. Without an
+        # explicit reset on that branch, `silent_park_count` would still
+        # carry over from earlier silent parks, and a later single empty
+        # resume could tip an otherwise-healthy session past the
+        # fresh-session threshold.
+        gh = FakeGitHubClient()
+        issue = make_issue(70, label="validating")
+        issue.comments.append(
+            FakeComment(id=1100, body="please fix it", user=FakeUser("alice"))
+        )
+        gh.add_issue(issue)
+        gh.seed_state(
+            70,
+            awaiting_human=True,
+            last_action_comment_id=950,
+            dev_agent="claude",
+            dev_session_id="dev-sess",
+            review_round=1,
+            pr_number=14,
+            branch="orchestrator/issue-70",
+            # Carryover from an earlier silent park; one short of the
+            # fresh-session threshold.
+            silent_park_count=1,
+        )
+
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=_agent(session_id="dev-sess", last_message="fixed"),
+            dirty_files=(),
+            push_branch=True,
+            head_shas=["aaa", "bbb"],
+        )
+
+        data = gh.pinned_data(70)
+        self.assertEqual(
+            data.get("silent_park_count"), 0,
+            "a successful dev fix must reset the silent-park streak so a "
+            "later transient empty result doesn't drop a healthy session",
+        )
+
 
 class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
     """Bound the implementing loop with MAX_RETRIES_PER_DAY in pinned state.
@@ -4173,6 +4215,69 @@ class SilentSessionResumeFallbackTest(unittest.TestCase, _PatchedWorkflowMixin):
         # Streak resets so a future blip doesn't drop the new session
         # immediately.
         self.assertEqual(state.get("silent_park_count"), 0)
+
+    def test_fresh_spawn_with_empty_session_id_still_clears_pinned(self) -> None:
+        # If the fresh spawn comes back without a `session_id` (agent
+        # backend hiccup, missing file, etc.), the poisoned id must STILL
+        # be removed from pinned state. Otherwise `_read_dev_session` on
+        # the next tick returns the dead session and the resume loop
+        # re-poisons itself.
+        threshold = workflow._SILENT_PARKS_BEFORE_FRESH_SESSION
+        gh, issue = self._seeded_issue(silent_park_count=threshold)
+        state = gh.read_pinned_state(issue)
+
+        with patch.object(workflow, "_ensure_worktree", lambda spec, n: _FAKE_WT), \
+             patch.object(
+                 workflow, "run_agent",
+                 lambda *a, **kw: _agent(session_id="", last_message=""),
+             ):
+            workflow._resume_dev_with_text(gh, _TEST_SPEC, issue, state, "go")
+
+        self.assertIsNone(
+            state.get("dev_session_id"),
+            "poisoned session id must be cleared even when the fresh "
+            "spawn returns no session_id",
+        )
+
+    def test_fresh_spawn_clears_legacy_codex_session_id_too(self) -> None:
+        # An issue still on the legacy `codex_session_id` schema must
+        # also have that field cleared on fresh-spawn -- otherwise the
+        # next tick's `_read_dev_session` falls through the new keys
+        # (because `dev_session_id` is None) and resurrects the poisoned
+        # legacy id.
+        threshold = workflow._SILENT_PARKS_BEFORE_FRESH_SESSION
+        gh = FakeGitHubClient()
+        issue = make_issue(951, label="implementing")
+        gh.add_issue(issue)
+        gh.seed_state(
+            951,
+            # Legacy schema: only `codex_session_id` is set, no `dev_agent`.
+            codex_session_id="poisoned-legacy",
+            silent_park_count=threshold,
+        )
+        state = gh.read_pinned_state(issue)
+
+        captured: dict = {}
+
+        def fake_run(agent, prompt, wt, *, resume_session_id=None):
+            captured["agent"] = agent
+            captured["resume_session_id"] = resume_session_id
+            return _agent(session_id="fresh-legacy", last_message="ok")
+
+        with patch.object(workflow, "_ensure_worktree", lambda spec, n: _FAKE_WT), \
+             patch.object(workflow, "run_agent", fake_run):
+            workflow._resume_dev_with_text(gh, _TEST_SPEC, issue, state, "go")
+
+        # Backend stays locked to codex (legacy).
+        self.assertEqual(captured["agent"], "codex")
+        # Resume happened with no session id -- the poisoned legacy id
+        # was dropped.
+        self.assertIsNone(captured["resume_session_id"])
+        # Pinned state migrated to the new keys with the fresh session
+        # id, and the legacy field is cleared.
+        self.assertEqual(state.get("dev_agent"), "codex")
+        self.assertEqual(state.get("dev_session_id"), "fresh-legacy")
+        self.assertIsNone(state.get("codex_session_id"))
 
 
 class HandoffConsumedThroughIssueThreadOnlyTest(
