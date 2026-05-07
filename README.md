@@ -136,7 +136,7 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | `DECOMPOSE_AGENT`         | `claude`                                      | decomposer backend; one of `codex` / `claude` (validated even when `DECOMPOSE=off`) |
 | `DECOMPOSE`               | `on`                                          | enable the `decomposing` stage; `off` reverts to the legacy "no label → implementing" pickup |
 | `HITL_HANDLE`             | `geserdugarov`                                | comma-separated GitHub logins to @-mention when a human is needed |
-| `WORKTREES_DIR`           | `../wt-orchestrator`                          | where per-issue git worktrees are created                 |
+| `WORKTREES_DIR`           | `../wt-orchestrator`                          | where per-issue git worktrees are created; per-repo subdir keeps them isolated, so the on-disk layout is `WORKTREES_DIR/<owner>__<name>/issue-N` |
 | `CODEX_BIN`               | `codex`                                       | override only if `codex` is not on `$PATH`                |
 | `CLAUDE_BIN`              | `claude`                                      | override only if `claude` is not on `$PATH`               |
 | `AGENT_GIT_NAME`          | `agent-orchestrator`                          | `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` injected into agent spawns |
