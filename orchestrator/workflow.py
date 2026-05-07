@@ -1757,19 +1757,15 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 spec, issue, state
             ):
                 return  # still stuck, do not re-post the park comment
-            # Conditions resolved: clear the park flags. The handoff
-            # watermark `last_action_comment_id` was already advanced by the
-            # original `_park_awaiting_human` call, so the in_review handler
-            # will not re-feed any already-consumed comments.
+            # Conditions resolved: clear the park flags. The recovery
+            # helper has already bumped review_round when a fix landed
+            # (push_failed, or agent_timeout that finished its push), so
+            # we only handle the flag clear here. The handoff watermark
+            # `last_action_comment_id` was already advanced by the
+            # original `_park_awaiting_human` call, so the in_review
+            # handler will not re-feed any already-consumed comments.
             state.set("awaiting_human", False)
             state.set("park_reason", None)
-            # `push_failed` recovery means the dev's fix is now landed --
-            # bump the review counter so the cap reflects the completed
-            # fix cycle. Timeout recoveries did NOT produce a fix; bumping
-            # would burn through MAX_REVIEW_ROUNDS without any progress.
-            if park_reason == "push_failed":
-                round_n = int(state.get("review_round") or 0)
-                state.set("review_round", round_n + 1)
             gh.write_pinned_state(issue, state)
             return
         wt = _worktree_path(spec, issue.number)
@@ -2242,13 +2238,14 @@ def _try_recover_validating_transient_park(
 
     Returns True if the underlying condition has resolved (caller should
     clear the park flags and progress); False to stay parked. Must not
-    spawn the agent, post issue/PR comments, or write pinned state -- the
-    caller owns that side of the recovery so a still-stuck tick produces
-    no visible churn.
+    spawn the agent or post issue/PR comments -- the caller owns the
+    visible side of the recovery so a still-stuck tick produces no churn.
 
-    For agent/reviewer timeouts there is nothing to retry inline -- the
-    fix is to let the next tick run the agent again with a fresh budget,
-    so we just signal "recovered" and the caller clears the park flags.
+    The helper IS allowed to update review-round bookkeeping when a fix
+    landed during recovery (e.g. an agent_timeout where the dev had
+    actually committed before timing out, and we finish the push here).
+    Callers should not mutate the round themselves; this is the only
+    write path while the park flags are still set.
     """
     park_reason = state.get("park_reason")
     if park_reason == "push_failed":
@@ -2258,8 +2255,49 @@ def _try_recover_validating_transient_park(
             # there is nothing to push. A human has to intervene (relabel
             # back to implementing) -- that's the unblocking signal.
             return False
-        return _push_branch(spec, wt, _branch_name(issue.number))
-    if park_reason in ("agent_timeout", "reviewer_timeout"):
+        if not _push_branch(spec, wt, _branch_name(issue.number)):
+            return False
+        # The dev's fix is now landed; bump the round so the cap reflects
+        # the completed fix cycle.
+        round_n = int(state.get("review_round") or 0)
+        state.set("review_round", round_n + 1)
+        return True
+    if park_reason == "reviewer_timeout":
+        # Reviewer agent only reads the worktree; nothing to reconcile
+        # locally. Clear flags so the next tick re-spawns the reviewer
+        # with a fresh budget.
+        return True
+    if park_reason == "agent_timeout":
+        # The dev agent could have committed or left uncommitted edits
+        # before the timeout killed it. Recovery cannot just clear flags
+        # -- the next tick's reviewer would inspect the LOCAL worktree
+        # and could approve a SHA that is not on the PR, seeding
+        # `agent_approved_sha` to an unpushed commit and stalling
+        # in_review. Reconcile the worktree explicitly here.
+        wt = _worktree_path(spec, issue.number)
+        if not wt.exists():
+            return False
+        if _worktree_dirty_files(wt):
+            # The dev left edits that were never committed. We cannot
+            # safely push, review, or auto-merge in this state; stay
+            # parked until a human or a fresh comment-driven resume
+            # sorts it out. Worse than the silent path: a reviewer that
+            # ignores the dirty index would still vote on the committed
+            # head while the leftover edits are silently dropped on the
+            # next push.
+            return False
+        if _has_new_commits(spec, wt):
+            # The dev committed before timing out. Finish what it
+            # started by pushing; on success the fix is now landed and
+            # we bump the round just like the push_failed branch.
+            if not _push_branch(spec, wt, _branch_name(issue.number)):
+                return False
+            round_n = int(state.get("review_round") or 0)
+            state.set("review_round", round_n + 1)
+            return True
+        # Clean tree, no unpushed commits: nothing the reviewer would
+        # see has changed. Clear flags so the next tick re-runs the
+        # reviewer on the same code with a fresh budget.
         return True
     return False
 
