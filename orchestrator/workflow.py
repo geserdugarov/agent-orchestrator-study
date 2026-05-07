@@ -1739,6 +1739,12 @@ def _handle_dev_fix_result(
             f"{config.HITL_MENTIONS} agent timed out after {config.AGENT_TIMEOUT}s, "
             "manual intervention needed.",
         )
+        # Tag as transient: a stuck dev fix-loop (validating CHANGES_REQUESTED
+        # or comment-driven resume) clears on the next tick when the validating
+        # recovery branch lets the reviewer re-run; the in_review fix-loop
+        # leaves it tagged but stays parked because in_review's transient set
+        # does not include this reason.
+        state.set("park_reason", "agent_timeout")
         return False
 
     after_sha = _head_sha(wt)
@@ -1788,32 +1794,37 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     if state.get("awaiting_human"):
         # Transient-park recovery: when the original park reason is something
         # that can resolve without a human comment (a push race that the
-        # next --force-with-lease push will land), re-attempt silently. This
-        # mirrors the in_review recovery branch -- without it, a tick that
-        # parked on `push_failed` would sit forever even though the next push
-        # would succeed, because `_resume_developer_on_human_reply` only
-        # fires on new issue-thread comments.
+        # next --force-with-lease push will land, or an agent timeout that
+        # the next tick can simply rerun past), re-attempt silently. This
+        # mirrors the in_review recovery branch -- without it, the issue
+        # would sit forever, because `_resume_developer_on_human_reply`
+        # only fires on new issue-thread comments and the human action
+        # that unstuck the underlying condition typically does not include
+        # one.
         last_action_id = state.get("last_action_comment_id")
         new_comments = gh.comments_after(issue, last_action_id)
+        park_reason = state.get("park_reason")
         if (
             not new_comments
-            and state.get("park_reason")
-            in _VALIDATING_TRANSIENT_PARK_REASONS
+            and park_reason in _VALIDATING_TRANSIENT_PARK_REASONS
         ):
             if not _try_recover_validating_transient_park(
                 spec, issue, state
             ):
                 return  # still stuck, do not re-post the park comment
-            # Conditions resolved: clear the park flags and treat this tick
-            # as the successful tail of the dev-fix loop, bumping the review
-            # round so the next tick runs the reviewer. The handoff
+            # Conditions resolved: clear the park flags. The handoff
             # watermark `last_action_comment_id` was already advanced by the
             # original `_park_awaiting_human` call, so the in_review handler
             # will not re-feed any already-consumed comments.
             state.set("awaiting_human", False)
             state.set("park_reason", None)
-            round_n = int(state.get("review_round") or 0)
-            state.set("review_round", round_n + 1)
+            # `push_failed` recovery means the dev's fix is now landed --
+            # bump the review counter so the cap reflects the completed
+            # fix cycle. Timeout recoveries did NOT produce a fix; bumping
+            # would burn through MAX_REVIEW_ROUNDS without any progress.
+            if park_reason == "push_failed":
+                round_n = int(state.get("review_round") or 0)
+                state.set("review_round", round_n + 1)
             gh.write_pinned_state(issue, state)
             return
         wt = _worktree_path(spec, issue.number)
@@ -1868,6 +1879,10 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             f"{config.HITL_MENTIONS} reviewer timed out after "
             f"{config.REVIEW_TIMEOUT}s; manual intervention needed.",
         )
+        # Tag as transient so the next tick re-spawns the reviewer instead
+        # of waiting for a human comment that the timeout itself does not
+        # produce.
+        state.set("park_reason", "reviewer_timeout")
         gh.write_pinned_state(issue, state)
         return
 
@@ -2256,13 +2271,23 @@ def _comment_created_at(comment) -> Optional[datetime]:
 _TRANSIENT_PARK_REASONS = frozenset({"failed_checks", "unmergeable"})
 
 # Validating-side counterpart: park reasons whose underlying condition can
-# resolve without any human comment (a non-fast-forward push retried under
-# --force-with-lease once the remote settles is the canonical case). Without
-# this, a transient push failure during a dev-fix would leave the issue
-# parked forever -- `_resume_developer_on_human_reply` only fires on a new
-# issue-thread comment, but the human action that unstuck the underlying
-# condition (CI, rebase, branch update) typically does not include one.
-_VALIDATING_TRANSIENT_PARK_REASONS = frozenset({"push_failed"})
+# resolve without any human comment. Without this, a transient validating
+# failure would leave the issue parked forever -- `_resume_developer_on_human_reply`
+# only fires on a new issue-thread comment, and the human action that
+# unstuck the underlying condition (a flake clears, CI settles, the remote
+# accepts the next push) typically does not include one.
+#
+#   `push_failed`     - non-fast-forward push; retried under --force-with-lease.
+#   `agent_timeout`   - dev-fix agent timed out; let the next tick re-run the
+#                       reviewer (which will spawn the dev again if changes
+#                       are still requested).
+#   `reviewer_timeout`- reviewer agent timed out; let the next tick re-run it.
+#
+# Reasons that need human content (a question, a dirty worktree, a verdict
+# the agent could not produce) stay parked until a comment arrives.
+_VALIDATING_TRANSIENT_PARK_REASONS = frozenset(
+    {"push_failed", "agent_timeout", "reviewer_timeout"}
+)
 
 
 def _try_recover_validating_transient_park(
@@ -2275,6 +2300,10 @@ def _try_recover_validating_transient_park(
     spawn the agent, post issue/PR comments, or write pinned state -- the
     caller owns that side of the recovery so a still-stuck tick produces
     no visible churn.
+
+    For agent/reviewer timeouts there is nothing to retry inline -- the
+    fix is to let the next tick run the agent again with a fresh budget,
+    so we just signal "recovered" and the caller clears the park flags.
     """
     park_reason = state.get("park_reason")
     if park_reason == "push_failed":
@@ -2285,6 +2314,8 @@ def _try_recover_validating_transient_park(
             # back to implementing) -- that's the unblocking signal.
             return False
         return _push_branch(spec, wt, _branch_name(issue.number))
+    if park_reason in ("agent_timeout", "reviewer_timeout"):
+        return True
     return False
 
 

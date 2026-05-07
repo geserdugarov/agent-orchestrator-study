@@ -853,7 +853,12 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
             run_agent=_agent(timed_out=True),
         )
 
-        self.assertTrue(gh.pinned_data(5).get("awaiting_human"))
+        data = gh.pinned_data(5)
+        self.assertTrue(data.get("awaiting_human"))
+        # Tagged transient so the next tick re-spawns the reviewer instead
+        # of waiting for a human comment that the timeout itself does not
+        # produce.
+        self.assertEqual(data.get("park_reason"), "reviewer_timeout")
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("reviewer timed out", last_comment)
         self.assertNotIn((5, "in_review"), gh.label_history)
@@ -879,6 +884,29 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
             session_id="rev-sess",
             last_message="1. Fix typo\n\nVERDICT: CHANGES_REQUESTED",
         )
+
+    def test_dev_fix_timeout_parks_with_agent_timeout_reason(self) -> None:
+        # The dev agent timed out mid-fix. The park must be tagged so the
+        # next tick's recovery branch can rerun the reviewer instead of
+        # waiting for a human comment that the timeout itself cannot
+        # produce.
+        gh, issue = self._seeded()
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=[
+                self._changes_requested_review(),
+                _agent(session_id="dev-sess", timed_out=True),
+            ],
+            dirty_files=(),
+            push_branch=True,
+            head_shas=["aaa", "aaa"],
+        )
+
+        data = gh.pinned_data(6)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "agent_timeout")
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("agent timed out", last_comment)
 
     def test_dev_fix_no_new_commit_parks_round_unchanged(self) -> None:
         gh, issue = self._seeded()
@@ -3209,6 +3237,54 @@ class ValidatingTransientParkRecoveryTest(
         mocks["_push_branch"].assert_not_called()
         data = gh.pinned_data(170)
         self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_reviewer_timeout_park_recovers_silently(self) -> None:
+        # A previous tick parked because the reviewer agent timed out.
+        # The next tick must clear the flags so the reviewer re-runs --
+        # nothing in `_resume_developer_on_human_reply` would unstick this
+        # otherwise (no comment ever lands from a timeout).
+        gh, issue = self._parked_issue(park_reason="reviewer_timeout")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+
+        # Recovery is silent on this tick: the agent is NOT re-spawned
+        # here (next tick does that, on the cleared awaiting_human flag),
+        # no push is attempted (no fix landed), and no new comment is
+        # posted.
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        self.assertEqual(gh.posted_comments, [])
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+        # review_round MUST NOT advance: a timeout produced no fix, so
+        # bumping would burn through MAX_REVIEW_ROUNDS without progress.
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_agent_timeout_park_recovers_silently(self) -> None:
+        # Mirror of the reviewer case for the dev-fix path. Same cleanup
+        # contract: clear flags, do not bump the round.
+        gh, issue = self._parked_issue(park_reason="agent_timeout")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        self.assertEqual(gh.posted_comments, [])
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
         self.assertEqual(data.get("review_round"), 1)
 
     def test_transient_park_with_new_comment_takes_resume_path(self) -> None:
