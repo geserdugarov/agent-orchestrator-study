@@ -3267,15 +3267,18 @@ class ValidatingTransientParkRecoveryTest(
         # bumping would burn through MAX_REVIEW_ROUNDS without progress.
         self.assertEqual(data.get("review_round"), 1)
 
-    def test_agent_timeout_park_recovers_silently(self) -> None:
-        # Mirror of the reviewer case for the dev-fix path. Same cleanup
-        # contract: clear flags, do not bump the round.
+    def test_agent_timeout_clean_tree_no_commits_recovers_silently(self) -> None:
+        # Common timeout shape: the dev burned the budget without
+        # producing anything. Recovery clears flags and does not bump
+        # the round (no fix landed); next tick re-runs the reviewer.
         gh, issue = self._parked_issue(park_reason="agent_timeout")
 
         with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
             mocks = self._run(
                 lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
+                has_new_commits=False,
+                dirty_files=(),
                 push_branch=True,
             )
 
@@ -3285,6 +3288,82 @@ class ValidatingTransientParkRecoveryTest(
         data = gh.pinned_data(170)
         self.assertFalse(data.get("awaiting_human"))
         self.assertIsNone(data.get("park_reason"))
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_agent_timeout_with_unpushed_commits_pushes_and_bumps(self) -> None:
+        # The dev committed the fix locally but the timeout killed it
+        # before the push. Recovery must finish that push -- otherwise
+        # the next tick's reviewer would inspect (and potentially
+        # approve) a SHA that is not on the PR, seeding
+        # `agent_approved_sha` to an unpushed commit and stalling
+        # in_review.
+        gh, issue = self._parked_issue(park_reason="agent_timeout")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                has_new_commits=True,
+                dirty_files=(),
+                push_branch=True,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_called_once()
+        self.assertEqual(gh.posted_comments, [])
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+        # Bumped: a real fix landed.
+        self.assertEqual(data.get("review_round"), 2)
+
+    def test_agent_timeout_with_unpushed_commits_push_fails_stays_parked(
+        self,
+    ) -> None:
+        gh, issue = self._parked_issue(park_reason="agent_timeout")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                has_new_commits=True,
+                dirty_files=(),
+                push_branch=False,
+            )
+
+        mocks["_push_branch"].assert_called_once()
+        self.assertEqual(gh.posted_comments, [])
+        data = gh.pinned_data(170)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "agent_timeout")
+        # NOT bumped while still stuck.
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_agent_timeout_with_dirty_worktree_stays_parked(self) -> None:
+        # The dev edited files without committing before timing out.
+        # Recovery refuses to silently push (would publish an incomplete
+        # branch) or to clear flags (the next reviewer would inspect
+        # uncommitted state). Stays parked until a human or comment-
+        # driven resume sorts the dirty edits out.
+        gh, issue = self._parked_issue(park_reason="agent_timeout")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                has_new_commits=True,
+                dirty_files=["leftover.py"],
+                push_branch=True,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        # No new comment posted on this tick -- the original park
+        # message still describes the situation.
+        self.assertEqual(gh.posted_comments, [])
+        data = gh.pinned_data(170)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "agent_timeout")
         self.assertEqual(data.get("review_round"), 1)
 
     def test_transient_park_with_new_comment_takes_resume_path(self) -> None:
