@@ -41,6 +41,15 @@ _VERDICT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Conventional Commits subject: `<type>[(scope)][!]: <subject>`. The type
+# allowlist matches the ones the implement/fix prompts teach plus the broader
+# Conventional Commits set, so an agent that picks `perf:` or `ci:` still
+# gets credited as conventional.
+_CONVENTIONAL_RE = re.compile(
+    r"^(?:feat|fix|chore|docs|refactor|test|perf|build|ci|style|revert)"
+    r"(?:\([^)]+\))?!?:\s+\S",
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -181,6 +190,52 @@ def _has_new_commits(worktree: Path) -> bool:
     if r.returncode != 0:
         return False
     return int((r.stdout or "0").strip() or "0") > 0
+
+
+def _first_commit_subject(worktree: Path) -> str:
+    """Subject line of the oldest commit in `origin/<base>..HEAD`, or ''.
+
+    Used by `_on_commits` to derive a Conventional-Commits PR title from what
+    the agent actually wrote, so the PR title matches the commit history
+    when the agent followed the convention.
+    """
+    r = _git(
+        "log", "--reverse", "--format=%s",
+        f"origin/{config.BASE_BRANCH}..HEAD",
+        cwd=worktree,
+    )
+    if r.returncode != 0:
+        return ""
+    lines = (r.stdout or "").splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _is_conventional_subject(subject: str) -> bool:
+    return bool(_CONVENTIONAL_RE.match(subject or ""))
+
+
+def _pr_title_from_commit_or_issue(issue: Issue, first_subject: str) -> str:
+    """Pick a Conventional-Commits PR title.
+
+    Prefer the agent's first commit subject when it already follows the
+    convention (so the PR title matches the commit history). Otherwise
+    fall back to `<type>: <issue title>`, choosing `fix` for bug-labelled
+    issues and `feat` everywhere else. Traceability is preserved by the
+    `Resolves #<n>` line in the PR body, so the title stays clean.
+    """
+    subject = (first_subject or "").strip()
+    if _is_conventional_subject(subject):
+        return subject
+    issue_title = (issue.title or "").strip()
+    if _is_conventional_subject(issue_title):
+        return issue_title
+    label_names = {(getattr(l, "name", "") or "").lower() for l in (issue.labels or [])}
+    if {"bug", "fix"} & label_names:
+        ctype = "fix"
+    else:
+        ctype = "feat"
+    body = issue_title or f"address issue #{issue.number}"
+    return f"{ctype}: {body}"
 
 
 def _head_sha(worktree: Path) -> str:
@@ -369,6 +424,11 @@ def _build_implement_prompt(issue: Issue, comments_text: str) -> str:
         "Implement the change in the current working directory (a fresh git worktree on a "
         "new branch). When done, COMMIT your changes with a clear message. Do NOT push - "
         "the orchestrator pushes and opens the PR.\n\n"
+        "Before committing, run `git log --oneline -20` to see how recent commit subjects "
+        "are formatted, and follow the same convention. This repo uses Conventional Commits "
+        "of the form `<type>: <subject>` (e.g. `feat:`, `fix:`, `chore:`, `docs:`, "
+        "`refactor:`, `test:`); pick the type that best fits your change and keep the "
+        "subject short and imperative.\n\n"
         "If you cannot proceed because of missing information, leave the working tree "
         "uncommitted (no commits) and end your response with a clear question for the human."
     )
@@ -406,6 +466,10 @@ def _build_fix_prompt(review_feedback: str) -> str:
         "below, then COMMIT the fix in your current worktree. Do NOT push -- the orchestrator "
         "pushes and re-runs the review.\n\n"
         f"Review feedback:\n\n{quoted}\n\n"
+        "Before committing, run `git log --oneline -20` to see how recent commit subjects "
+        "are formatted, and follow the same convention. This repo uses Conventional Commits "
+        "of the form `<type>: <subject>` (e.g. `feat:`, `fix:`, `chore:`, `docs:`, "
+        "`refactor:`, `test:`); for a review fix `fix:` is usually the right type.\n\n"
         "If you genuinely disagree with a point, end your final message with a question for "
         "the human and leave that item un-fixed; the orchestrator will park the issue for "
         "human review. Otherwise, fix all items (a single commit is fine)."
@@ -2342,7 +2406,7 @@ def _on_commits(
     # relabel: reuse the existing open PR instead of 422-ing on duplicate.
     pr = gh.find_open_pr(branch=branch, base=config.BASE_BRANCH)
     if pr is None:
-        title = f"#{issue.number}: {issue.title}"
+        title = _pr_title_from_commit_or_issue(issue, _first_commit_subject(wt))
         dev_agent, dev_sid = _read_dev_session(state)
         body_parts = [
             f"Resolves #{issue.number}",
