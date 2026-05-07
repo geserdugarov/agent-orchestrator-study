@@ -1595,13 +1595,23 @@ def _resume_dev_with_text(
         )
         dev_sid = None
         state.set("silent_park_count", 0)
+        # Clear the poisoned session from pinned state BEFORE the spawn.
+        # If the fresh spawn returns no `session_id` (or its persistence
+        # is racy), the next tick must see a cleared session -- not the
+        # old poisoned id, which `_read_dev_session` would otherwise
+        # return again and burn another retry. Writing `dev_agent` here
+        # also overrides the legacy `codex_session_id` fallback path:
+        # `_read_dev_session` returns `(dev_agent, dev_session_id)` once
+        # `dev_agent` is set, ignoring the legacy field. Clear the legacy
+        # field too so the dropped session leaves no trace anywhere.
+        state.set("dev_agent", dev_agent)
+        state.set("dev_session_id", None)
+        state.set("codex_session_id", None)
     result = run_agent(dev_agent, followup_text, wt, resume_session_id=dev_sid)
     if fresh_spawn and result.session_id:
-        # Persist the new session id so subsequent resumes pick up the
-        # fresh session instead of re-poisoning themselves with the old
-        # one. Mirrors the persistence done in `_handle_implementing`'s
-        # fresh-spawn branch.
-        state.set("dev_agent", dev_agent)
+        # Fresh spawn produced a session id -- record it so subsequent
+        # resumes pick up the live session. Mirrors the persistence done
+        # in `_handle_implementing`'s fresh-spawn branch.
         state.set("dev_session_id", result.session_id)
     state.set("awaiting_human", False)
     return wt, result
@@ -1736,6 +1746,16 @@ def _handle_dev_fix_result(
         # No new commit: dev asked a question or did nothing.
         _on_question(gh, issue, state, result)
         return False
+
+    # A new commit landed -- the session is alive and producing output, so
+    # the silent-park streak must reset here. Otherwise a single later
+    # empty resume would tip a healthy session past the fresh-session
+    # threshold (`silent_park_count` is meant to count *consecutive*
+    # silent parks, not lifetime silent parks). Covers the validating /
+    # in_review fix paths whose success exit (`return True` below) bypasses
+    # `_on_commits` / `_on_dirty_worktree`, which would otherwise be the
+    # only resetters on this branch.
+    state.set("silent_park_count", 0)
 
     dirty = _worktree_dirty_files(wt)
     if dirty:
