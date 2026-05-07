@@ -424,6 +424,27 @@ class GitHubClient:
             return False
         return any(s == "APPROVED" for s in states)
 
+    def delete_remote_branch(self, branch: str) -> bool:
+        """Delete the remote `<branch>` ref from the repo.
+
+        Idempotent: a 404 (ref already gone) is treated as success because
+        the repo's "Automatically delete head branches" setting may have
+        removed the branch as part of the merge call. Other failures are
+        logged and swallowed so a tidy-up step never raises out of the
+        merge handler.
+        """
+        try:
+            self.repo.get_git_ref(f"heads/{branch}").delete()
+            return True
+        except GithubException as e:
+            if e.status == 404:
+                return True
+            log.warning(
+                "could not delete remote branch %r (HTTP %s): %s",
+                branch, e.status, e.data,
+            )
+            return False
+
     def merge_pr(
         self, pr: PullRequest, *, sha: str, method: str = "squash"
     ) -> bool:

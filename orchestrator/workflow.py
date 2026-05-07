@@ -368,6 +368,57 @@ def _cleanup_decompose_worktree(spec: RepoSpec, issue_number: int) -> None:
         )
 
 
+def _cleanup_merged_branch(
+    gh: GitHubClient, spec: RepoSpec, issue_number: int
+) -> None:
+    """Remove the per-issue worktree and delete the local + remote branches.
+
+    Called after the PR for `issue_number` has merged (either via AUTO_MERGE
+    or an external human merge). Best-effort: each step swallows its own
+    error so a leftover worktree or branch never raises out of the merge
+    handler -- by the time we reach here the issue has already flipped to
+    `done`, and a stale ref is tidiness, not correctness.
+
+    Order matters: the worktree must come down before `git branch -D`,
+    because git refuses to delete a branch that's still checked out in a
+    worktree. Remote delete is last so a local-side failure does not block
+    cleaning up the GitHub side (which is what the operator actually sees
+    in the repo's branch list). All local `_git` calls run from
+    `spec.target_root` so the multi-repo loop tidies the right clone.
+    """
+    branch = _branch_name(issue_number)
+    wt = _worktree_path(spec, issue_number)
+    if wt.exists():
+        r = _git(
+            "worktree", "remove", "--force", str(wt),
+            cwd=spec.target_root,
+        )
+        if r.returncode != 0:
+            log.warning(
+                "issue=#%d worktree remove failed: %s",
+                issue_number, (r.stderr or "").strip(),
+            )
+
+    have_local = _git(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+        cwd=spec.target_root,
+    ).returncode == 0
+    if have_local:
+        r = _git("branch", "-D", branch, cwd=spec.target_root)
+        if r.returncode != 0:
+            log.warning(
+                "issue=#%d local branch %r delete failed: %s",
+                issue_number, branch, (r.stderr or "").strip(),
+            )
+
+    try:
+        gh.delete_remote_branch(branch)
+    except Exception:
+        log.exception(
+            "issue=#%d remote branch %r delete raised", issue_number, branch,
+        )
+
+
 def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
     """Push via GIT_ASKPASS so the token never appears in argv.
 
@@ -2248,6 +2299,7 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             log.exception(
                 "issue=#%s could not close after merge", issue.number,
             )
+        _cleanup_merged_branch(gh, spec, issue.number)
         return
 
     if pr_status == "closed":  # closed without merge
@@ -2480,6 +2532,7 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         log.exception(
             "issue=#%s could not close after auto-merge", issue.number,
         )
+    _cleanup_merged_branch(gh, spec, issue.number)
 
 
 def _on_commits(
