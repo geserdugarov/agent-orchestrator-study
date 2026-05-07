@@ -419,24 +419,40 @@ def _cleanup_merged_branch(
         )
 
 
-def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
+def _push_branch(
+    spec: RepoSpec, worktree: Path, branch: str,
+    *,
+    force_with_lease: Optional[str] = None,
+) -> bool:
     """Push via GIT_ASKPASS so the token never appears in argv.
+
+    `force_with_lease`, when provided, is the SHA the caller expects the
+    remote ref to be at. The push then uses
+    `--force-with-lease=refs/heads/<branch>:<sha>` against that exact SHA,
+    so a concurrent update to the remote rejects the push instead of being
+    silently clobbered. This is the squash/rewrite path: pinning the lease
+    to the caller-supplied pre-rewrite HEAD (rather than reading it from
+    the live remote) prevents the "out-of-band update happened in the
+    window between approval and push" race -- a fresh `ls-remote` would
+    treat the unexpected new remote SHA as the lease value and silently
+    overwrite it.
+
+    When `force_with_lease` is None (the default), the function reads the
+    current remote SHA via `ls-remote` and uses that as the lease. This is
+    the normal-push path: the orchestrator owns the
+    `orchestrator/issue-<n>` namespace, but a self-restart between commit
+    and push can leave the worktree on a different SHA than what was
+    already pushed -- e.g. a `resume=False` rerun of codex amending
+    equivalent work. A plain push then fails non-fast-forward and parks
+    the issue. The lease lets the retry succeed while still refusing to
+    clobber a concurrent foreign update (the lease check compares against
+    what we observed, not a stale remote-tracking ref).
 
     The push target URL carries only the username (`x-access-token`); the
     token itself is read from the GIT_TOKEN env var by a tempfile askpass
     script. This keeps the PAT out of `/proc/<pid>/cmdline`, which is
     world-readable on Linux. We also use an explicit `HEAD:refs/heads/<branch>`
     refspec so no upstream is set and no remote URL is stored in .git/config.
-
-    The push uses `--force-with-lease` against the SHA observed by `ls-remote`
-    on this same call. The orchestrator owns the `orchestrator/issue-<n>`
-    namespace, but a self-restart between commit and push can leave the
-    worktree on a different SHA than what was already pushed -- e.g. a
-    `resume=False` rerun of codex amending equivalent work, or a previous
-    push that succeeded silently. A plain push then fails non-fast-forward
-    and parks the issue. The lease lets the retry succeed while still
-    refusing to clobber a concurrent foreign update (the lease check
-    compares against what we observed, not a stale remote-tracking ref).
 
     The worktree is shared with the codex agent, so anything in `.git/hooks/`
     or `.git/config` is attacker-controlled. The agent also writes as the same
@@ -496,23 +512,26 @@ def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
             "-c", "core.fsmonitor=",
         ]
         ref = f"refs/heads/{branch}"
-        ls = subprocess.run(
-            [*git_prefix, "ls-remote", auth_url, ref],
-            cwd=str(worktree),
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        if ls.returncode != 0:
-            scrubbed = (ls.stderr or "").replace(config.GITHUB_TOKEN, "***")
-            log.error("git ls-remote failed for %s: %s", branch, scrubbed)
-            return False
-        remote_sha = ""
-        for line in (ls.stdout or "").splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[1] == ref:
-                remote_sha = parts[0]
-                break
+        if force_with_lease is not None:
+            remote_sha = force_with_lease
+        else:
+            ls = subprocess.run(
+                [*git_prefix, "ls-remote", auth_url, ref],
+                cwd=str(worktree),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if ls.returncode != 0:
+                scrubbed = (ls.stderr or "").replace(config.GITHUB_TOKEN, "***")
+                log.error("git ls-remote failed for %s: %s", branch, scrubbed)
+                return False
+            remote_sha = ""
+            for line in (ls.stdout or "").splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[1] == ref:
+                    remote_sha = parts[0]
+                    break
         # An empty <expected> in --force-with-lease means "expect the ref to
         # not exist", which is the right lease for the create-branch case.
         r = subprocess.run(
@@ -566,6 +585,17 @@ def _squash_and_force_push(
     if not base_sha:
         return False, None, 0, "merge-base returned empty"
 
+    # Snapshot the original HEAD BEFORE any destructive step. Every
+    # post-reset failure path below restores the branch to this SHA so
+    # the original commits are still on the branch (as the issue spec
+    # requires), and we use it as the pinned lease value for the
+    # force-push (the remote was last set to this SHA by the dev's plain
+    # push, so a remote drift between then and now means an out-of-band
+    # update we must NOT clobber).
+    original_head = _head_sha(worktree)
+    if not original_head:
+        return False, None, 0, "could not read original HEAD"
+
     log_r = _git(
         "log", "--reverse", "--pretty=%s", f"{base_sha}..HEAD",
         cwd=worktree,
@@ -579,9 +609,9 @@ def _squash_and_force_push(
         line for line in (log_r.stdout or "").splitlines() if line.strip()
     ]
     if len(subjects) <= 1:
-        # Nothing to squash. Return the current HEAD so the caller can
-        # still record agent_approved_sha if it wants.
-        return True, _head_sha(worktree) or None, 0, None
+        # Nothing to squash; the caller can still record original_head
+        # as agent_approved_sha if it wants.
+        return True, original_head, 0, None
 
     if _worktree_dirty_files(worktree):
         return False, None, 0, "worktree has uncommitted changes"
@@ -605,6 +635,27 @@ def _squash_and_force_push(
             f"reset --soft failed: {(reset_r.stderr or '').strip()}",
         )
 
+    def _rollback(reason: str) -> None:
+        """Restore the branch to original_head after a post-reset failure.
+        Best-effort: a rollback failure leaves the worktree in an
+        inconsistent state; logged loudly so an operator notices.
+        """
+        rb = _git("reset", "--hard", original_head, cwd=worktree)
+        if rb.returncode != 0:
+            log.error(
+                "issue=#%s rollback to %s after %s failed; worktree may be "
+                "in an inconsistent state: %s",
+                issue.number, original_head, reason,
+                (rb.stderr or "").strip(),
+            )
+
+    # Hardening for the orchestrator-owned squash commit. The agent has
+    # write access to .git/hooks, .git/config (templatedir), and any
+    # global/system git config the host user owns. Without these flags a
+    # planted pre-commit hook or commit-msg hook would run during this
+    # commit and could exfiltrate secrets we hold (no GIT_TOKEN here, but
+    # ANTHROPIC_API_KEY etc. live in os.environ for the agent to use).
+    # Mirrors the same hardening _push_branch applies.
     commit_env = {
         **os.environ,
         **_GIT_NO_PROMPT_ENV,
@@ -612,15 +663,25 @@ def _squash_and_force_push(
         "GIT_AUTHOR_EMAIL": config.AGENT_GIT_EMAIL,
         "GIT_COMMITTER_NAME": config.AGENT_GIT_NAME,
         "GIT_COMMITTER_EMAIL": config.AGENT_GIT_EMAIL,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
     commit_r = subprocess.run(
-        ["git", "commit", "-m", message],
+        [
+            "git",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=",
+            "-c", "commit.gpgsign=false",
+            "commit", "-m", message,
+        ],
         cwd=str(worktree),
         capture_output=True,
         text=True,
         env=commit_env,
     )
     if commit_r.returncode != 0:
+        _rollback("squash commit")
         return (
             False, None, 0,
             f"squash commit failed: {(commit_r.stderr or '').strip()}",
@@ -628,12 +689,14 @@ def _squash_and_force_push(
 
     new_sha = _head_sha(worktree)
     if not new_sha:
+        _rollback("post-commit head read")
         return False, None, 0, "could not read new HEAD after squash"
 
-    if not _push_branch(spec, worktree, branch):
-        return False, new_sha, len(subjects), (
-            "force-push with lease rejected (concurrent update or "
-            "lease violation); see orchestrator logs"
+    if not _push_branch(spec, worktree, branch, force_with_lease=original_head):
+        _rollback("force-push")
+        return False, None, 0, (
+            "force-push with lease rejected (concurrent update on the "
+            "remote, or lease violation); see orchestrator logs"
         )
 
     return True, new_sha, len(subjects), None

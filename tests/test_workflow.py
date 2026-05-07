@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2108,6 +2111,256 @@ class SquashOnApprovalTest(unittest.TestCase, _PatchedWorkflowMixin):
         data = gh.pinned_data(5)
         self.assertEqual(data.get("agent_approved_sha"), self.REVIEWED_SHA)
         self.assertIn((5, "in_review"), gh.label_history)
+
+
+class SquashHelperRealGitTest(unittest.TestCase):
+    """Integration test for `_squash_and_force_push` against a real git repo.
+
+    The workflow-level squash tests above mock the helper itself, so they
+    cannot catch failures in its rollback logic, in the squash-commit
+    message construction, or in the lease-pinning. This class creates a
+    bare remote + working clone with multiple commits on a topic branch,
+    runs the helper directly, and asserts the on-disk state.
+    """
+
+    def _git(self, *args: str, cwd: Path, env_extra: dict | None = None) -> str:
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        if env_extra:
+            env.update(env_extra)
+        r = subprocess.run(
+            ["git", *args], cwd=str(cwd),
+            capture_output=True, text=True, env=env, check=True,
+        )
+        return r.stdout
+
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="orch-squash-test-"))
+        self.addCleanup(shutil.rmtree, str(self.tmpdir), ignore_errors=True)
+
+        # Bare remote + working clone, base branch "main".
+        self.remote = self.tmpdir / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(self.remote)],
+            check=True, capture_output=True,
+        )
+        self.work = self.tmpdir / "work"
+        subprocess.run(
+            ["git", "clone", str(self.remote), str(self.work)],
+            check=True, capture_output=True,
+        )
+        # Identity for prep commits below; the orchestrator-owned squash
+        # commit uses its own GIT_AUTHOR_*/GIT_COMMITTER_* env vars, so
+        # this is just for the dev's pre-squash commits.
+        author_env = {
+            "GIT_AUTHOR_NAME": "Dev", "GIT_AUTHOR_EMAIL": "dev@example.com",
+            "GIT_COMMITTER_NAME": "Dev", "GIT_COMMITTER_EMAIL": "dev@example.com",
+        }
+        # Initial commit on main.
+        (self.work / "README.md").write_text("hello\n")
+        self._git("add", ".", cwd=self.work)
+        self._git("commit", "-m", "initial", cwd=self.work, env_extra=author_env)
+        self._git("push", "origin", "main", cwd=self.work)
+
+        # Topic branch with three dev commits.
+        self.branch = "orchestrator/issue-9"
+        self._git("checkout", "-b", self.branch, cwd=self.work)
+        for i, msg in enumerate(["fix: typo", "add foo", "add bar"], start=1):
+            (self.work / f"f{i}.txt").write_text(f"{i}\n")
+            self._git("add", ".", cwd=self.work)
+            self._git(
+                "commit", "-m", msg, cwd=self.work, env_extra=author_env,
+            )
+        self._git("push", "origin", self.branch, cwd=self.work)
+        self._git("fetch", "origin", cwd=self.work)
+
+    def _make_issue(self, title: str = "test issue", number: int = 9):
+        return make_issue(number, title=title)
+
+    def _commits_on_branch(self) -> list[str]:
+        """Subjects of all commits between origin/main and HEAD, oldest first."""
+        out = self._git(
+            "log", "--reverse", "--pretty=%s", "origin/main..HEAD",
+            cwd=self.work,
+        )
+        return [s for s in out.splitlines() if s.strip()]
+
+    def test_squash_collapses_three_commits_to_one(self) -> None:
+        # First commit's subject ("fix: typo") is conventional-commit form,
+        # so the squash subject reuses it; body lists all three.
+        issue = self._make_issue()
+        with patch.object(config, "BASE_BRANCH", "main"), \
+             patch.object(workflow, "_push_branch", return_value=True):
+            success, new_sha, count, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertTrue(success, f"expected success, got err={err!r}")
+        self.assertIsNone(err)
+        self.assertEqual(count, 3)
+        self.assertTrue(new_sha)
+
+        commits = self._commits_on_branch()
+        self.assertEqual(
+            len(commits), 1,
+            f"expected one commit on top of base, got {commits!r}",
+        )
+        # Squash subject reuses the conventional-commit first subject.
+        self.assertEqual(commits[0], "fix: typo")
+        # Body aggregates all original subjects.
+        body = self._git(
+            "log", "-1", "--pretty=%B", cwd=self.work,
+        )
+        self.assertIn("Squashed commits:", body)
+        for original in ("- fix: typo", "- add foo", "- add bar"):
+            self.assertIn(original, body)
+
+    def test_squash_uses_issue_title_when_no_conventional_first_subject(
+        self,
+    ) -> None:
+        # Reset and rebuild the branch with non-conv-commit first subject.
+        self._git("reset", "--hard", "origin/main", cwd=self.work)
+        author_env = {
+            "GIT_AUTHOR_NAME": "Dev", "GIT_AUTHOR_EMAIL": "dev@example.com",
+            "GIT_COMMITTER_NAME": "Dev", "GIT_COMMITTER_EMAIL": "dev@example.com",
+        }
+        for i, msg in enumerate(["typo fix", "feat: add foo"], start=1):
+            (self.work / f"g{i}.txt").write_text(f"{i}\n")
+            self._git("add", ".", cwd=self.work)
+            self._git(
+                "commit", "-m", msg, cwd=self.work, env_extra=author_env,
+            )
+
+        issue = self._make_issue(title="rename frobnicator")
+        with patch.object(config, "BASE_BRANCH", "main"), \
+             patch.object(workflow, "_push_branch", return_value=True):
+            success, _, count, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertTrue(success, err)
+        self.assertEqual(count, 2)
+
+        subject = self._git("log", "-1", "--pretty=%s", cwd=self.work).strip()
+        self.assertEqual(subject, "feat: rename frobnicator")
+
+    def test_squash_with_only_one_commit_is_a_no_op(self) -> None:
+        # Reset to a single commit on top of base.
+        self._git("reset", "--hard", "origin/main", cwd=self.work)
+        author_env = {
+            "GIT_AUTHOR_NAME": "Dev", "GIT_AUTHOR_EMAIL": "dev@example.com",
+            "GIT_COMMITTER_NAME": "Dev", "GIT_COMMITTER_EMAIL": "dev@example.com",
+        }
+        (self.work / "only.txt").write_text("only\n")
+        self._git("add", ".", cwd=self.work)
+        self._git(
+            "commit", "-m", "feat: only one", cwd=self.work,
+            env_extra=author_env,
+        )
+        original_head = self._git(
+            "rev-parse", "HEAD", cwd=self.work,
+        ).strip()
+
+        issue = self._make_issue()
+        push_mock = patch.object(workflow, "_push_branch", return_value=True)
+        with patch.object(config, "BASE_BRANCH", "main"), push_mock as pm:
+            success, sha, count, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertTrue(success)
+        self.assertEqual(count, 0)
+        self.assertEqual(sha, original_head)
+        # Single-commit branch must NOT trigger a push at all.
+        pm.assert_not_called()
+        # HEAD unchanged.
+        self.assertEqual(
+            self._git("rev-parse", "HEAD", cwd=self.work).strip(),
+            original_head,
+        )
+
+    def test_rollback_restores_branch_when_force_push_fails(self) -> None:
+        # The whole point of saving original_head: a push failure after
+        # the soft-reset + squash commit must not leave the branch
+        # pointing at the squash commit. The original commits must still
+        # be on the branch so the operator can decide what to do.
+        original_head = self._git(
+            "rev-parse", "HEAD", cwd=self.work,
+        ).strip()
+        original_subjects = self._commits_on_branch()
+        self.assertEqual(len(original_subjects), 3)
+
+        issue = self._make_issue()
+        with patch.object(config, "BASE_BRANCH", "main"), \
+             patch.object(workflow, "_push_branch", return_value=False):
+            success, sha, count, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertFalse(success)
+        self.assertIsNone(sha)
+        self.assertEqual(count, 0)
+        self.assertIn("force-push", err or "")
+        # HEAD restored.
+        self.assertEqual(
+            self._git("rev-parse", "HEAD", cwd=self.work).strip(),
+            original_head,
+            "rollback must restore HEAD to the pre-squash SHA",
+        )
+        # All three original commits still on the branch.
+        self.assertEqual(self._commits_on_branch(), original_subjects)
+        # Working tree clean (rollback used --hard, but pre-reset tree
+        # already matched HEAD's tree, so no file diffs should remain).
+        status = self._git("status", "--porcelain", cwd=self.work)
+        self.assertEqual(status.strip(), "")
+
+    def test_squash_commit_uses_orchestrator_identity(self) -> None:
+        # The squash commit must be authored under AGENT_GIT_NAME /
+        # AGENT_GIT_EMAIL regardless of the dev's commit identity. This
+        # keeps a single attribution for orchestrator-owned commits and
+        # matches the agent-spawn `_agent_env` behavior.
+        issue = self._make_issue()
+        with patch.object(config, "BASE_BRANCH", "main"), \
+             patch.object(workflow, "_push_branch", return_value=True), \
+             patch.object(config, "AGENT_GIT_NAME", "orch-bot"), \
+             patch.object(
+                 config, "AGENT_GIT_EMAIL", "orch-bot@example.com"
+             ):
+            success, _, _, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertTrue(success, err)
+
+        author = self._git(
+            "log", "-1", "--pretty=%an <%ae>", cwd=self.work,
+        ).strip()
+        committer = self._git(
+            "log", "-1", "--pretty=%cn <%ce>", cwd=self.work,
+        ).strip()
+        self.assertEqual(author, "orch-bot <orch-bot@example.com>")
+        self.assertEqual(committer, "orch-bot <orch-bot@example.com>")
+
+    def test_dirty_worktree_aborts_before_reset(self) -> None:
+        # An uncommitted change in the worktree (the agent left work
+        # behind) is a refuse-to-rewrite signal: the helper must abort
+        # WITHOUT touching HEAD so the dirty state is visible to the
+        # operator. Without the pre-reset dirty check the soft-reset
+        # would happen and the rollback would clobber the dirty changes.
+        original_head = self._git(
+            "rev-parse", "HEAD", cwd=self.work,
+        ).strip()
+        (self.work / "scratch.txt").write_text("uncommitted\n")
+
+        issue = self._make_issue()
+        with patch.object(config, "BASE_BRANCH", "main"), \
+             patch.object(workflow, "_push_branch", return_value=True) as pm:
+            success, _, _, err = workflow._squash_and_force_push(
+                _TEST_SPEC, self.work, self.branch, issue,
+            )
+        self.assertFalse(success)
+        self.assertIn("uncommitted", (err or ""))
+        # HEAD untouched, dirty file preserved, no push attempted.
+        self.assertEqual(
+            self._git("rev-parse", "HEAD", cwd=self.work).strip(),
+            original_head,
+        )
+        self.assertTrue((self.work / "scratch.txt").exists())
+        pm.assert_not_called()
 
 
 class ListPollableIssuesTest(unittest.TestCase):
