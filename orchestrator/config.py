@@ -31,6 +31,10 @@ _SECRET_KEYS = frozenset({
 
 
 def _load_dotenv() -> None:
+    if os.environ.get("ORCHESTRATOR_SKIP_DOTENV", "").strip().lower() in (
+        "1", "true", "on", "yes",
+    ):
+        return
     env_path = REPO_ROOT / ".env"
     if not env_path.exists():
         return

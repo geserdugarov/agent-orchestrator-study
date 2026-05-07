@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+os.environ.setdefault("ORCHESTRATOR_SKIP_DOTENV", "1")
 
 from orchestrator import config, workflow
 from orchestrator.agents import AgentResult
@@ -580,7 +583,7 @@ class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded(issue_number=30)
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -599,7 +602,7 @@ class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded(issue_number=31)
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -615,7 +618,7 @@ class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded(issue_number=32)
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -632,7 +635,7 @@ class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded(issue_number=33, label_name="bug")
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -647,7 +650,7 @@ class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded(issue_number=34)
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -667,7 +670,7 @@ class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.add_issue(issue)
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),

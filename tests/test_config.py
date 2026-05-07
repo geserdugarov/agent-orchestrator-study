@@ -10,6 +10,7 @@ class HitlHandleConfigTest(unittest.TestCase):
     def _load_config(self, hitl_handle: str):
         env = {
             "HITL_HANDLE": hitl_handle,
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         with patch.dict(os.environ, env, clear=True):
@@ -41,6 +42,7 @@ class HitlHandleConfigTest(unittest.TestCase):
 class AgentGitIdentityConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
@@ -76,6 +78,7 @@ class AgentBackendConfigTest(unittest.TestCase):
 
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
@@ -150,6 +153,7 @@ class DecomposeKillSwitchConfigTest(unittest.TestCase):
 
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
@@ -194,6 +198,7 @@ class AutoMergeConfigTest(unittest.TestCase):
 
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
@@ -238,6 +243,7 @@ class AutoMergeConfigTest(unittest.TestCase):
 class InReviewDebounceConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
@@ -261,6 +267,7 @@ class InReviewDebounceConfigTest(unittest.TestCase):
 class MaxRetriesPerDayConfigTest(unittest.TestCase):
     def _load_config(self, env: dict[str, str] | None = None):
         full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
             "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
         }
         if env:
