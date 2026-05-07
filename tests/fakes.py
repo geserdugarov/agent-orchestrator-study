@@ -168,6 +168,11 @@ class FakeGitHubClient:
         self.pulls: dict[int, FakePR] = {}
         self.merge_calls: list[tuple[int, str, str]] = []
         self.merge_returns_ok: bool = True
+        # Branches the orchestrator asked us to delete remotely after merge.
+        # Tests assert on this list to verify the post-merge cleanup hook
+        # actually fires.
+        self.deleted_remote_branches: list[str] = []
+        self.delete_remote_branch_returns_ok: bool = True
 
     def seed_state(self, issue_number: int, **data: Any) -> None:
         """Pre-populate pinned state for an issue. The next read_pinned_state
@@ -376,6 +381,10 @@ class FakeGitHubClient:
         pr.merged = True
         pr.state = "closed"
         return True
+
+    def delete_remote_branch(self, branch: str) -> bool:
+        self.deleted_remote_branches.append(branch)
+        return self.delete_remote_branch_returns_ok
 
     def pr_conversation_comments_after(
         self, pr: FakePR, after_id: Optional[int]

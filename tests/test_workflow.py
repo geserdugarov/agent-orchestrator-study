@@ -103,12 +103,14 @@ class _PatchedWorkflowMixin:
         # `_on_commits` reads the worktree's first commit subject to derive
         # the PR title; mock it so tests don't shell out to git.
         first_subject_mock = MagicMock(return_value=first_commit_subject)
+        cleanup_merged_mock = MagicMock()
 
         with patch.object(workflow, "run_agent", rc_mock), \
              patch.object(workflow, "_ensure_worktree", wt_mock), \
              patch.object(workflow, "_ensure_decompose_worktree", decompose_wt_mock), \
              patch.object(workflow, "_decompose_worktree_path", decompose_path_mock), \
              patch.object(workflow, "_cleanup_decompose_worktree", cleanup_decompose_mock), \
+             patch.object(workflow, "_cleanup_merged_branch", cleanup_merged_mock), \
              patch.object(workflow, "_has_new_commits", hnc_mock), \
              patch.object(workflow, "_worktree_dirty_files", df_mock), \
              patch.object(workflow, "_push_branch", push_mock), \
@@ -122,6 +124,7 @@ class _PatchedWorkflowMixin:
             "_ensure_decompose_worktree": decompose_wt_mock,
             "_decompose_worktree_path": decompose_path_mock,
             "_cleanup_decompose_worktree": cleanup_decompose_mock,
+            "_cleanup_merged_branch": cleanup_merged_mock,
             "_has_new_commits": hnc_mock,
             "_worktree_dirty_files": df_mock,
             "_push_branch": push_mock,
@@ -1273,7 +1276,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         pr = self._open_pr(merged=True, state="closed")
         gh, issue = self._seed(pr=pr)
 
-        self._run(
+        mocks = self._run(
             lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
@@ -1282,12 +1285,18 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIn("merged_at", gh.pinned_data(30))
         self.assertTrue(issue.closed)
         self.assertEqual(gh.merge_calls, [])
+        # Branch cleanup must fire for an external merge: the PR is gone, so
+        # the per-issue worktree and the local + remote branches are dead
+        # weight that should not survive past the `done` flip.
+        mocks["_cleanup_merged_branch"].assert_called_once_with(
+            gh, _TEST_SPEC, 30,
+        )
 
     def test_in_review_pr_closed_unmerged(self) -> None:
         pr = self._open_pr(merged=False, state="closed")
         gh, issue = self._seed(pr=pr)
 
-        self._run(
+        mocks = self._run(
             lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
@@ -1296,6 +1305,10 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIn("closed_without_merge_at", gh.pinned_data(30))
         self.assertTrue(issue.closed)
         self.assertEqual(gh.merge_calls, [])
+        # Closed-without-merge is `rejected`, not `done`. The branch may
+        # still be useful for reopening the PR or salvaging work, so we
+        # leave it alone -- cleanup is gated to the merged paths.
+        mocks["_cleanup_merged_branch"].assert_not_called()
 
     def test_in_review_pr_open_no_comments_no_auto_merge(self) -> None:
         pr = self._open_pr(approved=True, mergeable=True, check_state="success")
@@ -1319,7 +1332,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seed(pr=pr)
 
         with patch.object(config, "AUTO_MERGE", True):
-            self._run(
+            mocks = self._run(
                 lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
@@ -1328,6 +1341,9 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIn((30, "done"), gh.label_history)
         self.assertIn("merged_at", gh.pinned_data(30))
         self.assertTrue(issue.closed)
+        mocks["_cleanup_merged_branch"].assert_called_once_with(
+            gh, _TEST_SPEC, 30,
+        )
 
     def test_in_review_auto_merge_blocked_on_pending_checks(self) -> None:
         pr = self._open_pr(approved=True, mergeable=True, check_state="pending")
@@ -6110,6 +6126,138 @@ class WorktreePathSlugNamespaceTest(unittest.TestCase):
             path,
             config.WORKTREES_DIR / "geserdugarov__agent-orchestrator" / "issue-9",
         )
+
+class CleanupMergedBranchTest(unittest.TestCase):
+    """Direct coverage of `_cleanup_merged_branch`. The handler-level tests
+    patch this helper out so they only check it was invoked; here we run
+    the real implementation with `_git` mocked to verify the worktree
+    removal, local branch delete, and remote branch delete each fire (and
+    that an absent worktree is silently skipped instead of erroring).
+    """
+
+    ISSUE_NUMBER = 99
+    BRANCH = "orchestrator/issue-99"
+
+    def _run_helper(
+        self,
+        *,
+        worktree_exists: bool,
+        local_branch_exists: bool,
+    ):
+        from unittest.mock import MagicMock
+        gh = FakeGitHubClient()
+
+        rev_parse_rc = 0 if local_branch_exists else 1
+
+        def fake_git(*args, cwd):
+            cmd = args[0]
+            if cmd == "worktree":
+                return MagicMock(returncode=0, stderr="", stdout="")
+            if cmd == "rev-parse":
+                return MagicMock(returncode=rev_parse_rc, stderr="", stdout="")
+            if cmd == "branch":
+                return MagicMock(returncode=0, stderr="", stdout="")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        git_mock = MagicMock(side_effect=fake_git)
+
+        # `_worktree_path` returns a Path that may or may not exist on disk;
+        # patch its existence check rather than touching the real filesystem.
+        wt_path = MagicMock()
+        wt_path.exists.return_value = worktree_exists
+        wt_path.__str__ = lambda self: f"/tmp/issue-{CleanupMergedBranchTest.ISSUE_NUMBER}"
+
+        with patch.object(workflow, "_git", git_mock), \
+             patch.object(workflow, "_worktree_path", return_value=wt_path):
+            workflow._cleanup_merged_branch(gh, _TEST_SPEC, self.ISSUE_NUMBER)
+        return gh, git_mock
+
+    def test_full_cleanup_runs_all_three_steps(self) -> None:
+        gh, git_mock = self._run_helper(
+            worktree_exists=True, local_branch_exists=True,
+        )
+
+        # Worktree remove issued first, then rev-parse to probe the local
+        # branch, then `branch -D`. The remote-side delete recorder confirms
+        # gh.delete_remote_branch was called with the per-issue branch.
+        cmds = [c.args[0] for c in git_mock.call_args_list]
+        self.assertEqual(
+            cmds[:3],
+            ["worktree", "rev-parse", "branch"],
+        )
+        # The branch -D invocation targets the per-issue branch by name.
+        branch_call = next(
+            c for c in git_mock.call_args_list if c.args[0] == "branch"
+        )
+        self.assertEqual(branch_call.args[1], "-D")
+        self.assertEqual(branch_call.args[2], self.BRANCH)
+        self.assertEqual(gh.deleted_remote_branches, [self.BRANCH])
+
+    def test_skips_worktree_remove_when_worktree_absent(self) -> None:
+        # Worktree may already be gone if the operator cleaned it up by hand
+        # or a prior tick removed it. Helper should still drop the local
+        # branch and request the remote delete instead of erroring out.
+        gh, git_mock = self._run_helper(
+            worktree_exists=False, local_branch_exists=True,
+        )
+
+        cmds = [c.args[0] for c in git_mock.call_args_list]
+        self.assertNotIn("worktree", cmds)
+        self.assertIn("rev-parse", cmds)
+        self.assertIn("branch", cmds)
+        self.assertEqual(gh.deleted_remote_branches, [self.BRANCH])
+
+    def test_skips_local_delete_when_branch_absent(self) -> None:
+        # Branch may already be gone if a previous cleanup partly succeeded
+        # or the operator pruned it. We must not run `branch -D` (it would
+        # fail loudly), but must still request the remote delete.
+        gh, git_mock = self._run_helper(
+            worktree_exists=True, local_branch_exists=False,
+        )
+
+        cmds = [c.args[0] for c in git_mock.call_args_list]
+        self.assertIn("worktree", cmds)
+        self.assertIn("rev-parse", cmds)
+        self.assertNotIn("branch", cmds)
+        self.assertEqual(gh.deleted_remote_branches, [self.BRANCH])
+
+
+class DeleteRemoteBranchTest(unittest.TestCase):
+    """`GitHubClient.delete_remote_branch` is idempotent against a 404
+    because the repo's "auto-delete head branches" setting may have
+    already removed the ref as part of the merge. Other failures log
+    and return False so the caller can keep going.
+    """
+
+    def _client_with_ref(self, *, raise_status):
+        from unittest.mock import MagicMock
+        from orchestrator.github import GitHubClient
+        from github import GithubException
+
+        client = GitHubClient.__new__(GitHubClient)
+        client.repo = MagicMock()
+        if raise_status is None:
+            client.repo.get_git_ref.return_value = MagicMock()
+        else:
+            err = GithubException(status=raise_status, data={"message": "x"})
+            client.repo.get_git_ref.return_value = MagicMock()
+            client.repo.get_git_ref.return_value.delete.side_effect = err
+        return client
+
+    def test_success(self) -> None:
+        client = self._client_with_ref(raise_status=None)
+        self.assertTrue(client.delete_remote_branch("orchestrator/issue-1"))
+        client.repo.get_git_ref.assert_called_once_with(
+            "heads/orchestrator/issue-1"
+        )
+
+    def test_404_treated_as_success(self) -> None:
+        client = self._client_with_ref(raise_status=404)
+        self.assertTrue(client.delete_remote_branch("orchestrator/issue-1"))
+
+    def test_other_error_returns_false(self) -> None:
+        client = self._client_with_ref(raise_status=403)
+        self.assertFalse(client.delete_remote_branch("orchestrator/issue-1"))
 
 
 if __name__ == "__main__":
