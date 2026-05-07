@@ -22,6 +22,15 @@ from tests.fakes import (
 
 
 _FAKE_WT = Path("/tmp/orchestrator-test-wt-doesnt-matter")
+# Tests don't shell out (the worktree/git helpers are mocked), so the values
+# only need to be plausible -- the slug/base reach `_build_review_prompt`,
+# `_push_branch`, and the `find_open_pr` / `open_pr` call sites and are
+# inspected by some assertions; nothing else cares.
+_TEST_SPEC = config.RepoSpec(
+    slug="geserdugarov/agent-orchestrator",
+    target_root=Path("/tmp/orchestrator-test-target-root"),
+    base_branch="main",
+)
 
 
 def _agent(
@@ -171,7 +180,7 @@ class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", False):
             mocks = self._run(
-                lambda: workflow._handle_pickup(gh, issue),
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
                 run_agent=_agent(last_message="need clarification"),
                 has_new_commits=False,
             )
@@ -199,7 +208,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_commits_clean_tree_opens_pr_and_flips_label(self) -> None:
         gh, issue = self._seeded()
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="implemented"),
             # First call: not a recovered worktree -> codex runs.
             # Second call: codex produced commits -> push path.
@@ -229,7 +238,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         dirty = [f"file_{i}.py" for i in range(15)]
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="commit done but more work pending"),
             has_new_commits=[False, True],
             dirty_files=dirty,
@@ -248,7 +257,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_no_commits_with_message_parks_as_question(self) -> None:
         gh, issue = self._seeded()
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="What database should I use?"),
             has_new_commits=False,
         )
@@ -262,7 +271,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_codex_timeout_parks_with_timeout_message(self) -> None:
         gh, issue = self._seeded()
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(timed_out=True),
             has_new_commits=False,
         )
@@ -276,7 +285,7 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_push_failure_parks_without_opening_pr(self) -> None:
         gh, issue = self._seeded()
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -304,7 +313,7 @@ class HandleImplementingAwaitingHumanTest(unittest.TestCase, _PatchedWorkflowMix
         before = gh.write_state_calls
 
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -330,7 +339,7 @@ class HandleImplementingAwaitingHumanTest(unittest.TestCase, _PatchedWorkflowMix
         )
 
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-old", last_message="ok"),
             # awaiting_human path skips the recovered-worktree probe; only
             # the post-codex commit check runs.
@@ -360,7 +369,7 @@ class HandleImplementingRecoveredWorktreeTest(unittest.TestCase, _PatchedWorkflo
         gh.seed_state(3, codex_session_id="sess-prev")
 
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
             has_new_commits=True,
             dirty_files=(),
@@ -385,7 +394,7 @@ class OnCommitsPRReuseTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.existing_open_pr["orchestrator/issue-4"] = existing
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -603,7 +612,7 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_approved_flips_label_and_does_not_resume(self) -> None:
         gh, issue = self._seeded()
         mocks = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
 
@@ -623,7 +632,7 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         dev_fix = _agent(session_id="dev-sess", last_message="fixed")
 
         mocks = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=[review, dev_fix],
             dirty_files=(),
             push_branch=True,
@@ -649,7 +658,7 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_unknown_verdict_parks_with_quoted_message(self) -> None:
         gh, issue = self._seeded()
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="I'm not sure what to think"),
         )
 
@@ -663,7 +672,7 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
     def test_reviewer_timeout_parks(self) -> None:
         gh, issue = self._seeded()
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(timed_out=True),
         )
 
@@ -697,7 +706,7 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
     def test_dev_fix_no_new_commit_parks_round_unchanged(self) -> None:
         gh, issue = self._seeded()
         mocks = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=[
                 self._changes_requested_review(),
                 _agent(session_id="dev-sess", last_message="why?"),
@@ -717,7 +726,7 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
     def test_dev_fix_dirty_parks_round_unchanged(self) -> None:
         gh, issue = self._seeded()
         mocks = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=[
                 self._changes_requested_review(),
                 _agent(session_id="dev-sess", last_message="partial"),
@@ -737,7 +746,7 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
     def test_dev_fix_push_fail_parks_round_unchanged(self) -> None:
         gh, issue = self._seeded()
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=[
                 self._changes_requested_review(),
                 _agent(session_id="dev-sess", last_message="fixed"),
@@ -755,7 +764,7 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
     def test_review_round_at_cap_parks_without_spawning_reviewer(self) -> None:
         gh, issue = self._seeded(review_round=config.MAX_REVIEW_ROUNDS)
         mocks = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -784,7 +793,7 @@ class HandleValidatingAwaitingHumanResumeTest(unittest.TestCase, _PatchedWorkflo
         )
 
         mocks = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dev-sess", last_message="fixed"),
             dirty_files=(),
             push_branch=True,
@@ -830,7 +839,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
         # awaiting_human. Each tick consumes one retry from the budget.
         for tick in range(3):
             self._run(
-                lambda: workflow._handle_implementing(gh, issue),
+                lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(last_message=f"q{tick}"),
                 has_new_commits=False,
             )
@@ -847,7 +856,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         # Fourth tick: must park before codex spawns.
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="should not run"),
             has_new_commits=False,
         )
@@ -867,7 +876,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-1", last_message="done"),
             has_new_commits=[False, True],
             dirty_files=(),
@@ -889,7 +898,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="ask again"),
             has_new_commits=False,
         )
@@ -919,7 +928,7 @@ class HandleImplementingRetryCapTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_implementing(gh, issue),
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="sess-old", last_message="ok"),
             has_new_commits=[True],
             dirty_files=(),
@@ -953,7 +962,7 @@ class ConfigurableBackendTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DEV_AGENT", "claude"):
             mocks = self._run(
-                lambda: workflow._handle_implementing(gh, issue),
+                lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(session_id="sess-fresh", last_message="done"),
                 has_new_commits=[False, True],
                 dirty_files=(),
@@ -981,7 +990,7 @@ class ConfigurableBackendTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "REVIEW_AGENT", "codex"):
             mocks = self._run(
-                lambda: workflow._handle_validating(gh, issue),
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="rev-sess",
                     last_message="LGTM\n\nVERDICT: APPROVED",
@@ -1016,7 +1025,7 @@ class ConfigurableBackendTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "DEV_AGENT", "claude"), \
              patch.object(config, "REVIEW_AGENT", "claude"):
             mocks = self._run(
-                lambda: workflow._handle_validating(gh, issue),
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
                 run_agent=[review, dev_fix],
                 dirty_files=(),
                 push_branch=True,
@@ -1051,7 +1060,7 @@ class ConfigurableBackendTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DEV_AGENT", "claude"):
             mocks = self._run(
-                lambda: workflow._handle_implementing(gh, issue),
+                lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(session_id="sess-legacy", last_message="ok"),
                 has_new_commits=[True],
                 dirty_files=(),
@@ -1120,7 +1129,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seed(pr=pr)
 
         self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -1134,7 +1143,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seed(pr=pr)
 
         self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -1149,7 +1158,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", False):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1166,7 +1175,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1181,7 +1190,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1196,7 +1205,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1210,7 +1219,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1226,7 +1235,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1243,7 +1252,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1275,7 +1284,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1299,7 +1308,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dev-sess", last_message="renamed"),
             push_branch=True,
             head_shas=["aaa", "bbb"],
@@ -1328,7 +1337,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1343,7 +1352,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seed(pr=None, with_pr_number=False)
 
         self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -1355,7 +1364,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         # comment posted; comment count stays at 1).
         before = len(gh.posted_comments)
         self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
         self.assertEqual(len(gh.posted_comments), before)
@@ -1377,7 +1386,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1401,7 +1410,7 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1466,7 +1475,7 @@ class ValidatingToInReviewHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue, pr = self._setup()
 
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             # Local worktree HEAD == pr.head.sha; reviewed_sha snapshot
             # (the only _head_sha call on the approved path) returns it
@@ -1500,7 +1509,7 @@ class ValidatingToInReviewHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
             c.created_at = long_ago
 
         mocks_v = self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             head_shas=("newhead42",),
         )
@@ -1528,7 +1537,7 @@ class ValidatingToInReviewHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks_r = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1585,7 +1594,7 @@ class ValidatingToInReviewHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
 
@@ -1648,7 +1657,7 @@ class HandleInReviewClosedIssueExternalMergeTest(
         gh.seed_state(40, pr_number=99, branch="orchestrator/issue-40")
 
         self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -1679,7 +1688,7 @@ class StaleHumanApprovalAutoMergeTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1704,7 +1713,7 @@ class StaleHumanApprovalAutoMergeTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1743,7 +1752,7 @@ class InReviewParkWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True):
             # Tick 1: fail-checks park.
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
         self.assertTrue(gh.pinned_data(60).get("awaiting_human"))
@@ -1757,7 +1766,7 @@ class InReviewParkWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True):
             # Tick 2: nothing new; must NOT resume the dev agent.
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
         mocks["run_agent"].assert_not_called()
@@ -1783,7 +1792,7 @@ class InReviewParkWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
         self.assertTrue(gh.pinned_data(61).get("awaiting_human"))
@@ -1792,7 +1801,7 @@ class InReviewParkWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
         mocks["run_agent"].assert_not_called()
@@ -1844,7 +1853,7 @@ class InReviewSplitWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dev-sess", last_message="renamed"),
             push_branch=True,
             head_shas=["aaa", "bbb"],
@@ -1883,7 +1892,7 @@ class InReviewSplitWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dev-sess", last_message="added"),
             push_branch=True,
             head_shas=["aaa", "bbb"],
@@ -1920,7 +1929,7 @@ class HumanChangesRequestedVetoTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1952,7 +1961,7 @@ class HumanChangesRequestedVetoTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -1980,7 +1989,7 @@ class HumanChangesRequestedVetoTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2046,7 +2055,7 @@ class ValidatingHandoffPreservesHumanFeedbackTest(
         # lands AFTER the human's. With the fix, the watermark stops at
         # the first human comment instead of swallowing it.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
         self.assertIn((15, "in_review"), gh.label_history)
@@ -2068,7 +2077,7 @@ class ValidatingHandoffPreservesHumanFeedbackTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="docstring added"
                 ),
@@ -2140,7 +2149,7 @@ class PrePickupChatterHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
         # Step 1: validating approves. Watermark must include id 850 so the
         # pre-pickup human comment is treated as consumed.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             head_shas=("cafe1234",),
         )
@@ -2167,7 +2176,7 @@ class PrePickupChatterHandoffTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2229,7 +2238,7 @@ class InReviewPRReviewSummaryTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="renamed",
                 ),
@@ -2267,7 +2276,7 @@ class InReviewPRReviewSummaryTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="added test",
                 ),
@@ -2302,7 +2311,7 @@ class InReviewPRReviewSummaryTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2330,7 +2339,7 @@ class InReviewPRReviewSummaryTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2398,7 +2407,7 @@ class SameAccountHumanFeedbackTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="standing by"
                 ),
@@ -2463,7 +2472,7 @@ class SameAccountHumanFeedbackTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         # Step 1: validating approves; watermark seed must STOP at id=950.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
         wm = gh.pinned_data(101).get("pr_last_comment_id")
@@ -2481,7 +2490,7 @@ class SameAccountHumanFeedbackTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="docstring added"
                 ),
@@ -2574,7 +2583,7 @@ class LegacyInReviewWatermarkSeedTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", False), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2602,7 +2611,7 @@ class LegacyInReviewWatermarkSeedTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2654,7 +2663,7 @@ class CrossNamespaceFilterTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="renamed",
                 ),
@@ -2705,7 +2714,7 @@ class CrossNamespaceFilterTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="tightened",
                 ),
@@ -2765,7 +2774,7 @@ class TransientParkRecoveryTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2786,7 +2795,7 @@ class TransientParkRecoveryTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2807,7 +2816,7 @@ class TransientParkRecoveryTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2831,7 +2840,7 @@ class TransientParkRecoveryTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -2905,7 +2914,7 @@ class ValidatingHandoffSeedsAllWatermarksTest(
         # pr_last_review_summary_id so the legacy in_review migration cannot
         # accidentally advance past the human review.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
         data = gh.pinned_data(200)
@@ -2920,7 +2929,7 @@ class ValidatingHandoffSeedsAllWatermarksTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="tightened",
                 ),
@@ -2951,7 +2960,7 @@ class ValidatingHandoffSeedsAllWatermarksTest(
         )
 
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
         data = gh.pinned_data(200)
@@ -2963,7 +2972,7 @@ class ValidatingHandoffSeedsAllWatermarksTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="renamed",
                 ),
@@ -3019,7 +3028,7 @@ class ManuallyClosedInReviewIssueTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "AUTO_MERGE", True):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -3046,7 +3055,7 @@ class ManuallyClosedInReviewIssueTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", False), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -3070,7 +3079,7 @@ class ManuallyClosedInReviewIssueTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.seed_state(251, pr_number=701, branch="orchestrator/issue-251")
 
         self._run(
-            lambda: workflow._handle_in_review(gh, issue),
+            lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -3128,7 +3137,7 @@ class HandoffInlineIdCollisionTest(unittest.TestCase, _PatchedWorkflowMixin):
         # Step 1: validating handoff. The inline comment must NOT bump
         # pr_last_review_comment_id past 4242.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
         data = gh.pinned_data(300)
@@ -3144,7 +3153,7 @@ class HandoffInlineIdCollisionTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="renamed",
                 ),
@@ -3204,7 +3213,7 @@ class LegacyMigrationPersistsEmptyWatermarksTest(
         # The migration must persist 0 on every namespace anyway.
         with patch.object(config, "AUTO_MERGE", False):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
         data = gh.pinned_data(400)
@@ -3226,7 +3235,7 @@ class LegacyMigrationPersistsEmptyWatermarksTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="renamed",
                 ),
@@ -3259,7 +3268,7 @@ class LegacyMigrationPersistsEmptyWatermarksTest(
 
         with patch.object(config, "AUTO_MERGE", False):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
         data = gh.pinned_data(400)
@@ -3279,7 +3288,7 @@ class LegacyMigrationPersistsEmptyWatermarksTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="tightened",
                 ),
@@ -3362,7 +3371,7 @@ class HandoffWithoutPickupIdLegacyStateTest(
         # Step 1: validating approves. Handoff must NOT advance the
         # watermark past 950.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
         )
         wm = gh.pinned_data(500).get("pr_last_comment_id")
@@ -3381,7 +3390,7 @@ class HandoffWithoutPickupIdLegacyStateTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="ack",
                 ),
@@ -3527,7 +3536,7 @@ class ZeroWatermarkSurvivesFallbackTest(unittest.TestCase, _PatchedWorkflowMixin
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="ack",
                 ),
@@ -3598,7 +3607,7 @@ class StaleParkReasonClearedOnNewParkTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess",
                     last_message="I cannot proceed without a clarification",
@@ -3622,7 +3631,7 @@ class StaleParkReasonClearedOnNewParkTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -3691,7 +3700,7 @@ class ReviewedShaBranchUpdateRaceTest(unittest.TestCase, _PatchedWorkflowMixin):
         # worktree at "reviewedAA". The remote PR shows "forced42".
         # `agent_approved_sha` must record what the agent actually saw.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             head_shas=("reviewedAA",),
         )
@@ -3713,7 +3722,7 @@ class ReviewedShaBranchUpdateRaceTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -3757,7 +3766,7 @@ class ReviewedShaBranchUpdateRaceTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             head_shas=("happyAA",),
         )
@@ -3767,7 +3776,7 @@ class ReviewedShaBranchUpdateRaceTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -3837,7 +3846,7 @@ class HandoffSkipsConsumedRepliesTest(unittest.TestCase, _PatchedWorkflowMixin):
         # Step 1: validating approves. The handoff seed must walk PAST
         # comment 920 (already consumed) instead of stopping at it.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             head_shas=("cafe1234",),
         )
@@ -3855,7 +3864,7 @@ class HandoffSkipsConsumedRepliesTest(unittest.TestCase, _PatchedWorkflowMixin):
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -3884,9 +3893,11 @@ class HandoffSkipsConsumedRepliesTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
         state = gh.read_pinned_state(issue)
 
-        with patch.object(workflow, "_ensure_worktree", lambda n: _FAKE_WT), \
+        with patch.object(workflow, "_ensure_worktree", lambda spec, n: _FAKE_WT), \
              patch.object(workflow, "run_agent", lambda *a, **kw: _agent()):
-            result = workflow._resume_developer_on_human_reply(gh, issue, state)
+            result = workflow._resume_developer_on_human_reply(
+                gh, _TEST_SPEC, issue, state
+            )
 
         self.assertIsNotNone(result)
         self.assertEqual(
@@ -3965,7 +3976,7 @@ class HandoffConsumedThroughIssueThreadOnlyTest(
         # seed must stop before 915 so the next in_review tick scans the
         # PR-conv surface and finds the human comment.
         self._run(
-            lambda: workflow._handle_validating(gh, issue),
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
             run_agent=_agent(last_message="LGTM\n\nVERDICT: APPROVED"),
             head_shas=("cafe1234",),
         )
@@ -3986,7 +3997,7 @@ class HandoffConsumedThroughIssueThreadOnlyTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             mocks = self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="docstring added",
                 ),
@@ -4138,7 +4149,7 @@ class AutoMergeSHAShiftDuringMergeabilityCheckTest(
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600), \
              patch.object(gh, "pr_is_mergeable", mergeable_with_refresh):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -4163,7 +4174,7 @@ class AutoMergeSHAShiftDuringMergeabilityCheckTest(
         with patch.object(config, "AUTO_MERGE", True), \
              patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
             self._run(
-                lambda: workflow._handle_in_review(gh, issue),
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
 
@@ -4481,7 +4492,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", True):
             self._run(
-                lambda: workflow._handle_pickup(gh, issue),
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dec-sess", last_message=manifest
                 ),
@@ -4505,7 +4516,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dec-sess", last_message=manifest
             ),
@@ -4537,7 +4548,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dec-sess", last_message=manifest
             ),
@@ -4579,7 +4590,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dec-sess", last_message=manifest
             ),
@@ -4613,7 +4624,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         manifest = _manifest('{"decision": "single", "rationale": "fits"}')
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
             has_new_commits=True,
         )
@@ -4632,7 +4643,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         manifest = _manifest('{"decision": "single", "rationale": "fits"}')
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
             dirty_files=("foo.py",),
         )
@@ -4650,7 +4661,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         bad = _manifest("{not really json")
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=bad),
         )
 
@@ -4671,7 +4682,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.add_issue(issue)
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dec-sess",
                 last_message="Should the new commands accept a --json flag?",
@@ -4706,7 +4717,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dec-sess", last_message=manifest
             ),
@@ -4747,7 +4758,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE_AGENT", "codex"):
             mocks = self._run(
-                lambda: workflow._handle_decomposing(gh, issue),
+                lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dec-sess", last_message=manifest
                 ),
@@ -4770,7 +4781,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -4793,7 +4804,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", False):
             self._run(
-                lambda: workflow._handle_pickup(gh, issue),
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="done"
                 ),
@@ -4835,7 +4846,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", False):
             mocks = self._run(
-                lambda: workflow._handle_decomposing(gh, issue),
+                lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="implemented"
                 ),
@@ -4907,7 +4918,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", False):
             self._run(
-                lambda: workflow._handle_decomposing(gh, issue),
+                lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="implemented"
                 ),
@@ -4943,7 +4954,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", False):
             self._run(
-                lambda: workflow._handle_decomposing(gh, issue),
+                lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
                 run_agent=_agent(
                     session_id="dev-sess", last_message="implemented"
                 ),
@@ -4983,7 +4994,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         with patch.object(config, "DECOMPOSE", False):
             mocks = self._run(
-                lambda: workflow._handle_decomposing(gh, parent),
+                lambda: workflow._handle_decomposing(gh, _TEST_SPEC, parent),
                 run_agent=_agent(),
             )
 
@@ -5022,7 +5033,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.create_child_issue = spy_create
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
         )
 
@@ -5065,7 +5076,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -5093,7 +5104,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -5123,7 +5134,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -5159,7 +5170,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -5210,7 +5221,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, parent),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5253,7 +5264,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.create_child_issue = spy_create
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
         )
 
@@ -5292,7 +5303,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.write_pinned_state = spy_write
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
         )
 
@@ -5320,16 +5331,16 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
         )
 
-        mocks["_ensure_decompose_worktree"].assert_called_with(70)
+        mocks["_ensure_decompose_worktree"].assert_called_with(_TEST_SPEC, 70)
         mocks["_ensure_worktree"].assert_not_called()
         # Cleanup runs at function exit so the next consumer of issue 70
         # (here _handle_ready -> _handle_implementing on the next tick)
         # starts from a fresh checkout.
-        mocks["_cleanup_decompose_worktree"].assert_called_with(70)
+        mocks["_cleanup_decompose_worktree"].assert_called_with(_TEST_SPEC, 70)
 
     def test_decompose_skips_cleanup_on_dirty_park(self) -> None:
         # Operator inspection requires the decomposer's worktree to
@@ -5340,7 +5351,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         manifest = _manifest('{"decision": "single", "rationale": "fits"}')
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
             has_new_commits=True,
         )
@@ -5366,7 +5377,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         mocks = self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(),
         )
 
@@ -5385,7 +5396,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_decomposing(gh, issue),
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
             run_agent=_agent(session_id="dec-sess", last_message=manifest),
         )
 
@@ -5405,7 +5416,7 @@ class HandleReadyTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.add_issue(issue)
 
         mocks = self._run(
-            lambda: workflow._handle_ready(gh, issue),
+            lambda: workflow._handle_ready(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dev-sess", last_message="implemented"
             ),
@@ -5439,7 +5450,7 @@ class HandleReadyTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         before = len(gh.posted_comments)
         self._run(
-            lambda: workflow._handle_ready(gh, issue),
+            lambda: workflow._handle_ready(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dev-sess", last_message="done"
             ),
@@ -5482,7 +5493,7 @@ class HandleReadyTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_ready(gh, issue),
+            lambda: workflow._handle_ready(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dev-sess", last_message="done"
             ),
@@ -5517,7 +5528,7 @@ class HandleReadyTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_ready(gh, issue),
+            lambda: workflow._handle_ready(gh, _TEST_SPEC, issue),
             run_agent=_agent(
                 session_id="dev-sess", last_message="done"
             ),
@@ -5561,7 +5572,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5578,7 +5589,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5595,7 +5606,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5629,7 +5640,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.seed_state(40, children=[401, 402])
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5666,7 +5677,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.seed_state(41, children=[411, 412])
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5695,7 +5706,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.seed_state(42, children=[421])
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5716,7 +5727,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5737,7 +5748,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh.seed_state(34, decomposer_agent="claude")
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5762,7 +5773,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         before_labels = list(gh.label_history)
 
         self._run(
-            lambda: workflow._handle_blocked(gh, child),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, child),
             run_agent=_agent(),
         )
 
@@ -5784,7 +5795,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 
@@ -5822,7 +5833,7 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self._run(
-            lambda: workflow._handle_blocked(gh, parent),
+            lambda: workflow._handle_blocked(gh, _TEST_SPEC, parent),
             run_agent=_agent(),
         )
 

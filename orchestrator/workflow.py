@@ -24,6 +24,7 @@ from github.Issue import Issue
 
 from . import config
 from .agents import AgentResult, run_agent
+from .config import RepoSpec
 from .github import GitHubClient, PinnedState
 
 log = logging.getLogger(__name__)
@@ -147,7 +148,7 @@ def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _ensure_worktree(issue_number: int) -> Path:
+def _ensure_worktree(spec: RepoSpec, issue_number: int) -> Path:
     """Return a worktree on a per-issue branch, reusing one with unpushed work.
 
     The reuse is what lets the orchestrator survive a crash between codex
@@ -159,32 +160,32 @@ def _ensure_worktree(issue_number: int) -> Path:
     branch = _branch_name(issue_number)
 
     if wt.exists():
-        if _has_new_commits(wt):
+        if _has_new_commits(spec, wt):
             log.info("issue=#%d worktree has unpushed commits; reusing", issue_number)
             return wt
-        _git("worktree", "remove", "--force", str(wt), cwd=config.TARGET_REPO_ROOT)
+        _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
 
-    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.TARGET_REPO_ROOT)
+    _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
 
     have_branch = _git(
-        "rev-parse", "--verify", branch, cwd=config.TARGET_REPO_ROOT
+        "rev-parse", "--verify", branch, cwd=spec.target_root
     ).returncode == 0
     if have_branch:
-        result = _git("worktree", "add", str(wt), branch, cwd=config.TARGET_REPO_ROOT)
+        result = _git("worktree", "add", str(wt), branch, cwd=spec.target_root)
     else:
         result = _git(
             "worktree", "add", "-b", branch, str(wt),
-            f"origin/{config.BASE_BRANCH}",
-            cwd=config.TARGET_REPO_ROOT,
+            f"origin/{spec.base_branch}",
+            cwd=spec.target_root,
         )
     if result.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {result.stderr}")
     return wt
 
 
-def _has_new_commits(worktree: Path) -> bool:
+def _has_new_commits(spec: RepoSpec, worktree: Path) -> bool:
     r = _git(
-        "rev-list", "--count", f"origin/{config.BASE_BRANCH}..HEAD",
+        "rev-list", "--count", f"origin/{spec.base_branch}..HEAD",
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -294,7 +295,7 @@ def _decompose_worktree_path(issue_number: int) -> Path:
     return config.WORKTREES_DIR / f"decompose-{issue_number}"
 
 
-def _ensure_decompose_worktree(issue_number: int) -> Path:
+def _ensure_decompose_worktree(spec: RepoSpec, issue_number: int) -> Path:
     """Create the decomposer's worktree fresh from current origin/<base>.
 
     Force-removes any existing decomposer worktree first; the decomposer
@@ -304,19 +305,19 @@ def _ensure_decompose_worktree(issue_number: int) -> Path:
     config.WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
     wt = _decompose_worktree_path(issue_number)
     if wt.exists():
-        _git("worktree", "remove", "--force", str(wt), cwd=config.TARGET_REPO_ROOT)
-    _git("fetch", "--quiet", "origin", config.BASE_BRANCH, cwd=config.TARGET_REPO_ROOT)
+        _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
+    _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
     result = _git(
         "worktree", "add", "--detach", str(wt),
-        f"origin/{config.BASE_BRANCH}",
-        cwd=config.TARGET_REPO_ROOT,
+        f"origin/{spec.base_branch}",
+        cwd=spec.target_root,
     )
     if result.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {result.stderr}")
     return wt
 
 
-def _cleanup_decompose_worktree(issue_number: int) -> None:
+def _cleanup_decompose_worktree(spec: RepoSpec, issue_number: int) -> None:
     """Remove the decomposer's worktree if it exists.
 
     Called at every `_handle_decomposing` exit except the dirty/commits
@@ -326,14 +327,14 @@ def _cleanup_decompose_worktree(issue_number: int) -> None:
     try:
         wt = _decompose_worktree_path(issue_number)
         if wt.exists():
-            _git("worktree", "remove", "--force", str(wt), cwd=config.TARGET_REPO_ROOT)
+            _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
     except Exception:
         log.exception(
             "issue=#%d failed to clean up decomposer worktree", issue_number,
         )
 
 
-def _push_branch(worktree: Path, branch: str) -> bool:
+def _push_branch(spec: RepoSpec, worktree: Path, branch: str) -> bool:
     """Push via GIT_ASKPASS so the token never appears in argv.
 
     The push target URL carries only the username (`x-access-token`); the
@@ -376,7 +377,7 @@ def _push_branch(worktree: Path, branch: str) -> bool:
             branch, rewrite.stdout.strip(),
         )
         return False
-    auth_url = f"https://x-access-token@github.com/{config.REPO}.git"
+    auth_url = f"https://x-access-token@github.com/{spec.slug}.git"
     with tempfile.TemporaryDirectory(prefix="orch-askpass-") as td:
         askpass = Path(td) / "askpass.sh"
         askpass.write_text('#!/bin/sh\nprintf %s "$GIT_TOKEN"\n')
@@ -434,18 +435,18 @@ def _build_implement_prompt(issue: Issue, comments_text: str) -> str:
     )
 
 
-def _build_review_prompt(issue: Issue, comments_text: str) -> str:
+def _build_review_prompt(spec: RepoSpec, issue: Issue, comments_text: str) -> str:
     body = issue.body or "(no body)"
     convo = comments_text or "(no prior comments)"
     return (
         f"You are an automated code reviewer for GitHub issue #{issue.number}: {issue.title!r}. "
         "A separate codex session has implemented this issue and committed to the current "
-        f"branch. The base branch is `origin/{config.BASE_BRANCH}`.\n\n"
+        f"branch. The base branch is `origin/{spec.base_branch}`.\n\n"
         f"Issue body:\n{body}\n\n"
         f"Conversation so far:\n{convo}\n\n"
         "Inspect the change with:\n"
-        f"  git log --oneline origin/{config.BASE_BRANCH}..HEAD\n"
-        f"  git diff origin/{config.BASE_BRANCH}...HEAD\n\n"
+        f"  git log --oneline origin/{spec.base_branch}..HEAD\n"
+        f"  git diff origin/{spec.base_branch}...HEAD\n\n"
         "Review the change against the issue requirements. Flag correctness bugs, missing "
         "tests, scope creep, obvious style issues, and anything that would block a human "
         "approver. Do NOT edit or commit anything -- you are a reviewer only.\n\n"
@@ -508,41 +509,43 @@ def _recent_comments_text(issue: Issue, max_chars: int = 4000) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
-def tick(gh: GitHubClient) -> None:
+def tick(gh: GitHubClient, spec: RepoSpec) -> None:
     for issue in gh.list_pollable_issues():
         try:
-            _process_issue(gh, issue)
+            _process_issue(gh, spec, issue)
         except Exception:
-            log.exception("issue=#%s processing failed", issue.number)
+            log.exception(
+                "repo=%s issue=#%s processing failed", spec.slug, issue.number,
+            )
 
 
-def _process_issue(gh: GitHubClient, issue: Issue) -> None:
+def _process_issue(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     label = gh.workflow_label(issue)
-    log.info("issue=#%s label=%r", issue.number, label)
+    log.info("repo=%s issue=#%s label=%r", spec.slug, issue.number, label)
     if label is None:
-        _handle_pickup(gh, issue)
+        _handle_pickup(gh, spec, issue)
     elif label == "decomposing":
-        _handle_decomposing(gh, issue)
+        _handle_decomposing(gh, spec, issue)
     elif label == "ready":
-        _handle_ready(gh, issue)
+        _handle_ready(gh, spec, issue)
     elif label == "blocked":
-        _handle_blocked(gh, issue)
+        _handle_blocked(gh, spec, issue)
     elif label == "implementing":
-        _handle_implementing(gh, issue)
+        _handle_implementing(gh, spec, issue)
     elif label == "validating":
-        _handle_validating(gh, issue)
+        _handle_validating(gh, spec, issue)
     elif label == "in_review":
-        _handle_in_review(gh, issue)
+        _handle_in_review(gh, spec, issue)
     elif label in ("done", "rejected"):
         return
     else:
         log.warning(
-            "issue=#%s label=%r not implemented yet; leaving alone",
-            issue.number, label,
+            "repo=%s issue=#%s label=%r not implemented yet; leaving alone",
+            spec.slug, issue.number, label,
         )
 
 
-def _handle_pickup(gh: GitHubClient, issue: Issue) -> None:
+def _handle_pickup(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     state = PinnedState()
     state.set("created_at", _now_iso())
     if config.DECOMPOSE:
@@ -557,7 +560,7 @@ def _handle_pickup(gh: GitHubClient, issue: Issue) -> None:
             state.set("pickup_comment_id", int(pickup_id))
         gh.set_workflow_label(issue, "decomposing")
         gh.write_pinned_state(issue, state)
-        _handle_decomposing(gh, issue)
+        _handle_decomposing(gh, spec, issue)
         return
     # Legacy path with DECOMPOSE=off: skip decomposition entirely and route
     # the unlabeled issue straight to implementing, exactly as the
@@ -579,7 +582,7 @@ def _handle_pickup(gh: GitHubClient, issue: Issue) -> None:
         state.set("pickup_comment_id", int(pickup_id))
     gh.set_workflow_label(issue, "implementing")
     gh.write_pinned_state(issue, state)
-    _handle_implementing(gh, issue)
+    _handle_implementing(gh, spec, issue)
 
 
 # Captures the JSON payload between a fenced ```orchestrator-manifest block.
@@ -778,7 +781,7 @@ def _read_decomposer_session(
 
 
 def _resume_decomposer_on_human_reply(
-    gh: GitHubClient, issue: Issue, state: PinnedState
+    gh: GitHubClient, spec: RepoSpec, issue: Issue, state: PinnedState
 ) -> Optional[AgentResult]:
     """Resume the decomposer's locked-backend session with new comments.
 
@@ -802,7 +805,7 @@ def _resume_decomposer_on_human_reply(
     )
     wt = _decompose_worktree_path(issue.number)
     if not wt.exists():
-        wt = _ensure_decompose_worktree(issue.number)
+        wt = _ensure_decompose_worktree(spec, issue.number)
     decomposer_agent, decomposer_sid = _read_decomposer_session(state)
     result = run_agent(
         decomposer_agent, followup, wt, resume_session_id=decomposer_sid
@@ -811,7 +814,7 @@ def _resume_decomposer_on_human_reply(
     return result
 
 
-def _handle_decomposing(gh: GitHubClient, issue: Issue) -> None:
+def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     state = gh.read_pinned_state(issue)
 
     # Track whether to keep the decomposer worktree past this tick. Set
@@ -943,11 +946,11 @@ def _handle_decomposing(gh: GitHubClient, issue: Issue) -> None:
                     state.set("last_action_comment_id", latest)
             gh.set_workflow_label(issue, "implementing")
             gh.write_pinned_state(issue, state)
-            _handle_implementing(gh, issue)
+            _handle_implementing(gh, spec, issue)
             return
 
         if state.get("awaiting_human"):
-            result = _resume_decomposer_on_human_reply(gh, issue, state)
+            result = _resume_decomposer_on_human_reply(gh, spec, issue, state)
             if result is None:
                 # No human reply yet. Keep the worktree intact -- if a
                 # prior tick parked on the dirty/commits reason, the
@@ -962,7 +965,7 @@ def _handle_decomposing(gh: GitHubClient, issue: Issue) -> None:
             ):
                 gh.write_pinned_state(issue, state)
                 return
-            wt = _ensure_decompose_worktree(issue.number)
+            wt = _ensure_decompose_worktree(spec, issue.number)
             decomposer_agent, _ = _read_decomposer_session(state)
             prompt = _build_decompose_prompt(issue, _recent_comments_text(issue))
             result = run_agent(decomposer_agent, prompt, wt)
@@ -987,7 +990,7 @@ def _handle_decomposing(gh: GitHubClient, issue: Issue) -> None:
         # human and KEEP the worktree past this tick so the operator can
         # inspect what the decomposer actually produced before resetting.
         wt = _decompose_worktree_path(issue.number)
-        if _has_new_commits(wt) or _worktree_dirty_files(wt):
+        if _has_new_commits(spec, wt) or _worktree_dirty_files(wt):
             keep_worktree = True
             _park_awaiting_human(
                 gh, issue, state,
@@ -1168,10 +1171,10 @@ def _handle_decomposing(gh: GitHubClient, issue: Issue) -> None:
                 )
     finally:
         if not keep_worktree:
-            _cleanup_decompose_worktree(issue.number)
+            _cleanup_decompose_worktree(spec, issue.number)
 
 
-def _handle_ready(gh: GitHubClient, issue: Issue) -> None:
+def _handle_ready(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     """`ready` is the entry point for an auto-created child or for a parent
     whose decomposer voted `single`. Both cases need the same pickup-state
     seeding the legacy `_handle_pickup` did before flipping to
@@ -1209,10 +1212,10 @@ def _handle_ready(gh: GitHubClient, issue: Issue) -> None:
             state.set("last_action_comment_id", latest)
     gh.set_workflow_label(issue, "implementing")
     gh.write_pinned_state(issue, state)
-    _handle_implementing(gh, issue)
+    _handle_implementing(gh, spec, issue)
 
 
-def _handle_blocked(gh: GitHubClient, issue: Issue) -> None:
+def _handle_blocked(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     """Poll children to decide whether the parent unblocks (or one of the
     children unblocks).
 
@@ -1420,7 +1423,11 @@ def _check_and_increment_retry_budget(
 
 
 def _resume_dev_with_text(
-    gh: GitHubClient, issue: Issue, state: PinnedState, followup_text: str
+    gh: GitHubClient,
+    spec: RepoSpec,
+    issue: Issue,
+    state: PinnedState,
+    followup_text: str,
 ) -> Tuple[Path, AgentResult]:
     """Resume the dev's locked-backend session with the given prompt text.
 
@@ -1432,7 +1439,7 @@ def _resume_dev_with_text(
     """
     wt = _worktree_path(issue.number)
     if not wt.exists():
-        wt = _ensure_worktree(issue.number)
+        wt = _ensure_worktree(spec, issue.number)
     dev_agent, dev_sid = _read_dev_session(state)
     result = run_agent(dev_agent, followup_text, wt, resume_session_id=dev_sid)
     state.set("awaiting_human", False)
@@ -1440,7 +1447,7 @@ def _resume_dev_with_text(
 
 
 def _resume_developer_on_human_reply(
-    gh: GitHubClient, issue: Issue, state: PinnedState
+    gh: GitHubClient, spec: RepoSpec, issue: Issue, state: PinnedState
 ) -> Optional[Tuple[Path, AgentResult]]:
     """Resume the developer's agent session with new issue-level comments.
 
@@ -1471,20 +1478,20 @@ def _resume_developer_on_human_reply(
         f"@{c.user.login if c.user else 'user'}: {c.body}"
         for c in new_comments if c.body
     )
-    return _resume_dev_with_text(gh, issue, state, followup)
+    return _resume_dev_with_text(gh, spec, issue, state, followup)
 
 
-def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
+def _handle_implementing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     state = gh.read_pinned_state(issue)
 
     if state.get("awaiting_human"):
-        resumed = _resume_developer_on_human_reply(gh, issue, state)
+        resumed = _resume_developer_on_human_reply(gh, spec, issue, state)
         if resumed is None:
             return
         wt, result = resumed
     else:
-        wt = _ensure_worktree(issue.number)
-        if _has_new_commits(wt):
+        wt = _ensure_worktree(spec, issue.number)
+        if _has_new_commits(spec, wt):
             # Recovered worktree: the dev agent already committed on a
             # previous tick; skip a fresh run and go straight to push.
             log.info(
@@ -1527,12 +1534,12 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
         return
 
     wt = _worktree_path(issue.number)
-    if _has_new_commits(wt):
+    if _has_new_commits(spec, wt):
         dirty = _worktree_dirty_files(wt)
         if dirty:
             _on_dirty_worktree(gh, issue, state, result, dirty)
         else:
-            _on_commits(gh, issue, state, result)
+            _on_commits(gh, spec, issue, state, result)
     else:
         _on_question(gh, issue, state, result)
 
@@ -1541,6 +1548,7 @@ def _handle_implementing(gh: GitHubClient, issue: Issue) -> None:
 
 def _handle_dev_fix_result(
     gh: GitHubClient,
+    spec: RepoSpec,
     issue: Issue,
     state: PinnedState,
     wt: Path,
@@ -1574,7 +1582,7 @@ def _handle_dev_fix_result(
         return False
 
     branch = _branch_name(issue.number)
-    if not _push_branch(wt, branch):
+    if not _push_branch(spec, wt, branch):
         _park_awaiting_human(
             gh, issue, state,
             f"{config.HITL_MENTIONS} git push failed; see orchestrator logs.",
@@ -1584,7 +1592,7 @@ def _handle_dev_fix_result(
     return True
 
 
-def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
+def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     state = gh.read_pinned_state(issue)
     pr_number = state.get("pr_number")
 
@@ -1595,14 +1603,16 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
     if state.get("awaiting_human"):
         wt = _worktree_path(issue.number)
         if not wt.exists():
-            wt = _ensure_worktree(issue.number)
+            wt = _ensure_worktree(spec, issue.number)
         before_sha = _head_sha(wt)
-        resumed = _resume_developer_on_human_reply(gh, issue, state)
+        resumed = _resume_developer_on_human_reply(gh, spec, issue, state)
         if resumed is None:
             return
         wt, result = resumed
         state.set("last_agent_action_at", _now_iso())
-        if not _handle_dev_fix_result(gh, issue, state, wt, result, before_sha):
+        if not _handle_dev_fix_result(
+            gh, spec, issue, state, wt, result, before_sha
+        ):
             gh.write_pinned_state(issue, state)
             return
         round_n = int(state.get("review_round") or 0)
@@ -1620,7 +1630,7 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
         gh.write_pinned_state(issue, state)
         return
 
-    wt = _ensure_worktree(issue.number)
+    wt = _ensure_worktree(spec, issue.number)
     # The reviewer reads the local worktree's HEAD; remember which commit
     # that is so the in_review handoff can persist the SHA the agent
     # actually inspected. Setting `agent_approved_sha = pr.head.sha`
@@ -1628,7 +1638,7 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
     # which lets AUTO_MERGE land an unreviewed commit if the branch was
     # force-pushed or otherwise updated between the review and the handoff.
     reviewed_sha = _head_sha(wt)
-    review_prompt = _build_review_prompt(issue, _recent_comments_text(issue))
+    review_prompt = _build_review_prompt(spec, issue, _recent_comments_text(issue))
     review = run_agent(
         config.REVIEW_AGENT, review_prompt, wt, timeout=config.REVIEW_TIMEOUT
     )
@@ -1776,7 +1786,9 @@ def _handle_validating(gh: GitHubClient, issue: Issue) -> None:
     )
     state.set("last_agent_action_at", _now_iso())
 
-    if not _handle_dev_fix_result(gh, issue, state, wt, dev_result, before_sha):
+    if not _handle_dev_fix_result(
+        gh, spec, issue, state, wt, dev_result, before_sha
+    ):
         gh.write_pinned_state(issue, state)
         return
 
@@ -2111,7 +2123,7 @@ def _seed_legacy_in_review_watermarks(
         gh.write_pinned_state(issue, state)
 
 
-def _handle_in_review(gh: GitHubClient, issue: Issue) -> None:
+def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     """Drive an in_review issue toward done / rejected, or back to validating
     on a new PR comment.
 
@@ -2263,12 +2275,12 @@ def _handle_in_review(gh: GitHubClient, issue: Issue) -> None:
         followup = _build_pr_comment_followup(new_comments)
         wt = _worktree_path(issue.number)
         if not wt.exists():
-            wt = _ensure_worktree(issue.number)
+            wt = _ensure_worktree(spec, issue.number)
         before_sha = _head_sha(wt)
-        wt, dev_result = _resume_dev_with_text(gh, issue, state, followup)
+        wt, dev_result = _resume_dev_with_text(gh, spec, issue, state, followup)
         state.set("last_agent_action_at", _now_iso())
         if not _handle_dev_fix_result(
-            gh, issue, state, wt, dev_result, before_sha
+            gh, spec, issue, state, wt, dev_result, before_sha
         ):
             # Park has updated last_action_comment_id; bump the in_review
             # watermarks past anything we just consumed so the next tick does
@@ -2388,11 +2400,15 @@ def _handle_in_review(gh: GitHubClient, issue: Issue) -> None:
 
 
 def _on_commits(
-    gh: GitHubClient, issue: Issue, state: PinnedState, result: AgentResult
+    gh: GitHubClient,
+    spec: RepoSpec,
+    issue: Issue,
+    state: PinnedState,
+    result: AgentResult,
 ) -> None:
     wt = _worktree_path(issue.number)
     branch = _branch_name(issue.number)
-    if not _push_branch(wt, branch):
+    if not _push_branch(spec, wt, branch):
         # Park on awaiting_human like the timeout/question paths. Otherwise the
         # worktree's commits keep _has_new_commits() true, so every poll would
         # re-enter _on_commits() and re-comment indefinitely until a human acts.
@@ -2404,7 +2420,7 @@ def _on_commits(
         return
     # Recover gracefully if a previous tick crashed between open_pr and the
     # relabel: reuse the existing open PR instead of 422-ing on duplicate.
-    pr = gh.find_open_pr(branch=branch, base=config.BASE_BRANCH)
+    pr = gh.find_open_pr(branch=branch, base=spec.base_branch)
     if pr is None:
         title = _pr_title_from_commit_or_issue(issue, _first_commit_subject(wt))
         dev_agent, dev_sid = _read_dev_session(state)
@@ -2416,7 +2432,7 @@ def _on_commits(
         if result.last_message.strip():
             body_parts += ["", "---", "_Last agent message:_", "", result.last_message[:2000]]
         pr = gh.open_pr(
-            branch=branch, base=config.BASE_BRANCH, title=title, body="\n".join(body_parts)
+            branch=branch, base=spec.base_branch, title=title, body="\n".join(body_parts)
         )
         _post_issue_comment(gh, issue, state, f":sparkles: PR opened: #{pr.number}")
     else:
