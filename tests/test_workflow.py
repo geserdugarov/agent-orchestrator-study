@@ -6616,6 +6616,37 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIsNone(data.get("park_reason"))
 
 
+class HandleResolvingConflictDispatchTest(unittest.TestCase):
+    """The `resolving_conflict` label is a placeholder slot for a follow-up
+    child to fill in. For now the dispatcher just needs to route to the
+    no-op handler instead of warning "not implemented yet"."""
+
+    def test_dispatcher_routes_resolving_conflict_to_handler(self) -> None:
+        gh = FakeGitHubClient()
+        issue = make_issue(42, label="resolving_conflict")
+        gh.add_issue(issue)
+
+        with patch.object(
+            workflow, "_handle_resolving_conflict"
+        ) as handler:
+            workflow._process_issue(gh, _TEST_SPEC, issue)
+
+        handler.assert_called_once_with(gh, _TEST_SPEC, issue)
+
+    def test_handler_is_a_quiet_noop(self) -> None:
+        gh = FakeGitHubClient()
+        issue = make_issue(43, label="resolving_conflict")
+        gh.add_issue(issue)
+
+        workflow._handle_resolving_conflict(gh, _TEST_SPEC, issue)
+
+        # No comments, no label changes, no pinned-state writes -- the
+        # placeholder must not perturb the issue at all.
+        self.assertEqual(gh.posted_comments, [])
+        self.assertEqual(gh.label_history, [])
+        self.assertEqual(gh.write_state_calls, 0)
+
+
 class CreateChildIssueAlwaysUsesParentRepoTest(unittest.TestCase):
     """`create_child_issue` is structurally bound to `self.repo` so a
     misuse cannot accidentally file a child against a different repo

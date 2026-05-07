@@ -102,7 +102,7 @@ Pinned in [`pyproject.toml`](pyproject.toml):
 
    The wrapper does `git pull --ff-only origin main` and re-launches the orchestrator after each clean exit (so a self-modifying merge picks up the new code automatically).
 
-   On first start the orchestrator creates the 8 workflow labels on the repo and begins polling open issues every 60 seconds.
+   On first start the orchestrator creates the 9 workflow labels on the repo and begins polling open issues every 60 seconds.
 
 6. **File a bootstrap test issue** to verify the path works end-to-end:
 

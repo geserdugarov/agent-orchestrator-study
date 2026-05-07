@@ -81,6 +81,7 @@ An issue must have at most 1 label. It is essentially the task status.
 * `implementing` — applied to issues being worked on by code agents
 * `validating` — applied to issues going through automated validation
 * `in_review` — applied to issues for which a PR is ready
+* `resolving_conflict` — auto-resolving merge conflicts after a sibling PR landed first
 * `done` — terminal status for completed issues whose code is merged into `main` (+ the issue must be closed)
 * `rejected` — status for issues that were declined (+ the issue must be closed)
 
