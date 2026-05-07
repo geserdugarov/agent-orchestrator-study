@@ -1548,6 +1548,14 @@ def _check_and_increment_retry_budget(
     return True
 
 
+# After this many consecutive `agent_silent` parks on the same
+# `dev_session_id`, `_resume_dev_with_text` drops the session id and starts
+# a fresh spawn. Two strikes (rather than one) tolerates a transient
+# single-call blip while still preventing the resume loop from burning every
+# fresh-spawn retry slot on a poisoned session that's not coming back.
+_SILENT_PARKS_BEFORE_FRESH_SESSION = 2
+
+
 def _resume_dev_with_text(
     gh: GitHubClient,
     spec: RepoSpec,
@@ -1562,12 +1570,39 @@ def _resume_dev_with_text(
     an inter-backend session bridge that does not exist. Clears the
     `awaiting_human` flag because the caller is reacting to a fresh human
     signal (issue or PR comment) by spawning the agent.
+
+    After `_SILENT_PARKS_BEFORE_FRESH_SESSION` consecutive `agent_silent`
+    parks on the current `dev_session_id`, the resume drops the session id
+    and starts a fresh spawn instead. Sessions killed mid-stream (e.g. by a
+    Claude rate limit) consistently return empty results on every subsequent
+    resume; without this fallback every human "retry" comment burns another
+    fresh-spawn retry slot on the same poisoned session.
     """
     wt = _worktree_path(spec, issue.number)
     if not wt.exists():
         wt = _ensure_worktree(spec, issue.number)
     dev_agent, dev_sid = _read_dev_session(state)
+    silent_count = int(state.get("silent_park_count") or 0)
+    fresh_spawn = (
+        dev_sid is not None
+        and silent_count >= _SILENT_PARKS_BEFORE_FRESH_SESSION
+    )
+    if fresh_spawn:
+        log.info(
+            "issue=#%d dropping poisoned dev session %r after %d "
+            "consecutive silent parks; starting fresh",
+            issue.number, dev_sid, silent_count,
+        )
+        dev_sid = None
+        state.set("silent_park_count", 0)
     result = run_agent(dev_agent, followup_text, wt, resume_session_id=dev_sid)
+    if fresh_spawn and result.session_id:
+        # Persist the new session id so subsequent resumes pick up the
+        # fresh session instead of re-poisoning themselves with the old
+        # one. Mirrors the persistence done in `_handle_implementing`'s
+        # fresh-spawn branch.
+        state.set("dev_agent", dev_agent)
+        state.set("dev_session_id", result.session_id)
     state.set("awaiting_human", False)
     return wt, result
 
@@ -2582,6 +2617,10 @@ def _on_commits(
     # later stage) starts with a fresh window.
     state.set("retry_count", 0)
     state.set("retry_window_start", None)
+    # The session just produced commits, so it isn't poisoned -- reset the
+    # silent-park streak so a future blip doesn't tip an otherwise-healthy
+    # session past the fresh-session threshold.
+    state.set("silent_park_count", 0)
     gh.set_workflow_label(issue, "validating")
 
 
@@ -2589,17 +2628,41 @@ def _on_question(
     gh: GitHubClient, issue: Issue, state: PinnedState, result: AgentResult
 ) -> None:
     raw = result.last_message.strip()
-    question = raw or "(agent did not produce a final message)"
-    quoted = "> " + question.replace("\n", "\n> ")
-    _post_issue_comment(
-        gh, issue, state,
-        f"{config.HITL_MENTIONS} agent needs your input to proceed:\n\n{quoted}",
-    )
-    state.set("awaiting_human", True)
-    # Question parks are not transient: they need a human reply before the
-    # auto-merge gates should run again. Clear any stale `park_reason`
-    # left behind by a prior AUTO_MERGE failed_checks/unmergeable park.
-    state.set("park_reason", None)
+    if raw:
+        quoted = "> " + raw.replace("\n", "\n> ")
+        _post_issue_comment(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} agent needs your input to proceed:\n\n{quoted}",
+        )
+        state.set("awaiting_human", True)
+        # Real question parks are not transient: they need a human reply
+        # before the auto-merge gates should run again. Clear any stale
+        # `park_reason` left behind by a prior AUTO_MERGE failed_checks /
+        # unmergeable park, and reset the silent-park streak.
+        state.set("park_reason", None)
+        state.set("silent_park_count", 0)
+    else:
+        # No commits AND no final message -- the agent produced literally
+        # nothing. Callers only invoke `_on_question` when the worktree has
+        # no new commits, so an empty `last_message` here is a silent
+        # failure, not a content question. The most common cause is a
+        # poisoned resume of a session previously killed mid-stream (e.g.
+        # by a Claude rate limit). Tag the park with a distinct reason so
+        # `_resume_dev_with_text` can drop the dev session id after enough
+        # consecutive silent parks, and surface the situation accurately
+        # to the operator instead of impersonating a real "agent has a
+        # question" park.
+        _post_issue_comment(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} agent produced no output (likely a "
+            "session-resume failure); manual intervention needed.",
+        )
+        state.set("awaiting_human", True)
+        state.set("park_reason", "agent_silent")
+        state.set(
+            "silent_park_count",
+            int(state.get("silent_park_count") or 0) + 1,
+        )
     latest = gh.latest_comment_id(issue)
     if latest is not None:
         state.set("last_action_comment_id", latest)
@@ -2638,8 +2701,10 @@ def _on_dirty_worktree(
     state.set("awaiting_human", True)
     # Mirror `_on_question`: not transient, clear any stale `park_reason`
     # so a prior AUTO_MERGE transient park does not auto-recover over the
-    # standing dirty-worktree question.
+    # standing dirty-worktree question. Clear the silent-park streak too:
+    # the agent produced output, so the session is not poisoned.
     state.set("park_reason", None)
+    state.set("silent_park_count", 0)
     latest = gh.latest_comment_id(issue)
     if latest is not None:
         state.set("last_action_comment_id", latest)
