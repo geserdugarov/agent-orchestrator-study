@@ -933,8 +933,13 @@ class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMi
             head_shas=["aaa", "aaa", "bbb"],
         )
 
-        self.assertEqual(gh.pinned_data(6).get("review_round"), 0)
-        self.assertTrue(gh.pinned_data(6).get("awaiting_human"))
+        data = gh.pinned_data(6)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertTrue(data.get("awaiting_human"))
+        # The transient `push_failed` tag is what lets the next tick's
+        # recovery branch silently retry the push without needing a human
+        # comment to unstick the issue.
+        self.assertEqual(data.get("park_reason"), "push_failed")
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("git push failed", last_comment)
 
@@ -3078,6 +3083,163 @@ class TransientParkRecoveryTest(unittest.TestCase, _PatchedWorkflowMixin):
 
         self.assertEqual(gh.merge_calls, [])
         self.assertEqual(gh.label_history, [])
+
+
+class ValidatingTransientParkRecoveryTest(
+    unittest.TestCase, _PatchedWorkflowMixin
+):
+    """A validating-side park whose underlying condition can self-resolve
+    (a non-fast-forward push that the next --force-with-lease push will
+    land) must auto-recover without needing a fresh issue-thread comment.
+    Otherwise `_resume_developer_on_human_reply` -- which only fires on a
+    new comment -- leaves the issue parked indefinitely even after the
+    transient cause is gone.
+    """
+
+    BRANCH = "orchestrator/issue-170"
+
+    def _parked_issue(self, *, park_reason: str):
+        gh = FakeGitHubClient()
+        # `last_action_comment_id` is well above any existing comment id, so
+        # `comments_after` returns []. This mirrors the post-park watermark
+        # set by `_park_awaiting_human` (it bumps to the latest comment id).
+        issue = make_issue(170, label="validating")
+        gh.add_issue(issue)
+        gh.seed_state(
+            170,
+            pr_number=99, branch=self.BRANCH,
+            dev_agent="claude", dev_session_id="dev-sess",
+            review_round=1,
+            awaiting_human=True,
+            park_reason=park_reason,
+            last_action_comment_id=10_000,
+        )
+        return gh, issue
+
+    def test_push_failed_park_recovers_when_push_succeeds(self) -> None:
+        gh, issue = self._parked_issue(park_reason="push_failed")
+
+        # Force the worktree-existence check to pass; "/tmp" always exists
+        # on Linux. The recovery only retries the push when the worktree
+        # is still on disk (otherwise the dev's local commits are gone and
+        # only a human relabel can unstick the issue).
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+
+        # Recovery must NOT spawn the agent or post any comment -- it is a
+        # silent retry.
+        mocks["run_agent"].assert_not_called()
+        self.assertEqual(gh.posted_comments, [])
+        self.assertEqual(gh.posted_pr_comments, [])
+        # Push retried and succeeded: park flags cleared, review_round
+        # incremented so the next tick runs the reviewer fresh.
+        mocks["_push_branch"].assert_called_once()
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+        self.assertEqual(data.get("review_round"), 2)
+        # Stays in `validating` (no relabel); the next tick's reviewer will
+        # decide whether to hand off.
+        self.assertEqual(gh.label_history, [])
+
+    def test_push_failed_park_stays_parked_when_push_still_fails(self) -> None:
+        # Recovery must not re-post the park message when the push still
+        # fails -- otherwise every poll would spam the issue.
+        gh, issue = self._parked_issue(park_reason="push_failed")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=False,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_called_once()
+        # No new park comment posted on this tick.
+        self.assertEqual(gh.posted_comments, [])
+        # Park flags preserved for the next recovery attempt.
+        data = gh.pinned_data(170)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "push_failed")
+        # review_round NOT bumped while still stuck.
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_push_failed_park_stays_parked_when_worktree_is_gone(self) -> None:
+        # If the worktree was reaped between the original park and the
+        # recovery tick, the dev's local commits are gone and there is
+        # nothing to push. Stay parked so a human can intervene.
+        gh, issue = self._parked_issue(park_reason="push_failed")
+
+        # Path that will not exist on the test host.
+        gone = Path("/tmp/orchestrator-test-recovery-no-such-worktree-xyz")
+        with patch.object(workflow, "_worktree_path", return_value=gone):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(170)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "push_failed")
+
+    def test_non_transient_park_stays_parked_with_no_new_comments(self) -> None:
+        # A park whose reason is not in the validating transient set (e.g.
+        # a question or dirty-tree park) must NOT auto-recover. The
+        # _resume_developer_on_human_reply path (no new comments) returns
+        # without doing anything; recovery is the only other path and it
+        # bails on park_reason.
+        gh, issue = self._parked_issue(park_reason=None)
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(170)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_transient_park_with_new_comment_takes_resume_path(self) -> None:
+        # A transient park is preempted by a fresh human comment: the
+        # comment-driven resume path wins, the dev is spawned with the
+        # human's feedback, and the recovery branch does not silently
+        # retry the push. This ensures the human's reply is not dropped.
+        gh, issue = self._parked_issue(park_reason="push_failed")
+        issue.comments.append(
+            FakeComment(
+                id=10_500, body="please rebase first",
+                user=FakeUser("alice"),
+            )
+        )
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="rebased",
+                ),
+                push_branch=True,
+                head_shas=["aaa", "bbb"],
+            )
+
+        # Dev was resumed with the human's feedback (recovery did NOT run).
+        mocks["run_agent"].assert_called_once()
+        followup = mocks["run_agent"].call_args.args[1]
+        self.assertIn("please rebase first", followup)
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
 
 
 class ValidatingHandoffSeedsAllWatermarksTest(
