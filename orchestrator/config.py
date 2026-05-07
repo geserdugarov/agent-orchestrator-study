@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -165,6 +166,34 @@ WORKTREES_DIR: Path = Path(
 # Base branch in the *target* repo: where worktrees branch from and where PRs
 # are opened against.
 BASE_BRANCH: str = os.environ.get("BASE_BRANCH", "main")
+
+
+@dataclass(frozen=True)
+class RepoSpec:
+    """Per-repo identity threaded through the workflow.
+
+    Replaces the global `REPO` / `TARGET_REPO_ROOT` / `BASE_BRANCH` reads
+    inside workflow.py so a future multi-repo loop can drive several repos
+    from one orchestrator process without touching module-level state.
+    """
+
+    slug: str
+    target_root: Path
+    base_branch: str
+
+
+def default_repo_specs() -> list[RepoSpec]:
+    """Single-element list built from the legacy `REPO` / `TARGET_REPO_ROOT` /
+    `BASE_BRANCH` env vars, so existing single-repo deployments keep working
+    unchanged. Multi-repo env parsing arrives in a follow-up child.
+    """
+    return [
+        RepoSpec(
+            slug=REPO,
+            target_root=TARGET_REPO_ROOT,
+            base_branch=BASE_BRANCH,
+        )
+    ]
 
 # Base branch of the orchestrator's *own* repo (REPO_ROOT). Used only by the
 # self-update path: `_self_modifying_merge_happened` watches `origin/<this>`

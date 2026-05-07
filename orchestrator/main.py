@@ -99,12 +99,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    gh = GitHubClient()
-    log.info("connected: repo=%s", config.REPO)
-    gh.ensure_workflow_labels()
+    # Single-repo today; the helper returns a one-element list so the next
+    # multi-repo child can extend `default_repo_specs()` without touching
+    # main.py's loop shape.
+    specs = config.default_repo_specs()
+    clients: list[tuple[config.RepoSpec, GitHubClient]] = []
+    for spec in specs:
+        gh = GitHubClient(repo_spec=spec)
+        log.info("connected: repo=%s", spec.slug)
+        gh.ensure_workflow_labels()
+        clients.append((spec, gh))
 
     if args.once:
-        workflow.tick(gh)
+        for spec, gh in clients:
+            workflow.tick(gh, spec)
         return 0
 
     own_sha = _own_head_sha()
@@ -114,10 +122,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if own_sha and _self_modifying_merge_happened(own_sha):
             log.info("self-modifying merge detected; exiting for restart")
             return 0
-        try:
-            workflow.tick(gh)
-        except Exception:
-            log.exception("tick failed; continuing")
+        for spec, gh in clients:
+            log.info("tick: repo=%s", spec.slug)
+            try:
+                workflow.tick(gh, spec)
+            except Exception:
+                log.exception("tick failed for repo=%s; continuing", spec.slug)
         for _ in range(config.POLL_INTERVAL):
             if not _running:
                 break

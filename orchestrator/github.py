@@ -54,19 +54,31 @@ class PinnedState:
 
 
 class GitHubClient:
-    def __init__(self, token: Optional[str] = None, repo_slug: Optional[str] = None):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        repo_slug: Optional[str] = None,
+        repo_spec: Optional["config.RepoSpec"] = None,
+    ):
+        # `repo_spec` wins when both are passed -- the multi-repo caller in
+        # main.py threads a spec; legacy callers (and tests) still use the
+        # `repo_slug` shortcut against the single-repo default.
+        if repo_spec is not None:
+            slug = repo_spec.slug
+        else:
+            slug = repo_slug or config.REPO
         token = token or config.GITHUB_TOKEN
         if not token:
             raise RuntimeError(
                 "GITHUB_TOKEN is empty. Export it in the orchestrator's "
                 "environment or write it to "
-                f"~/.config/{config.REPO}/token "
+                f"~/.config/{slug}/token "
                 "(override path with ORCHESTRATOR_TOKEN_FILE). "
                 "Do NOT put it in REPO_ROOT/.env -- the implementer agent "
                 "can read that file."
             )
         self._gh = Github(auth=Auth.Token(token))
-        self.repo: Repository = self._gh.get_repo(repo_slug or config.REPO)
+        self.repo: Repository = self._gh.get_repo(slug)
 
     def list_pollable_issues(self, since: Optional[datetime] = None) -> Iterable[Issue]:
         """Open issues plus closed issues still labeled `in_review`.
