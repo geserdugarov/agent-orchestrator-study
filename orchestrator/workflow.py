@@ -662,6 +662,8 @@ def _process_issue(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         _handle_validating(gh, spec, issue)
     elif label == "in_review":
         _handle_in_review(gh, spec, issue)
+    elif label == "resolving_conflict":
+        _handle_resolving_conflict(gh, spec, issue)
     elif label in ("done", "rejected"):
         return
     else:
@@ -2588,6 +2590,19 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             "issue=#%s could not close after auto-merge", issue.number,
         )
     _cleanup_merged_branch(gh, spec, issue.number)
+
+
+def _handle_resolving_conflict(
+    gh: GitHubClient, spec: RepoSpec, issue: Issue
+) -> None:
+    """Placeholder for the conflict-resolution stage. No behavior yet -- the
+    label and dispatcher branch exist so a follow-up child can wire in the
+    actual rebase/retry logic without another label-rollout step.
+    """
+    log.info(
+        "repo=%s issue=#%s resolving_conflict (no-op placeholder)",
+        spec.slug, issue.number,
+    )
 
 
 def _on_commits(
