@@ -1713,6 +1713,10 @@ def _handle_dev_fix_result(
             gh, issue, state,
             f"{config.HITL_MENTIONS} git push failed; see orchestrator logs.",
         )
+        # Tag as transient so a self-resolving condition (the next push
+        # succeeds under --force-with-lease once the remote settles) can
+        # silently recover the issue without needing a human comment.
+        state.set("park_reason", "push_failed")
         return False
 
     return True
@@ -1727,6 +1731,36 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # but on success we stay in validating and bump the round so the reviewer
     # runs again on the next tick.
     if state.get("awaiting_human"):
+        # Transient-park recovery: when the original park reason is something
+        # that can resolve without a human comment (a push race that the
+        # next --force-with-lease push will land), re-attempt silently. This
+        # mirrors the in_review recovery branch -- without it, a tick that
+        # parked on `push_failed` would sit forever even though the next push
+        # would succeed, because `_resume_developer_on_human_reply` only
+        # fires on new issue-thread comments.
+        last_action_id = state.get("last_action_comment_id")
+        new_comments = gh.comments_after(issue, last_action_id)
+        if (
+            not new_comments
+            and state.get("park_reason")
+            in _VALIDATING_TRANSIENT_PARK_REASONS
+        ):
+            if not _try_recover_validating_transient_park(
+                spec, issue, state
+            ):
+                return  # still stuck, do not re-post the park comment
+            # Conditions resolved: clear the park flags and treat this tick
+            # as the successful tail of the dev-fix loop, bumping the review
+            # round so the next tick runs the reviewer. The handoff
+            # watermark `last_action_comment_id` was already advanced by the
+            # original `_park_awaiting_human` call, so the in_review handler
+            # will not re-feed any already-consumed comments.
+            state.set("awaiting_human", False)
+            state.set("park_reason", None)
+            round_n = int(state.get("review_round") or 0)
+            state.set("review_round", round_n + 1)
+            gh.write_pinned_state(issue, state)
+            return
         wt = _worktree_path(spec, issue.number)
         if not wt.exists():
             wt = _ensure_worktree(spec, issue.number)
@@ -2165,6 +2199,38 @@ def _comment_created_at(comment) -> Optional[datetime]:
 # a stale required review). Other parks (`missing_pr_number`, dev-fix
 # failures) need explicit human action to unstick.
 _TRANSIENT_PARK_REASONS = frozenset({"failed_checks", "unmergeable"})
+
+# Validating-side counterpart: park reasons whose underlying condition can
+# resolve without any human comment (a non-fast-forward push retried under
+# --force-with-lease once the remote settles is the canonical case). Without
+# this, a transient push failure during a dev-fix would leave the issue
+# parked forever -- `_resume_developer_on_human_reply` only fires on a new
+# issue-thread comment, but the human action that unstuck the underlying
+# condition (CI, rebase, branch update) typically does not include one.
+_VALIDATING_TRANSIENT_PARK_REASONS = frozenset({"push_failed"})
+
+
+def _try_recover_validating_transient_park(
+    spec: RepoSpec, issue: Issue, state: PinnedState
+) -> bool:
+    """Quietly attempt to clear a transient validating park.
+
+    Returns True if the underlying condition has resolved (caller should
+    clear the park flags and progress); False to stay parked. Must not
+    spawn the agent, post issue/PR comments, or write pinned state -- the
+    caller owns that side of the recovery so a still-stuck tick produces
+    no visible churn.
+    """
+    park_reason = state.get("park_reason")
+    if park_reason == "push_failed":
+        wt = _worktree_path(spec, issue.number)
+        if not wt.exists():
+            # Worktree was reaped; the dev's local commits are gone, so
+            # there is nothing to push. A human has to intervene (relabel
+            # back to implementing) -- that's the unblocking signal.
+            return False
+        return _push_branch(spec, wt, _branch_name(issue.number))
+    return False
 
 
 def _auto_merge_gates_pass(
