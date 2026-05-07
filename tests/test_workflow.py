@@ -394,10 +394,39 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
 
         self.assertEqual(gh.opened_prs, [])
-        self.assertTrue(gh.pinned_data(1).get("awaiting_human"))
+        data = gh.pinned_data(1)
+        self.assertTrue(data.get("awaiting_human"))
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("> What database should I use?", last_comment)
         self.assertIn("agent needs your input", last_comment)
+        # A real question with content is not a silent failure.
+        self.assertIsNone(data.get("park_reason"))
+        self.assertEqual(data.get("silent_park_count", 0), 0)
+
+    def test_no_commits_no_message_parks_as_silent_failure(self) -> None:
+        # Empty `last_message` AND no commits is the poisoned-resume shape
+        # documented in #24: a session killed mid-stream (e.g. by a Claude
+        # rate limit) consistently returns empty results on every resume.
+        # The park must surface as a silent failure (distinct
+        # `park_reason`, distinct HITL message) instead of impersonating a
+        # real "agent has a content question" park.
+        gh, issue = self._seeded()
+        self._run(
+            lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
+            run_agent=_agent(last_message=""),
+            has_new_commits=False,
+        )
+
+        data = gh.pinned_data(1)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "agent_silent")
+        self.assertEqual(data.get("silent_park_count"), 1)
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("agent produced no output", last_comment)
+        self.assertIn("session-resume failure", last_comment)
+        self.assertNotIn("agent needs your input", last_comment)
+        # No quoted empty-message body either.
+        self.assertNotIn("> (agent did not produce a final message)", last_comment)
 
     def test_codex_timeout_parks_with_timeout_message(self) -> None:
         gh, issue = self._seeded()
@@ -4065,6 +4094,85 @@ class HandoffSkipsConsumedRepliesTest(unittest.TestCase, _PatchedWorkflowMixin):
             state.get("last_action_comment_id"), 921,
             "resume must bump last_action_comment_id to max(consumed)",
         )
+
+
+class SilentSessionResumeFallbackTest(unittest.TestCase, _PatchedWorkflowMixin):
+    """`_resume_dev_with_text` drops a poisoned `dev_session_id` after
+    `_SILENT_PARKS_BEFORE_FRESH_SESSION` consecutive `agent_silent` parks
+    and starts a fresh spawn instead. Without this fallback every human
+    "retry" comment burns another fresh-spawn retry slot on the same dead
+    session (the Claude rate-limit kill shape documented in #24).
+    """
+
+    def _seeded_issue(self, *, silent_park_count: int):
+        gh = FakeGitHubClient()
+        issue = make_issue(950, label="implementing")
+        gh.add_issue(issue)
+        gh.seed_state(
+            950,
+            dev_agent="claude",
+            dev_session_id="poisoned-sess",
+            silent_park_count=silent_park_count,
+        )
+        return gh, issue
+
+    def test_below_threshold_keeps_existing_session_id(self) -> None:
+        # One prior silent park is treated as a transient blip, not a
+        # poisoned session: the resume still passes the original session
+        # id and the streak counter stays put for the next park to bump.
+        gh, issue = self._seeded_issue(silent_park_count=1)
+        state = gh.read_pinned_state(issue)
+
+        captured: dict = {}
+
+        def fake_run(agent, prompt, wt, *, resume_session_id=None):
+            captured["resume_session_id"] = resume_session_id
+            return _agent(session_id="ignored", last_message="ok")
+
+        with patch.object(workflow, "_ensure_worktree", lambda spec, n: _FAKE_WT), \
+             patch.object(workflow, "run_agent", fake_run):
+            workflow._resume_dev_with_text(gh, _TEST_SPEC, issue, state, "go")
+
+        self.assertEqual(
+            captured["resume_session_id"], "poisoned-sess",
+            "below threshold the original session id must still be resumed",
+        )
+        # Session id and streak are not touched on the below-threshold path.
+        self.assertEqual(state.get("dev_session_id"), "poisoned-sess")
+        self.assertEqual(state.get("silent_park_count"), 1)
+
+    def test_at_threshold_drops_session_and_persists_fresh_one(self) -> None:
+        # `_SILENT_PARKS_BEFORE_FRESH_SESSION` consecutive silent parks ==
+        # session is poisoned. The resume must call `run_agent` with
+        # `resume_session_id=None`, persist the new session id from the
+        # result, and reset the silent-park streak so the new session
+        # starts with a clean budget.
+        threshold = workflow._SILENT_PARKS_BEFORE_FRESH_SESSION
+        gh, issue = self._seeded_issue(silent_park_count=threshold)
+        state = gh.read_pinned_state(issue)
+
+        captured: dict = {}
+
+        def fake_run(agent, prompt, wt, *, resume_session_id=None):
+            captured["agent"] = agent
+            captured["resume_session_id"] = resume_session_id
+            return _agent(session_id="fresh-sess", last_message="ok")
+
+        with patch.object(workflow, "_ensure_worktree", lambda spec, n: _FAKE_WT), \
+             patch.object(workflow, "run_agent", fake_run):
+            workflow._resume_dev_with_text(gh, _TEST_SPEC, issue, state, "go")
+
+        self.assertIsNone(
+            captured["resume_session_id"],
+            "fresh spawn must drop the poisoned dev_session_id",
+        )
+        self.assertEqual(captured["agent"], "claude")
+        # New session id must be persisted so the next resume picks it up
+        # instead of looking up an empty `dev_session_id` and re-spawning.
+        self.assertEqual(state.get("dev_session_id"), "fresh-sess")
+        # Streak resets so a future blip doesn't drop the new session
+        # immediately.
+        self.assertEqual(state.get("silent_park_count"), 0)
 
 
 class HandoffConsumedThroughIssueThreadOnlyTest(
