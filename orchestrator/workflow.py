@@ -1745,6 +1745,13 @@ def _handle_dev_fix_result(
         # leaves it tagged but stays parked because in_review's transient set
         # does not include this reason.
         state.set("park_reason", "agent_timeout")
+        # Persist the pre-agent SHA so the recovery branch can tell whether
+        # the timeout actually produced a new commit. `_has_new_commits()`
+        # would say yes for any normal PR worktree (the dev's earlier fixes
+        # are ahead of `origin/<base>` even when this run did nothing), so
+        # without this watermark the recovery would force-push a stale
+        # local HEAD and bump the round on every tick.
+        state.set("pre_dev_fix_sha", before_sha or "")
         return False
 
     after_sha = _head_sha(wt)
@@ -2336,23 +2343,36 @@ def _try_recover_validating_transient_park(
             # The dev left edits that were never committed. We cannot
             # safely push, review, or auto-merge in this state; stay
             # parked until a human or a fresh comment-driven resume
-            # sorts it out. Worse than the silent path: a reviewer that
-            # ignores the dirty index would still vote on the committed
-            # head while the leftover edits are silently dropped on the
-            # next push.
+            # sorts it out. A reviewer that ignored the dirty index
+            # would vote on the committed head while the leftover edits
+            # are silently dropped on the next push.
             return False
-        if _has_new_commits(spec, wt):
-            # The dev committed before timing out. Finish what it
-            # started by pushing; on success the fix is now landed and
-            # we bump the round just like the push_failed branch.
-            if not _push_branch(spec, wt, _branch_name(issue.number)):
-                return False
-            round_n = int(state.get("review_round") or 0)
-            state.set("review_round", round_n + 1)
+        # The pre-agent SHA was persisted when the timeout park ran.
+        # Compare against the current worktree HEAD instead of
+        # `_has_new_commits()`, which only checks against
+        # `origin/<base>` and would always say "yes" for a PR worktree
+        # whose earlier fixes already shipped.
+        pre_sha = state.get("pre_dev_fix_sha")
+        if not isinstance(pre_sha, str):
+            # Defensive: the timeout-tagging path always persists this,
+            # so a missing watermark means foreign state we cannot
+            # reason about. Stay parked rather than risk force-pushing
+            # an out-of-date HEAD over the remote.
+            return False
+        now_sha = _head_sha(wt)
+        if not now_sha or now_sha == pre_sha:
+            # The timeout produced no new commit. Clear flags but do
+            # not bump the round or push -- nothing landed.
+            state.set("pre_dev_fix_sha", None)
             return True
-        # Clean tree, no unpushed commits: nothing the reviewer would
-        # see has changed. Clear flags so the next tick re-runs the
-        # reviewer on the same code with a fresh budget.
+        # The dev committed before timing out. Finish what it started
+        # by pushing the new SHA; on success the fix is now landed and
+        # we bump the round just like the push_failed branch.
+        if not _push_branch(spec, wt, _branch_name(issue.number)):
+            return False
+        state.set("pre_dev_fix_sha", None)
+        round_n = int(state.get("review_round") or 0)
+        state.set("review_round", round_n + 1)
         return True
     return False
 
