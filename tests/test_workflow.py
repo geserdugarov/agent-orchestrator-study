@@ -566,6 +566,18 @@ class ConventionalCommitPromptTest(unittest.TestCase):
         self.assertIn("subject line only", prompt)
         self.assertIn("Co-Authored-By", prompt)
 
+    def test_pr_comment_followup_mentions_conventional_commits(self) -> None:
+        comments = [FakeComment(id=42, body="please rename foo to bar",
+                                user=FakeUser("alice"))]
+        prompt = workflow._build_pr_comment_followup(comments)
+
+        self.assertIn("git log", prompt)
+        self.assertIn("Conventional Commits", prompt)
+        for prefix in ("feat:", "fix:", "chore:", "docs:", "refactor:", "test:"):
+            self.assertIn(prefix, prompt)
+        self.assertIn("subject line only", prompt)
+        self.assertIn("Co-Authored-By", prompt)
+
 
 class ConventionalPrTitleTest(unittest.TestCase, _PatchedWorkflowMixin):
     """`_on_commits` derives the PR title from the agent's first commit
