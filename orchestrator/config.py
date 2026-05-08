@@ -117,6 +117,16 @@ HITL_HANDLES: tuple[str, ...] = (
 )
 HITL_HANDLE: str = ",".join(HITL_HANDLES)
 HITL_MENTIONS: str = " ".join(f"@{handle}" for handle in HITL_HANDLES)
+# Comma-separated GitHub logins whose unlabeled issues the orchestrator is
+# willing to auto-pick-up. Empty (the default) disables the allowlist and
+# preserves the legacy "anyone can trigger" behavior. Set this on a public
+# repo to keep random users from spending the orchestrator's compute budget
+# on useless tasks. The guard only fires at pickup; if a maintainer manually
+# labels an outsider's issue (e.g. `implementing`) the workflow still drives
+# it to completion, so this is purely a triage filter.
+ALLOWED_ISSUE_AUTHORS: tuple[str, ...] = _parse_hitl_handles(
+    os.environ.get("ALLOWED_ISSUE_AUTHORS", "")
+)
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 CLAUDE_BIN: str = os.environ.get("CLAUDE_BIN", "claude")
 

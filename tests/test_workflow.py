@@ -327,6 +327,63 @@ class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
         # _handle_implementing was actually entered (codex spawned).
         mocks["run_agent"].assert_called_once()
 
+    def test_pickup_skips_issue_from_non_allowed_author(self) -> None:
+        # A populated ALLOWED_ISSUE_AUTHORS allowlist must drop unlabeled
+        # issues from outside that list silently -- no comment, no label,
+        # no pinned state. This is the abuse guard: a stranger filing
+        # issues on a public repo cannot make the orchestrator spawn agents.
+        gh = FakeGitHubClient()
+        issue = make_issue(1, author="stranger")
+        gh.add_issue(issue)
+
+        with patch.object(config, "ALLOWED_ISSUE_AUTHORS", ("geserdugarov",)):
+            mocks = self._run(
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="should not run"),
+                has_new_commits=False,
+            )
+
+        self.assertEqual(gh.posted_comments, [])
+        self.assertEqual(gh.label_history, [])
+        self.assertEqual(gh.pinned_data(1), {})
+        mocks["run_agent"].assert_not_called()
+
+    def test_pickup_proceeds_for_allowed_author(self) -> None:
+        # Sanity: when the author IS in the list, pickup behaves exactly
+        # like the unguarded path -- this guard is purely a triage filter.
+        gh = FakeGitHubClient()
+        issue = make_issue(1, author="alice")
+        gh.add_issue(issue)
+
+        with patch.object(config, "ALLOWED_ISSUE_AUTHORS", ("alice", "bob")), \
+             patch.object(config, "DECOMPOSE", False):
+            self._run(
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="need clarification"),
+                has_new_commits=False,
+            )
+
+        self.assertIn((1, "implementing"), gh.label_history)
+        self.assertIn("created_at", gh.pinned_data(1))
+
+    def test_empty_allowlist_lets_anyone_through(self) -> None:
+        # Default config: empty tuple disables the filter so existing
+        # single-user setups (and any deployment that hasn't opted in)
+        # keep their current "anyone can trigger" behavior.
+        gh = FakeGitHubClient()
+        issue = make_issue(1, author="random-user")
+        gh.add_issue(issue)
+
+        with patch.object(config, "ALLOWED_ISSUE_AUTHORS", ()), \
+             patch.object(config, "DECOMPOSE", False):
+            self._run(
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="need clarification"),
+                has_new_commits=False,
+            )
+
+        self.assertIn((1, "implementing"), gh.label_history)
+
 
 class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
     def _seeded(self, label="implementing"):
