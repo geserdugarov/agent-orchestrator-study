@@ -185,6 +185,85 @@ class ParseReviewVerdictTest(unittest.TestCase):
         self.assertEqual(_parse_review_verdict(""), ("unknown", ""))
 
 
+class RedactSecretsTest(unittest.TestCase):
+    """The agent retains its provider auth (ANTHROPIC_API_KEY etc.) so that
+    its CLI can talk to the model. Anything we surface from its stderr to
+    GitHub must scrub those values first; otherwise a prompt-injected agent
+    that echoed its key onto stderr would leak it into a public issue.
+    """
+
+    def _patched_env(self, **values: str):
+        return patch.dict(os.environ, values, clear=False)
+
+    def test_redacts_provider_api_key(self) -> None:
+        with self._patched_env(ANTHROPIC_API_KEY="sk-ant-supersecretvalue123"):
+            out = workflow._redact_secrets(
+                "Traceback ...\n  401 sk-ant-supersecretvalue123 invalid"
+            )
+        self.assertNotIn("sk-ant-supersecretvalue123", out)
+        self.assertIn("***", out)
+
+    def test_redacts_github_token_by_exact_name(self) -> None:
+        # GITHUB_TOKEN itself doesn't end in any of the suffixes we strip,
+        # but it's the orchestrator's own creds for git/gh subprocesses --
+        # cover it explicitly via _SECRET_KEY_NAMES.
+        with self._patched_env(GITHUB_TOKEN="ghp_thisisthetokenvalue"):
+            out = workflow._redact_secrets("remote: bad credential ghp_thisisthetokenvalue")
+        self.assertNotIn("ghp_thisisthetokenvalue", out)
+
+    def test_redacts_arbitrary_provider_via_suffix(self) -> None:
+        # The suffix list is what catches the long tail (HF_TOKEN,
+        # GEMINI_API_KEY, ...) without us enumerating every provider.
+        with self._patched_env(GEMINI_API_KEY="ya29.deadbeefdeadbeef"):
+            out = workflow._redact_secrets("got ya29.deadbeefdeadbeef back")
+        self.assertNotIn("ya29.deadbeefdeadbeef", out)
+
+    def test_leaves_short_values_alone(self) -> None:
+        # A 4-char throwaway value would mask incidental substrings. The
+        # min-length floor protects regular english text in stderr.
+        with self._patched_env(DEV_KEY="true"):
+            out = workflow._redact_secrets("status was true and the build ran")
+        self.assertEqual(out, "status was true and the build ran")
+
+    def test_leaves_non_secret_keys_alone(self) -> None:
+        with self._patched_env(BUILD_NUMBER="this-string-is-long-enough"):
+            out = workflow._redact_secrets("BUILD this-string-is-long-enough done")
+        self.assertIn("this-string-is-long-enough", out)
+
+    def test_empty_input_passthrough(self) -> None:
+        self.assertEqual(workflow._redact_secrets(""), "")
+
+    def test_diagnostics_block_redacts_before_truncation(self) -> None:
+        # Park comments cap the surfaced tail at 1KB. If we redacted after
+        # slicing, a key that spans the cut would survive in the visible
+        # tail. Pad noise so the secret would otherwise straddle the cap.
+        secret = "sk-ant-spanningthecutboundary123"
+        with self._patched_env(ANTHROPIC_API_KEY=secret):
+            stderr = ("X" * (workflow._STDERR_TAIL_BUDGET - 8)) + secret + " trailing"
+            block = workflow._format_stderr_diagnostics(
+                AgentResult(
+                    session_id="s", last_message="", exit_code=1,
+                    timed_out=False, stdout="", stderr=stderr,
+                ),
+                "Agent",
+            )
+        self.assertNotIn(secret, block)
+        self.assertIn("***", block)
+        # The tail budget is still honored on the *redacted* string.
+        self.assertIn("trailing", block)
+
+    def test_log_tail_redacts(self) -> None:
+        with self._patched_env(OPENAI_API_KEY="sk-proj-loglinevaluexyz"):
+            tail = workflow._stderr_log_tail(
+                AgentResult(
+                    session_id="s", last_message="", exit_code=1,
+                    timed_out=False, stdout="",
+                    stderr="auth failed for sk-proj-loglinevaluexyz",
+                ),
+            )
+        self.assertNotIn("sk-proj-loglinevaluexyz", tail)
+
+
 class PushBranchTest(unittest.TestCase):
     """`_push_branch` handles the divergence cases that bit issue-5.
 

@@ -102,6 +102,47 @@ def _post_issue_comment(
 # all -- see #36) would otherwise bloat the issue body past GitHub's limit.
 _STDERR_TAIL_BUDGET = 1024
 
+# Provider auth (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is intentionally
+# left in the agent's environment by agents._agent_env -- the agent CLI
+# needs it to talk to its own model. A noisy backend, a buggy test, or a
+# prompt-injected command that echoed one of those values to stderr would
+# otherwise be republished verbatim in the park comment we post to the
+# issue. Match by suffix to cover the long tail of provider names
+# (HF_TOKEN, GEMINI_API_KEY, ...) without an explicit enumeration; the
+# orchestrator's own GITHUB_TOKEN is stripped from the agent env upstream
+# but still lives in this process, so the same scrub also covers stderr
+# captured from orchestrator-spawned git/gh subprocesses.
+_SECRET_KEY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PAT", "_CREDENTIAL")
+_SECRET_KEY_NAMES = frozenset({"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"})
+# Short values produce too many false-positive replacements (a 4-char dev
+# key masks incidental substrings like "true"/"main") for too little
+# protection. Real provider keys are well above this floor.
+_REDACT_MIN_VALUE_LEN = 8
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace values of secret-shaped env vars in `text` with `***`.
+
+    Called before any stderr is surfaced to GitHub or the log so a
+    prompt-injected agent that echoes its own provider key cannot exfiltrate
+    it via a park comment. Snapshot of os.environ at call time, so a key
+    that was unset between subprocess spawn and the post is no longer
+    redacted -- acceptable since it also no longer leaks anything reachable
+    from the agent.
+    """
+    if not text:
+        return text
+    redacted = text
+    for key, value in os.environ.items():
+        if not value or len(value) < _REDACT_MIN_VALUE_LEN:
+            continue
+        upper = key.upper()
+        if upper in _SECRET_KEY_NAMES or any(
+            upper.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES
+        ):
+            redacted = redacted.replace(value, "***")
+    return redacted
+
 
 def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str:
     """Render a stderr/exit-code diagnostic block to append to a park comment.
@@ -111,7 +152,7 @@ def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str
     block beginning with two newlines so it slots cleanly after an existing
     `_Last … message:_` body.
     """
-    tail = (result.stderr or "").rstrip()
+    tail = _redact_secrets((result.stderr or "").rstrip())
     if not tail:
         return ""
     if len(tail) > _STDERR_TAIL_BUDGET:
@@ -126,7 +167,7 @@ def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str
 def _stderr_log_tail(result: AgentResult, max_chars: int = 400) -> str:
     """Short stderr tail for log lines -- tighter than the park-comment cap
     so a single WARNING fits on one screen."""
-    tail = (result.stderr or "").rstrip()
+    tail = _redact_secrets((result.stderr or "").rstrip())
     if len(tail) > max_chars:
         tail = tail[-max_chars:]
     return tail
