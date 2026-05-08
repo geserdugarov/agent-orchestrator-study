@@ -46,6 +46,7 @@ class FakeIssue:
     labels: list[FakeLabel] = field(default_factory=list)
     comments: list[FakeComment] = field(default_factory=list)
     closed: bool = False
+    user: FakeUser = field(default_factory=lambda: FakeUser("geserdugarov"))
 
     @property
     def state(self) -> str:
@@ -125,6 +126,7 @@ def make_issue(
     comments: Iterable[FakeComment] = (),
     title: str = "test issue",
     body: str = "test body",
+    author: str = "geserdugarov",
 ) -> FakeIssue:
     labels = [FakeLabel(label)] if label else []
     return FakeIssue(
@@ -133,6 +135,7 @@ def make_issue(
         body=body,
         labels=labels,
         comments=list(comments),
+        user=FakeUser(author),
     )
 
 

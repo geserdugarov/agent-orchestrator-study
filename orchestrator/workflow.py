@@ -849,6 +849,18 @@ def _process_issue(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
 
 
 def _handle_pickup(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
+    # Author allowlist: when configured, silently skip unlabeled issues from
+    # anyone outside the list so random users can't burn agent budget on a
+    # public repo. Maintainers can still drive an outsider's issue manually
+    # by adding a workflow label themselves -- the guard only fires here.
+    if config.ALLOWED_ISSUE_AUTHORS:
+        author = getattr(getattr(issue, "user", None), "login", None) or ""
+        if author not in config.ALLOWED_ISSUE_AUTHORS:
+            log.info(
+                "repo=%s issue=#%s author=%r not in ALLOWED_ISSUE_AUTHORS; skipping pickup",
+                spec.slug, issue.number, author,
+            )
+            return
     state = PinnedState()
     state.set("created_at", _now_iso())
     if config.DECOMPOSE:

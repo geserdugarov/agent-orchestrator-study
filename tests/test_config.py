@@ -291,5 +291,40 @@ class MaxRetriesPerDayConfigTest(unittest.TestCase):
         self.assertEqual(config.MAX_RETRIES_PER_DAY, 0)
 
 
+class AllowedIssueAuthorsConfigTest(unittest.TestCase):
+    """Author-allowlist for unlabeled-issue pickup. Empty (default) disables
+    the filter so existing single-user setups keep working; a populated list
+    guards against random users on public repos triggering agent runs."""
+
+    def _load_config(self, env: dict[str, str] | None = None):
+        full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
+        }
+        if env:
+            full_env.update(env)
+        with patch.dict(os.environ, full_env, clear=True):
+            sys.modules.pop("orchestrator.config", None)
+            import orchestrator.config as config
+
+            return config
+
+    def test_default_is_empty_tuple(self) -> None:
+        config = self._load_config()
+        self.assertEqual(config.ALLOWED_ISSUE_AUTHORS, ())
+
+    def test_parses_comma_separated(self) -> None:
+        config = self._load_config({"ALLOWED_ISSUE_AUTHORS": "alice,bob"})
+        self.assertEqual(config.ALLOWED_ISSUE_AUTHORS, ("alice", "bob"))
+
+    def test_strips_whitespace_at_signs_and_duplicates(self) -> None:
+        config = self._load_config(
+            {"ALLOWED_ISSUE_AUTHORS": " @alice, bob, ,alice,@carol "}
+        )
+        self.assertEqual(
+            config.ALLOWED_ISSUE_AUTHORS, ("alice", "bob", "carol")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
