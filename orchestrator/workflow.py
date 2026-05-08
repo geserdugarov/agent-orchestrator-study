@@ -937,6 +937,8 @@ def _process_issue(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         _handle_ready(gh, spec, issue)
     elif label == "blocked":
         _handle_blocked(gh, spec, issue)
+    elif label == "umbrella":
+        _handle_umbrella(gh, spec, issue)
     elif label == "implementing":
         _handle_implementing(gh, spec, issue)
     elif label == "validating":
@@ -1081,6 +1083,15 @@ def _parse_manifest(
         return None, (
             f"too many children ({len(children)} > {_MAX_CHILDREN})"
         )
+    # Optional umbrella flag: when true, the parent issue itself has no
+    # implementation work -- it's a tracking issue whose only purpose is
+    # to aggregate children. Reject non-bool values rather than coercing
+    # so a typo like `"umbrella": "yes"` surfaces via the standard
+    # invalid-manifest HITL loop instead of silently being treated as
+    # truthy.
+    umbrella = data.get("umbrella")
+    if umbrella is not None and not isinstance(umbrella, bool):
+        return None, "umbrella must be a boolean"
     for idx, child in enumerate(children):
         if not isinstance(child, dict):
             return None, f"child {idx} is not an object"
@@ -1167,6 +1178,7 @@ def _build_decompose_prompt(issue: Issue, comments_text: str) -> str:
         "{\n"
         "  \"decision\": \"split\",\n"
         "  \"rationale\": \"<<= 2 sentences why>\",\n"
+        "  \"umbrella\": false,\n"
         "  \"children\": [\n"
         "    {\"title\": \"...\", \"body\": \"...\", \"depends_on\": []}\n"
         "  ]\n"
@@ -1182,7 +1194,14 @@ def _build_decompose_prompt(issue: Issue, comments_text: str) -> str:
         "array (not GitHub issue numbers; the orchestrator allocates those).\n"
         "- Self-dependencies and cycles are rejected.\n"
         "- Each child must be small enough to implement in one context "
-        "(do not propose a child that itself needs decomposition)."
+        "(do not propose a child that itself needs decomposition).\n\n"
+        "The optional `umbrella` boolean (default false) signals that the "
+        "parent issue itself has NO implementation work of its own and exists "
+        "only to aggregate the children. Set it to true when every line of "
+        "the parent's intent is covered by the children you are creating; "
+        "leave it false when the parent still needs its own coding pass after "
+        "the children land. An umbrella parent auto-resolves to `done` once "
+        "every child resolves; a non-umbrella parent re-enters implementation."
     )
 
 
@@ -1322,7 +1341,17 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                     )
                     gh.write_pinned_state(issue, state)
                     return
-            gh.set_workflow_label(issue, "blocked")
+            # `umbrella=True` is persisted alongside `expected_children_count`
+            # before any child is created, so the recovery path here picks
+            # it up and finalizes to `umbrella` instead of `blocked`. Without
+            # this branch, a SIGKILL between the umbrella manifest's child
+            # creation loop and the final label flip would resume as a
+            # plain blocked parent and re-enter implementation after all
+            # children resolved -- the opposite of what the manifest asked.
+            finalize_label = (
+                "umbrella" if state.get("umbrella") else "blocked"
+            )
+            gh.set_workflow_label(issue, finalize_label)
             gh.write_pinned_state(issue, state)
             return
 
@@ -1503,9 +1532,16 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         #      leave a runnable orphan child against a
         #      `decomposing`-labeled parent.
         children_manifest = parsed["children"]
+        is_umbrella = bool(parsed.get("umbrella"))
         created: list[Tuple[int, dict]] = []
         dep_graph: dict[str, list[int]] = {}
         state.set("expected_children_count", len(children_manifest))
+        # Persist the umbrella flag alongside the count so the half-finished
+        # recovery path above can finalize to the right label after a
+        # mid-loop SIGKILL. Always write it (including when False) so a
+        # buggy state migration that left a stale True from a prior aborted
+        # decomposition cannot survive into the recovery branch.
+        state.set("umbrella", is_umbrella)
         gh.write_pinned_state(issue, state)
         for idx, child in enumerate(children_manifest):
             depends_on = list(child.get("depends_on") or [])
@@ -1577,19 +1613,30 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
 
         # children/dep_graph/decomposed_at are already durable from the
         # incremental writes in the loop above. Post the summary, flip
-        # the parent label to `blocked`, and persist the new
+        # the parent label to `blocked` (or `umbrella` when the parent
+        # has no implementation work of its own), and persist the new
         # orchestrator_comment_id. Activation (children blocked -> ready)
         # only runs AFTER this final write, so a crash here cannot leave
         # a runnable orphan child against a `decomposing`-labeled parent.
         summary = "\n".join(
             f"- #{n}: {child['title']}" for n, child in created
         )
-        _post_issue_comment(
-            gh, issue, state,
-            f":bookmark_tabs: decomposer split this into {len(created)} "
-            f"child issue(s):\n\n{summary}",
-        )
-        gh.set_workflow_label(issue, "blocked")
+        if is_umbrella:
+            summary_intro = (
+                f":bookmark_tabs: decomposer split this into {len(created)} "
+                f"child issue(s); marking parent as `umbrella` (no "
+                f"implementation of its own; will auto-resolve once every "
+                f"child resolves):\n\n{summary}"
+            )
+            final_label = "umbrella"
+        else:
+            summary_intro = (
+                f":bookmark_tabs: decomposer split this into {len(created)} "
+                f"child issue(s):\n\n{summary}"
+            )
+            final_label = "blocked"
+        _post_issue_comment(gh, issue, state, summary_intro)
+        gh.set_workflow_label(issue, final_label)
         gh.write_pinned_state(issue, state)
 
         # Activation: flip no-dep children from `blocked` to `ready`.
@@ -1766,6 +1813,117 @@ def _handle_blocked(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # also flips (vacuous all-done over an empty list) -- this recovers
     # any no-dep child that the decomposer's same-tick activation step
     # left as `blocked` (network blip, label-flip failure, etc.).
+    dep_graph = state.get("dep_graph") or {}
+    relabeled = False
+    for idx, child_number in enumerate(children):
+        cn = int(child_number)
+        if child_labels.get(cn) != "blocked":
+            continue
+        deps = dep_graph.get(str(idx), [])
+        dep_numbers = [
+            int(children[int(d)]) for d in deps if int(d) < len(children)
+        ]
+        if all(child_labels.get(dn) == "done" for dn in dep_numbers):
+            gh.set_workflow_label(child_issues[cn], "ready")
+            relabeled = True
+    if relabeled:
+        gh.write_pinned_state(issue, state)
+
+
+def _handle_umbrella(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
+    """Poll children on an umbrella parent that has no implementation of
+    its own.
+
+    Mirrors `_handle_blocked` for the rejected/manually-closed checks and
+    the dep-graph activation walk, but the all-done branch resolves the
+    umbrella to `done` and closes the issue instead of flipping it to
+    `ready` -- there is no implementation pass for an umbrella, so the
+    only terminal path is "every child resolved -> close".
+    """
+    state = gh.read_pinned_state(issue)
+    children = state.get("children") or []
+    if not children:
+        # An umbrella with no recorded children is corrupt state (the
+        # decomposer only applies the umbrella label after creating
+        # children), but still surface to a human rather than silently
+        # closing an issue with no aggregated work.
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} `umbrella` without recorded children; "
+            "manual relabel suspected.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    child_labels: dict[int, Optional[str]] = {}
+    child_issues: dict[int, Issue] = {}
+    for child_number in children:
+        try:
+            child_issue = gh.get_issue(int(child_number))
+        except Exception:
+            log.exception(
+                "issue=#%s could not read child #%d", issue.number, child_number,
+            )
+            return
+        child_issues[int(child_number)] = child_issue
+        child_labels[int(child_number)] = gh.workflow_label(child_issue)
+
+    rejected = [n for n, lbl in child_labels.items() if lbl == "rejected"]
+    if rejected:
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} child issue(s) rejected: "
+            f"{', '.join(f'#{n}' for n in rejected)}; "
+            "decide whether to re-decompose or close.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    manually_closed = [
+        n for n, ci in child_issues.items()
+        if getattr(ci, "state", "open") == "closed"
+        and child_labels.get(n) not in ("done", "rejected", "in_review")
+    ]
+    if manually_closed:
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} child issue(s) closed without reaching "
+            f"`done` or `rejected`: "
+            f"{', '.join(f'#{n}' for n in manually_closed)}; "
+            "decide whether to re-decompose or close.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    if all(lbl == "done" for lbl in child_labels.values()):
+        _post_issue_comment(
+            gh, issue, state,
+            ":white_check_mark: all children resolved; closing umbrella issue.",
+        )
+        state.set("awaiting_human", False)
+        state.set("park_reason", None)
+        state.set("umbrella_resolved_at", _now_iso())
+        gh.set_workflow_label(issue, "done")
+        gh.write_pinned_state(issue, state)
+        try:
+            issue.edit(state="closed")
+        except Exception:
+            log.exception(
+                "issue=#%s could not close umbrella after children done",
+                issue.number,
+            )
+        return
+
+    # Same dep-graph activation walk as `_handle_blocked`: an umbrella's
+    # children can still depend on each other, and a no-dep child stuck
+    # at `blocked` after a same-tick activation hiccup needs to be
+    # rescued here.
     dep_graph = state.get("dep_graph") or {}
     relabeled = False
     for idx, child_number in enumerate(children):

@@ -78,6 +78,7 @@ An issue must have at most 1 label. It is essentially the task status.
 * `decomposing` — applied to issues currently being decomposed
 * `ready` — applied to decomposed issues ready for development
 * `blocked` — applied to decomposed issues that are blocked by other tasks
+* `umbrella` — applied to a decomposed parent that has no implementation of its own; auto-closes to `done` once every child resolves
 * `implementing` — applied to issues being worked on by code agents
 * `validating` — applied to issues going through automated validation
 * `in_review` — applied to issues for which a PR is ready
@@ -96,7 +97,9 @@ Once enough information has been collected, the bot can create nested issues to 
 
 If a task can be implemented within a single agent context, then no subtasks need to be created. The current criterion the orchestrator passes to the decomposer in the prompt is: if the change touches more than ~5 files or requires more than one logical commit — propose splitting; otherwise leave it as is. The criterion is imperfect but explicit, and easy to tune later.
 
-The decomposer returns a structured response — a single fenced JSON block `orchestrator-manifest` with schema `decision: "single" | "split"`, an optional `children` list, and an optional `depends_on` (an array of 0-indexed references between children, with no cycles or self-dependencies, no more than 10 children). The `_parse_manifest` parser rejects malformed manifests and moves the issue into `awaiting_human` for triage.
+The decomposer returns a structured response — a single fenced JSON block `orchestrator-manifest` with schema `decision: "single" | "split"`, an optional `children` list, an optional `depends_on` (an array of 0-indexed references between children, with no cycles or self-dependencies, no more than 10 children), and an optional `umbrella` boolean (default false). The `_parse_manifest` parser rejects malformed manifests and moves the issue into `awaiting_human` for triage.
+
+When `umbrella` is true on a `split` decision, the parent has no implementation work of its own — its only purpose is to aggregate the children. The orchestrator labels it `umbrella` instead of `blocked`, and `_handle_umbrella` auto-resolves it to `done` (closing the issue) once every child reaches `done`. A non-umbrella decomposed parent goes through `blocked` and re-enters implementation once its children resolve.
 
 **TODO:** refine the criteria (file threshold, layer-based splitting) as we accumulate experience.
 

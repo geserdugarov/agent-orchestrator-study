@@ -32,6 +32,7 @@ WORKFLOW_LABEL_SPECS: tuple[tuple[str, str, str], ...] = (
     ("decomposing", "fbca04", "Orchestrator is breaking this issue into sub-issues"),
     ("ready", "0e8a16", "Decomposed and ready for implementation"),
     ("blocked", "b60205", "Blocked on another issue"),
+    ("umbrella", "ededed", "Parent of child issues with no implementation of its own"),
     ("implementing", "1d76db", "A coding agent is working on this"),
     ("validating", "8a2be2", "Automated review/tests are running"),
     ("in_review", "d93f0b", "PR is open, awaiting human review"),
