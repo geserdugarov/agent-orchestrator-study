@@ -695,8 +695,15 @@ def _push_branch(
         insteadOf/pushInsteadOf rewrite, since those rewrite our auth URL
         and would deliver the token to whatever host the agent picked.
     """
-    if not config.GITHUB_TOKEN:
-        log.error("GITHUB_TOKEN missing; cannot push")
+    # Resolve the token from `spec.slug` rather than the cached
+    # `config.GITHUB_TOKEN` (which was looked up once for `config.REPO`),
+    # so a multi-repo deployment with one token file per slug under
+    # `~/.config/<owner>/<repo>/token` pushes with the right repo's token.
+    # Single-repo deployments see identical behavior because
+    # `_resolve_github_token(REPO)` returns the same value.
+    token = config._resolve_github_token(spec.slug)
+    if not token:
+        log.error("GITHUB_TOKEN missing for %s; cannot push", spec.slug)
         return False
     rewrite = subprocess.run(
         ["git", "config", "--local", "--get-regexp",
@@ -718,7 +725,7 @@ def _push_branch(
             **os.environ,
             **_GIT_NO_PROMPT_ENV,
             "GIT_ASKPASS": str(askpass),
-            "GIT_TOKEN": config.GITHUB_TOKEN,
+            "GIT_TOKEN": token,
             # Detach from any agent-writable global/system git config; the
             # only config that applies is the local worktree config (already
             # checked above) plus our explicit -c overrides below.
@@ -744,7 +751,7 @@ def _push_branch(
                 env=env,
             )
             if ls.returncode != 0:
-                scrubbed = (ls.stderr or "").replace(config.GITHUB_TOKEN, "***")
+                scrubbed = (ls.stderr or "").replace(token, "***")
                 log.error("git ls-remote failed for %s: %s", branch, scrubbed)
                 return False
             remote_sha = ""
@@ -769,7 +776,7 @@ def _push_branch(
         )
     if r.returncode != 0:
         # Scrub the token out of any error output before logging.
-        scrubbed = (r.stderr or "").replace(config.GITHUB_TOKEN, "***")
+        scrubbed = (r.stderr or "").replace(token, "***")
         log.error("git push failed for %s: %s", branch, scrubbed)
         return False
     return True

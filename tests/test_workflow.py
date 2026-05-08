@@ -383,8 +383,12 @@ class PushBranchTest(unittest.TestCase):
         from unittest.mock import MagicMock
 
         run_mock = MagicMock(side_effect=run_results)
+        # `_push_branch` resolves the token per-spec via
+        # `config._resolve_github_token(spec.slug)`; patch the function so
+        # tests don't depend on a real token file existing on disk.
         token_patch = patch.object(
-            workflow.config, "GITHUB_TOKEN", "ghp-test-secret"
+            workflow.config, "_resolve_github_token",
+            return_value="ghp-test-secret",
         )
         run_patch = patch.object(workflow.subprocess, "run", run_mock)
         return run_mock, token_patch, run_patch
@@ -472,6 +476,73 @@ class PushBranchTest(unittest.TestCase):
             )
         self.assertFalse(ok)
         self.assertEqual(run_mock.call_count, 1)
+
+    def test_uses_per_spec_token_for_git_push(self) -> None:
+        # Multi-repo regression guard: `_push_branch` must resolve the token
+        # from `spec.slug` (so a per-repo `~/.config/<owner>/<repo>/token`
+        # file is honored), not from the cached single-repo
+        # `config.GITHUB_TOKEN` that was looked up once for `config.REPO`.
+        from unittest.mock import MagicMock
+
+        sha = "deadbeefcafef00ddeadbeefcafef00ddeadbeef"
+        ls_stdout = f"{sha}\trefs/heads/orchestrator/issue-5\n"
+        run_mock = MagicMock(side_effect=[
+            self._ok(),                # rewrite check (clean)
+            self._ok(stdout=ls_stdout),  # ls-remote
+            self._ok(),                # push
+        ])
+        resolved: list[str] = []
+
+        def fake_resolve(slug: str) -> str:
+            resolved.append(slug)
+            # Return distinct tokens so a regression that fell back to the
+            # cached `config.GITHUB_TOKEN` would surface in GIT_TOKEN below.
+            return f"ghp-token-for-{slug.replace('/', '-')}"
+
+        other_spec = config.RepoSpec(
+            slug="acme/widgets",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="main",
+        )
+        with patch.object(workflow.config, "_resolve_github_token", fake_resolve), \
+             patch.object(workflow.subprocess, "run", run_mock):
+            ok = workflow._push_branch(
+                other_spec, _FAKE_WT, "orchestrator/issue-5"
+            )
+        self.assertTrue(ok)
+        # Token was resolved exactly once, for the spec's slug.
+        self.assertEqual(resolved, ["acme/widgets"])
+        ls_call = run_mock.call_args_list[1]
+        push_call = run_mock.call_args_list[2]
+        # ls-remote and push both run with the per-spec token in GIT_TOKEN.
+        self.assertEqual(
+            ls_call.kwargs["env"]["GIT_TOKEN"], "ghp-token-for-acme-widgets"
+        )
+        self.assertEqual(
+            push_call.kwargs["env"]["GIT_TOKEN"], "ghp-token-for-acme-widgets"
+        )
+        # Auth URL targets the spec's slug, not the cached config.REPO.
+        self.assertIn(
+            "https://x-access-token@github.com/acme/widgets.git",
+            ls_call.args[0],
+        )
+
+    def test_missing_per_spec_token_aborts_with_slug_in_log(self) -> None:
+        # A multi-repo deployment that forgot to populate the per-slug
+        # token file should refuse to push and log which repo is misconfigured
+        # rather than the generic "GITHUB_TOKEN missing" the legacy code emitted.
+        from unittest.mock import MagicMock
+
+        run_mock = MagicMock()
+        with patch.object(
+            workflow.config, "_resolve_github_token", return_value=""
+        ), patch.object(workflow.subprocess, "run", run_mock):
+            ok = workflow._push_branch(
+                _TEST_SPEC, _FAKE_WT, "orchestrator/issue-5"
+            )
+        self.assertFalse(ok)
+        # Push aborted before any subprocess ran.
+        run_mock.assert_not_called()
 
 
 class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
