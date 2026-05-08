@@ -113,7 +113,15 @@ _STDERR_TAIL_BUDGET = 1024
 # but still lives in this process, so the same scrub also covers stderr
 # captured from orchestrator-spawned git/gh subprocesses.
 _SECRET_KEY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PAT", "_CREDENTIAL")
-_SECRET_KEY_NAMES = frozenset({"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"})
+# Exact names cover two cases the suffix predicate misses: GitHub-token
+# aliases that don't end in any suffix above, and bare-named secrets
+# (`TOKEN`, `PASSWORD`, ...) some build systems still set unprefixed --
+# those would otherwise pass through _agent_env and leak unredacted if a
+# prompt-injected stderr echoed `$TOKEN`.
+_SECRET_KEY_NAMES = frozenset({
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT",
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "CREDENTIAL",
+})
 # Short values produce too many false-positive replacements (a 4-char dev
 # key masks incidental substrings like "true"/"main") for too little
 # protection. Real provider keys are well above this floor.

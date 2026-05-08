@@ -218,6 +218,18 @@ class RedactSecretsTest(unittest.TestCase):
             out = workflow._redact_secrets("got ya29.deadbeefdeadbeef back")
         self.assertNotIn("ya29.deadbeefdeadbeef", out)
 
+    def test_redacts_bare_name_secret(self) -> None:
+        # Bare names like `TOKEN` or `PASSWORD` don't end in `_TOKEN` etc.,
+        # so the suffix predicate misses them. _agent_env only strips
+        # GitHub-aliased tokens, so a bare $TOKEN passes through to the
+        # agent and would leak unredacted if echoed to stderr.
+        with self._patched_env(TOKEN="ghp_barenametokenvalue123"):
+            out = workflow._redact_secrets("auth failed for ghp_barenametokenvalue123")
+        self.assertNotIn("ghp_barenametokenvalue123", out)
+        with self._patched_env(PASSWORD="hunter2isthepasswordvalue"):
+            out = workflow._redact_secrets("login: hunter2isthepasswordvalue rejected")
+        self.assertNotIn("hunter2isthepasswordvalue", out)
+
     def test_leaves_short_values_alone(self) -> None:
         # A 4-char throwaway value would mask incidental substrings. The
         # min-length floor protects regular english text in stderr.
