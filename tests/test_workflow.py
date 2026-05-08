@@ -5811,6 +5811,36 @@ class ParseManifestTest(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNotNone(data)
 
+    def test_umbrella_flag_accepted(self) -> None:
+        data, error = workflow._parse_manifest(_manifest(
+            '{"decision": "split", "umbrella": true, "children": ['
+            '{"title": "A", "body": "a"}'
+            ']}'
+        ))
+        self.assertIsNone(error)
+        self.assertTrue(data.get("umbrella"))
+
+    def test_umbrella_default_missing(self) -> None:
+        data, error = workflow._parse_manifest(_manifest(
+            '{"decision": "split", "children": ['
+            '{"title": "A", "body": "a"}'
+            ']}'
+        ))
+        self.assertIsNone(error)
+        self.assertIsNone(data.get("umbrella"))
+
+    def test_umbrella_non_bool_rejected(self) -> None:
+        # A typo like `"umbrella": "yes"` would be silently treated as
+        # truthy if we coerced; reject so the standard invalid-manifest
+        # HITL/resume loop catches it instead of mislabeling the parent.
+        data, error = workflow._parse_manifest(_manifest(
+            '{"decision": "split", "umbrella": "yes", "children": ['
+            '{"title": "A", "body": "a"}'
+            ']}'
+        ))
+        self.assertIsNone(data)
+        self.assertIn("umbrella", error)
+
     def test_displayed_schema_example_is_valid_manifest(self) -> None:
         # A literal-minded decomposer that copies the schema verbatim
         # must produce a manifest that survives _parse_manifest. If the
@@ -5933,6 +5963,79 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         )
         for child in gh.created_child_issues:
             self.assertIn(f"#{child.number}", last_comment)
+
+    def test_decompose_split_umbrella_marks_parent_umbrella(self) -> None:
+        # `umbrella: true` on a split decision means the parent has no
+        # implementation work of its own; instead of `blocked` (which
+        # would re-enter implementation after children resolve), it gets
+        # the `umbrella` label and `_handle_umbrella` will close it once
+        # every child reaches `done`.
+        gh = FakeGitHubClient()
+        issue = make_issue(50, label="decomposing")
+        gh.add_issue(issue)
+        manifest = _manifest(
+            '{"decision": "split", "umbrella": true, '
+            '"rationale": "parent is just a tracker", "children": ['
+            '{"title": "A", "body": "a"},'
+            '{"title": "B", "body": "b"}'
+            ']}'
+        )
+
+        self._run(
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
+            run_agent=_agent(
+                session_id="dec-sess", last_message=manifest
+            ),
+        )
+
+        # Parent reached `umbrella`, NOT `blocked`.
+        labels = [lbl for n, lbl in gh.label_history if n == 50]
+        self.assertIn("umbrella", labels)
+        self.assertNotIn("blocked", labels)
+        # Children created normally, with no-dep activation -> `ready`.
+        self.assertEqual(len(gh.created_child_issues), 2)
+        for child in gh.created_child_issues:
+            self.assertEqual([l.name for l in child.labels], ["ready"])
+        # `umbrella` flag persisted on parent state so the
+        # half-finished recovery path can read it back after a SIGKILL.
+        self.assertTrue(gh.pinned_data(50).get("umbrella"))
+        # Summary comment mentions umbrella so a human glancing at the
+        # thread sees what label the parent landed on.
+        last_comment = next(
+            body for n, body in gh.posted_comments if n == 50
+            and ":bookmark_tabs:" in body
+        )
+        self.assertIn("umbrella", last_comment)
+
+    def test_decompose_split_non_umbrella_default_marks_blocked(
+        self,
+    ) -> None:
+        # Default for the umbrella flag is False -- a split manifest
+        # without `umbrella` must still go through `blocked` so the
+        # parent re-enters implementation after children resolve, the
+        # legacy behavior.
+        gh = FakeGitHubClient()
+        issue = make_issue(51, label="decomposing")
+        gh.add_issue(issue)
+        manifest = _manifest(
+            '{"decision": "split", "children": ['
+            '{"title": "A", "body": "a"}'
+            ']}'
+        )
+
+        self._run(
+            lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
+            run_agent=_agent(
+                session_id="dec-sess", last_message=manifest
+            ),
+        )
+
+        labels = [lbl for n, lbl in gh.label_history if n == 51]
+        self.assertIn("blocked", labels)
+        self.assertNotIn("umbrella", labels)
+        # State records umbrella=False explicitly so a stale True from a
+        # prior aborted decomposition cannot survive into recovery.
+        self.assertEqual(gh.pinned_data(51).get("umbrella"), False)
 
     def test_decompose_split_with_deps_persists_dep_graph(self) -> None:
         gh = FakeGitHubClient()
@@ -7197,6 +7300,167 @@ class HandleBlockedTest(unittest.TestCase, _PatchedWorkflowMixin):
         data = gh.pinned_data(38)
         self.assertFalse(data.get("awaiting_human"))
         self.assertIsNone(data.get("park_reason"))
+
+
+class HandleUmbrellaTest(unittest.TestCase, _PatchedWorkflowMixin):
+    """Umbrella parents have no implementation of their own; the only
+    terminal path is "every child resolved -> close the umbrella as
+    `done`". The rejected/manually-closed/dep-graph-walk branches mirror
+    `_handle_blocked`."""
+
+    def _seed_umbrella_with_children(
+        self,
+        *,
+        parent_number: int,
+        child_labels: list[Optional[str]],
+        dep_graph: Optional[dict] = None,
+    ) -> tuple[FakeGitHubClient, FakeIssue, list[FakeIssue]]:
+        gh = FakeGitHubClient()
+        parent = make_issue(parent_number, label="umbrella")
+        gh.add_issue(parent)
+        children: list[FakeIssue] = []
+        for i, lbl in enumerate(child_labels):
+            child = make_issue(parent_number * 10 + i + 1, label=lbl)
+            gh.add_issue(child)
+            children.append(child)
+        seed = {
+            "children": [c.number for c in children],
+            "umbrella": True,
+        }
+        if dep_graph is not None:
+            seed["dep_graph"] = dep_graph
+        gh.seed_state(parent_number, **seed)
+        return gh, parent, children
+
+    def test_dispatcher_routes_umbrella_to_handler(self) -> None:
+        gh = FakeGitHubClient()
+        issue = make_issue(60, label="umbrella")
+        gh.add_issue(issue)
+
+        with patch.object(workflow, "_handle_umbrella") as handler:
+            workflow._process_issue(gh, _TEST_SPEC, issue)
+
+        handler.assert_called_once_with(gh, _TEST_SPEC, issue)
+
+    def test_all_children_done_closes_umbrella_as_done(self) -> None:
+        gh, parent, children = self._seed_umbrella_with_children(
+            parent_number=61, child_labels=["done", "done"],
+        )
+
+        self._run(
+            lambda: workflow._handle_umbrella(gh, _TEST_SPEC, parent),
+            run_agent=_agent(),
+        )
+
+        # Terminal `done` label and the issue is closed -- mirrors how
+        # the merged path finalizes a regular issue.
+        self.assertIn((61, "done"), gh.label_history)
+        self.assertTrue(parent.closed)
+        # `umbrella_resolved_at` stamp recorded so a future audit can
+        # tell automatic-resolution apart from a manual close.
+        self.assertIn("umbrella_resolved_at", gh.pinned_data(61))
+        self.assertTrue(any(
+            "all children resolved" in body and "closing umbrella" in body
+            for n, body in gh.posted_comments if n == 61
+        ))
+
+    def test_some_children_in_progress_no_op(self) -> None:
+        gh, parent, children = self._seed_umbrella_with_children(
+            parent_number=62, child_labels=["done", "implementing"],
+        )
+
+        self._run(
+            lambda: workflow._handle_umbrella(gh, _TEST_SPEC, parent),
+            run_agent=_agent(),
+        )
+
+        self.assertNotIn((62, "done"), gh.label_history)
+        self.assertFalse(parent.closed)
+        self.assertEqual(
+            [b for n, b in gh.posted_comments if n == 62], [],
+        )
+
+    def test_rejected_child_parks_umbrella(self) -> None:
+        gh, parent, children = self._seed_umbrella_with_children(
+            parent_number=63, child_labels=["done", "rejected"],
+        )
+
+        self._run(
+            lambda: workflow._handle_umbrella(gh, _TEST_SPEC, parent),
+            run_agent=_agent(),
+        )
+
+        data = gh.pinned_data(63)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((63, "done"), gh.label_history)
+        self.assertFalse(parent.closed)
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("rejected", last_comment)
+        self.assertIn(f"#{children[1].number}", last_comment)
+
+    def test_manually_closed_child_parks_umbrella(self) -> None:
+        gh = FakeGitHubClient()
+        parent = make_issue(64, label="umbrella")
+        gh.add_issue(parent)
+        done_child = make_issue(641, label="done")
+        done_child.closed = True
+        gh.add_issue(done_child)
+        closed_child = make_issue(642, label="implementing")
+        closed_child.closed = True
+        gh.add_issue(closed_child)
+        gh.seed_state(64, children=[641, 642], umbrella=True)
+
+        self._run(
+            lambda: workflow._handle_umbrella(gh, _TEST_SPEC, parent),
+            run_agent=_agent(),
+        )
+
+        data = gh.pinned_data(64)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((64, "done"), gh.label_history)
+        self.assertFalse(parent.closed)
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("closed without reaching", last_comment)
+        self.assertIn("#642", last_comment)
+
+    def test_unblocks_middle_child_when_dep_done(self) -> None:
+        # A child stuck `blocked` on a dep that's now `done` should be
+        # flipped to `ready` exactly as `_handle_blocked` does -- an
+        # umbrella's children can still depend on each other.
+        gh, parent, children = self._seed_umbrella_with_children(
+            parent_number=65,
+            child_labels=["done", "blocked"],
+            dep_graph={"1": [0]},
+        )
+
+        self._run(
+            lambda: workflow._handle_umbrella(gh, _TEST_SPEC, parent),
+            run_agent=_agent(),
+        )
+
+        flipped = [
+            new for issue_n, new in gh.label_history
+            if issue_n == children[1].number
+        ]
+        self.assertEqual(flipped, ["ready"])
+        self.assertNotIn((65, "done"), gh.label_history)
+        self.assertFalse(parent.closed)
+
+    def test_umbrella_with_no_recorded_children_parks(self) -> None:
+        gh = FakeGitHubClient()
+        parent = make_issue(66, label="umbrella")
+        gh.add_issue(parent)
+        gh.seed_state(66, umbrella=True)
+
+        self._run(
+            lambda: workflow._handle_umbrella(gh, _TEST_SPEC, parent),
+            run_agent=_agent(),
+        )
+
+        data = gh.pinned_data(66)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((66, "done"), gh.label_history)
+        self.assertFalse(parent.closed)
 
 
 class HandleResolvingConflictDispatchTest(unittest.TestCase):
