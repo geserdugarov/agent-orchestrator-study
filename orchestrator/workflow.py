@@ -448,16 +448,18 @@ def _branch_ahead_behind(
     return (ahead, behind)
 
 
-def _first_commit_subject(worktree: Path) -> str:
+def _first_commit_subject(spec: RepoSpec, worktree: Path) -> str:
     """Subject line of the oldest commit in `origin/<base>..HEAD`, or ''.
 
     Used by `_on_commits` to derive a Conventional-Commits PR title from what
     the agent actually wrote, so the PR title matches the commit history
-    when the agent followed the convention.
+    when the agent followed the convention. Reads the base branch from the
+    spec so a multi-repo deployment with mixed default branches (e.g. one
+    repo on `main`, another on `master`) compares against the right remote.
     """
     r = _git(
         "log", "--reverse", "--format=%s",
-        f"origin/{config.BASE_BRANCH}..HEAD",
+        f"origin/{spec.base_branch}..HEAD",
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -4084,7 +4086,7 @@ def _on_commits(
     # relabel: reuse the existing open PR instead of 422-ing on duplicate.
     pr = gh.find_open_pr(branch=branch, base=spec.base_branch)
     if pr is None:
-        title = _pr_title_from_commit_or_issue(issue, _first_commit_subject(wt))
+        title = _pr_title_from_commit_or_issue(issue, _first_commit_subject(spec, wt))
         dev_agent, dev_sid = _read_dev_session(state)
         body_parts = [
             f"Resolves #{issue.number}",

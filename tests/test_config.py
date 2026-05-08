@@ -452,6 +452,23 @@ class MultiRepoConfigTest(unittest.TestCase):
             self._load_config({"REPOS": "no-slash|/tmp|main"})
         self.assertIn("owner/name", str(cm.exception))
 
+    def test_slug_with_empty_component_aborts_at_import(self) -> None:
+        # `owner//repo` and `/repo` and `owner/` are all malformed even
+        # though they contain `/`; require exactly two non-empty components.
+        for bad in ("owner//repo", "/repo", "owner/", "//"):
+            with self.subTest(slug=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    self._load_config({"REPOS": f"{bad}|/tmp|main"})
+                self.assertIn("owner/name", str(cm.exception))
+
+    def test_slug_with_extra_path_segment_aborts_at_import(self) -> None:
+        # `owner/repo/extra` looks plausible but PyGithub treats the slug
+        # as the full repo identifier, so any extra `/` would resolve to
+        # a wrong (or nonexistent) repo at runtime. Reject at import.
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REPOS": "owner/repo/extra|/tmp|main"})
+        self.assertIn("owner/name", str(cm.exception))
+
     def test_empty_base_branch_aborts_at_import(self) -> None:
         with self.assertRaises(SystemExit) as cm:
             self._load_config({"REPOS": "owner/repo|/tmp|"})

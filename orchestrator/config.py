@@ -231,15 +231,15 @@ def _parse_repos_env(raw: str) -> list[RepoSpec]:
                 f"(expected 'owner/name|target_root|base_branch'): {line!r}"
             )
         slug, target_root, base_branch = (p.strip() for p in parts)
-        if (
-            not slug
-            or "/" not in slug
-            or slug.startswith("/")
-            or slug.endswith("/")
-        ):
+        # Require exactly two non-empty components separated by a single
+        # '/'. A bare substring check would accept 'owner//repo' (empty
+        # owner or repo) and 'owner/repo/extra' (extra path segment).
+        slug_components = slug.split("/")
+        if len(slug_components) != 2 or not all(slug_components):
             raise SystemExit(
                 f"orchestrator: REPOS entry #{entry_no} has invalid "
-                f"owner/name {slug!r}; expected 'owner/name'"
+                f"owner/name {slug!r}; expected exactly 'owner/name' "
+                "with non-empty owner and name"
             )
         if not target_root:
             raise SystemExit(

@@ -1123,6 +1123,56 @@ class ConventionalSubjectHelperTest(unittest.TestCase):
             )
 
 
+class FirstCommitSubjectBaseBranchTest(unittest.TestCase):
+    """`_first_commit_subject` must compare against `spec.base_branch`, not
+    the global `config.BASE_BRANCH`. With `REPOS=...|...|master` and the
+    legacy `BASE_BRANCH=main`, the global default would point at the wrong
+    remote and either fail or include unrelated commits."""
+
+    def _capture_git(self, stdout: str = "feat: x\n"):
+        from unittest.mock import MagicMock
+
+        captured: list[tuple] = []
+
+        def fake_git(*args, cwd):
+            captured.append((args, cwd))
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = stdout
+            r.stderr = ""
+            return r
+
+        return fake_git, captured
+
+    def test_uses_per_spec_base_branch(self) -> None:
+        master_spec = config.RepoSpec(
+            slug="acme/legacy",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="master",
+        )
+        fake_git, captured = self._capture_git("feat: hello\n")
+        with patch.object(workflow, "_git", fake_git):
+            subj = workflow._first_commit_subject(
+                master_spec, Path("/tmp/wt-not-real")
+            )
+        self.assertEqual(subj, "feat: hello")
+        self.assertEqual(len(captured), 1)
+        args, _cwd = captured[0]
+        # The third positional arg to _git is the rev range; it must
+        # reference master (the spec's base_branch), not the cached `main`.
+        self.assertIn("origin/master..HEAD", args)
+        self.assertNotIn("origin/main..HEAD", args)
+
+    def test_default_spec_still_uses_main(self) -> None:
+        # Sanity check: legacy single-repo deployments keep using `main`
+        # because `_TEST_SPEC.base_branch` is `main`.
+        fake_git, captured = self._capture_git("")
+        with patch.object(workflow, "_git", fake_git):
+            workflow._first_commit_subject(_TEST_SPEC, Path("/tmp/wt-not-real"))
+        args, _cwd = captured[0]
+        self.assertIn("origin/main..HEAD", args)
+
+
 class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
     def _seeded(self, **state):
         gh = FakeGitHubClient()
