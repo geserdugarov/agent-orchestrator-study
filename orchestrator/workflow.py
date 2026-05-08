@@ -97,6 +97,112 @@ def _post_issue_comment(
     return c
 
 
+# Cap the stderr tail surfaced in park comments. A multi-MB Cloudflare
+# anti-bot interstitial (the original motivation for surfacing stderr at
+# all -- see #36) would otherwise bloat the issue body past GitHub's limit.
+_STDERR_TAIL_BUDGET = 1024
+
+# Provider auth (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is intentionally
+# left in the agent's environment by agents._agent_env -- the agent CLI
+# needs it to talk to its own model. A noisy backend, a buggy test, or a
+# prompt-injected command that echoed one of those values to stderr would
+# otherwise be republished verbatim in the park comment we post to the
+# issue. Match by suffix to cover the long tail of provider names
+# (HF_TOKEN, GEMINI_API_KEY, ...) without an explicit enumeration. The
+# orchestrator's own GITHUB_TOKEN is stripped from the agent env upstream
+# but still lives in this process; env-derived ones are caught by the
+# loop below, and the token-file path (ORCHESTRATOR_TOKEN_FILE / default
+# ~/.config/<repo>/token) is caught by the explicit config.GITHUB_TOKEN
+# pass in `_redact_secrets` -- without that pass the file-loaded token
+# would never appear in os.environ and would leak unredacted.
+_SECRET_KEY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PAT", "_CREDENTIAL")
+# Exact names cover two cases the suffix predicate misses: GitHub-token
+# aliases that don't end in any suffix above, and bare-named secrets
+# (`TOKEN`, `PASSWORD`, ...) some build systems still set unprefixed --
+# those would otherwise pass through _agent_env and leak unredacted if a
+# prompt-injected stderr echoed `$TOKEN`.
+_SECRET_KEY_NAMES = frozenset({
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT",
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "CREDENTIAL",
+})
+# Short values produce too many false-positive replacements (a 4-char dev
+# key masks incidental substrings like "true"/"main") for too little
+# protection. Real provider keys are well above this floor.
+_REDACT_MIN_VALUE_LEN = 8
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace values of secret-shaped env vars in `text` with `***`.
+
+    Called before any stderr is surfaced to GitHub or the log so a
+    prompt-injected agent that echoes its own provider key cannot exfiltrate
+    it via a park comment. Snapshot of os.environ at call time, so a key
+    that was unset between subprocess spawn and the post is no longer
+    redacted -- acceptable since it also no longer leaks anything reachable
+    from the agent.
+    """
+    if not text:
+        return text
+    redacted = text
+    for key, value in os.environ.items():
+        if not value or len(value) < _REDACT_MIN_VALUE_LEN:
+            continue
+        upper = key.upper()
+        if upper in _SECRET_KEY_NAMES or any(
+            upper.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES
+        ):
+            redacted = redacted.replace(value, "***")
+    # GITHUB_TOKEN may have been resolved from ORCHESTRATOR_TOKEN_FILE (or
+    # the default ~/.config/<repo>/token path) rather than the process env,
+    # in which case the env loop above never sees it. Without this explicit
+    # pass, a prompt-injected command that cat'd that file -- or any git/gh
+    # subprocess stderr quoting the token -- would publish it unredacted.
+    token = config.GITHUB_TOKEN
+    if token and len(token) >= _REDACT_MIN_VALUE_LEN:
+        redacted = redacted.replace(token, "***")
+    return redacted
+
+
+def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str:
+    """Render a stderr/exit-code diagnostic block to append to a park comment.
+
+    Returns "" when the agent produced no stderr -- callers can concatenate
+    unconditionally without a trailing dead section. Otherwise returns a
+    block beginning with two newlines so it slots cleanly after an existing
+    `_Last … message:_` body.
+
+    Redaction happens on the raw stderr before any trimming: a multi-line
+    secret env value (e.g. an SSH/PEM key whose env-var value ends in `\\n`)
+    echoed at the end of stderr would otherwise have its trailing newline
+    stripped first, so `str.replace` would no longer find the env value
+    verbatim and the secret would leak.
+    """
+    tail = _redact_secrets(result.stderr or "").rstrip()
+    if not tail:
+        return ""
+    if len(tail) > _STDERR_TAIL_BUDGET:
+        tail = tail[-_STDERR_TAIL_BUDGET:]
+    quoted = "> " + tail.replace("\n", "\n> ")
+    return (
+        f"\n\n_{label} stderr (last 1KB):_\n\n{quoted}\n\n"
+        f"_{label} exit code:_ {result.exit_code}"
+    )
+
+
+def _stderr_log_tail(result: AgentResult, max_chars: int = 400) -> str:
+    """Short stderr tail for log lines -- tighter than the park-comment cap
+    so a single WARNING fits on one screen.
+
+    Redact before trimming for the same reason as `_format_stderr_diagnostics`:
+    a multi-line secret value ending in `\\n` would not match `str.replace`
+    if `rstrip` ate the trailing newline first.
+    """
+    tail = _redact_secrets(result.stderr or "").rstrip()
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
 def _post_pr_comment(
     gh: GitHubClient, pr_number: int, state: PinnedState, body: str,
 ):
@@ -855,7 +961,10 @@ def _handle_pickup(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # by adding a workflow label themselves -- the guard only fires here.
     if config.ALLOWED_ISSUE_AUTHORS:
         author = getattr(getattr(issue, "user", None), "login", None) or ""
-        if author not in config.ALLOWED_ISSUE_AUTHORS:
+        # GitHub logins are case-insensitive (Alice and alice resolve to the
+        # same account), so normalize both sides before comparing.
+        allowed = {h.lower() for h in config.ALLOWED_ISSUE_AUTHORS}
+        if author.lower() not in allowed:
             log.info(
                 "repo=%s issue=#%s author=%r not in ALLOWED_ISSUE_AUTHORS; skipping pickup",
                 spec.slug, issue.number, author,
@@ -1332,13 +1441,28 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                     f"_Last decomposer message:_\n\n{quoted}",
                 )
             else:
-                raw = last_msg.strip() or "(decomposer produced no final message)"
+                stripped = last_msg.strip()
+                raw = stripped or "(decomposer produced no final message)"
                 quoted = "> " + raw.replace("\n", "\n> ")
+                # Only attach stderr diagnostics on the silent path -- a
+                # real content question from the decomposer doesn't need
+                # the operator wading through subprocess noise.
+                diag = (
+                    "" if stripped
+                    else _format_stderr_diagnostics(result, "Decomposer")
+                )
                 _park_awaiting_human(
                     gh, issue, state,
                     f"{config.HITL_MENTIONS} decomposer needs your input to "
-                    f"proceed:\n\n{quoted}",
+                    f"proceed:\n\n{quoted}{diag}",
                 )
+                if not stripped:
+                    log.warning(
+                        "issue=#%s decomposer produced no final message; "
+                        "exit_code=%d timed_out=%s stderr_tail=%r",
+                        issue.number, result.exit_code, result.timed_out,
+                        _stderr_log_tail(result),
+                    )
             gh.write_pinned_state(issue, state)
             return
 
@@ -2231,10 +2355,26 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     if verdict == "unknown":
         raw = (review.last_message or "").strip() or "(reviewer produced no final message)"
         quoted = "> " + raw.replace("\n", "\n> ")
+        # Surface stderr only on the silent-review path (empty last_message).
+        # If the reviewer DID emit text but it just lacked a VERDICT line,
+        # the human is reading real model output and stderr noise would
+        # only distract.
+        diag = (
+            _format_stderr_diagnostics(review, "Reviewer")
+            if not (review.last_message or "").strip()
+            else ""
+        )
         _park_awaiting_human(
             gh, issue, state,
             f"{config.HITL_MENTIONS} reviewer did not emit a VERDICT line; "
-            f"manual adjudication needed.\n\n_Last reviewer message:_\n\n{quoted}",
+            f"manual adjudication needed.\n\n_Last reviewer message:_\n\n"
+            f"{quoted}{diag}",
+        )
+        log.warning(
+            "issue=#%s reviewer emitted no VERDICT; exit_code=%d "
+            "timed_out=%s stderr_tail=%r",
+            issue.number, review.exit_code, review.timed_out,
+            _stderr_log_tail(review),
         )
         gh.write_pinned_state(issue, state)
         return
@@ -3083,10 +3223,17 @@ def _on_question(
         # consecutive silent parks, and surface the situation accurately
         # to the operator instead of impersonating a real "agent has a
         # question" park.
+        diag = _format_stderr_diagnostics(result, "Agent")
         _post_issue_comment(
             gh, issue, state,
             f"{config.HITL_MENTIONS} agent produced no output (likely a "
-            "session-resume failure); manual intervention needed.",
+            f"session-resume failure); manual intervention needed.{diag}",
+        )
+        log.warning(
+            "issue=#%s agent produced no output; exit_code=%d "
+            "timed_out=%s stderr_tail=%r",
+            issue.number, result.exit_code, result.timed_out,
+            _stderr_log_tail(result),
         )
         state.set("awaiting_human", True)
         state.set("park_reason", "agent_silent")
