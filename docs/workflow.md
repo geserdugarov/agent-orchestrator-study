@@ -114,6 +114,8 @@ If a PR has already been created, read the active discussions from it.
 After implementation finishes, the bot must create a PR with the changes. Leave a comment on the issue with the session identifiers so that
 we can return to those sessions with context if needed via `codex resume` or `claude resume`.
 
+PR titles and commit messages follow the repository's existing Conventional Commits style — `<type>: <subject>` with `feat:` / `fix:` / `docs:` / `chore:` / `refactor:` / `test:` etc. The implementer prompt instructs the agent to inspect `git log --oneline -20` and follow the same convention; commit messages must be subject-only (no body, no `Co-Authored-By:` trailer). When opening the PR, `_pr_title_from_commit_or_issue` reuses the agent's first commit subject if it is already conformant, otherwise falls back to `<type>: <issue title>` (`fix` for bug-labelled issues, `feat` everywhere else). Issue traceability stays via the `Resolves #<n>` line in the PR body, so the title stays clean.
+
 After work finishes, remove the `implementing` label and apply the `validating` label. Push the changes to the branch.
 
 Possibly at this stage several agents will work in parallel and produce several solutions for the task. We need to pick one best
@@ -130,7 +132,7 @@ We can add an architectural review — for example, flagging absence of large fi
 
 **TODO (not implemented):** running tests, linters, and other project-specific checks at the validation stage. Currently `_handle_validating` only spawns the reviewer agent and runs no other local checks; the GitHub checks status (`pr_combined_check_state`) is consulted later, in the auto-merge gate of `_handle_in_review` (under `AUTO_MERGE=on`), not before the transition into `in_review`.
 
-By this stage the PR has already been created (the implementer opens it before the transition to `validating`). After reviewer approval, change the label to `in_review`.
+By this stage the PR has already been created (the implementer opens it before the transition to `validating`). After reviewer approval, the orchestrator squashes the PR's commits into one and force-pushes (`_squash_and_force_push`, gated by `SQUASH_ON_APPROVAL`, default `on`) before flipping the label to `in_review`. The squash subject reuses the first commit when it already matches conventional-commit form; otherwise it is built as `feat: <issue title>`. The body lists the original subjects so reviewers can still see what landed. The push is `--force-with-lease` against the pre-squash SHA, so a concurrent remote update parks awaiting human instead of clobbering work. Because the squash and the relabel happen inside the same `validating → in_review` handoff, by the time the next tick runs the issue is already labelled `in_review` and `_handle_validating` no longer applies — the rewritten head does not retrigger the review that just ended. If the squash or force-push fails, the orchestrator parks awaiting human and stays on `validating` (no relabel), leaving the original commits on the branch for manual triage.
 
 # Acceptance (HITL)
 
