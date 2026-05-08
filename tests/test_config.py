@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -353,6 +355,135 @@ class MaxConflictRoundsConfigTest(unittest.TestCase):
     def test_env_override(self) -> None:
         config = self._load_config({"MAX_CONFLICT_ROUNDS": "7"})
         self.assertEqual(config.MAX_CONFLICT_ROUNDS, 7)
+
+
+class MultiRepoConfigTest(unittest.TestCase):
+    """`REPOS` parses N entries; when unset the legacy single-repo trio
+    (`REPO` / `TARGET_REPO_ROOT` / `BASE_BRANCH`) keeps working."""
+
+    def _load_config(self, env: dict[str, str] | None = None):
+        full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
+        }
+        if env:
+            full_env.update(env)
+        with patch.dict(os.environ, full_env, clear=True):
+            sys.modules.pop("orchestrator.config", None)
+            import orchestrator.config as config
+
+            return config
+
+    def test_legacy_single_repo_fallback_when_repos_unset(self) -> None:
+        config = self._load_config({
+            "REPO": "owner/legacy",
+            "TARGET_REPO_ROOT": "/tmp",
+            "BASE_BRANCH": "trunk",
+        })
+
+        specs = config.default_repo_specs()
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].slug, "owner/legacy")
+        self.assertEqual(specs[0].target_root, Path("/tmp"))
+        self.assertEqual(specs[0].base_branch, "trunk")
+
+    def test_multi_entry_parsing_newline_and_semicolon(self) -> None:
+        # Mix newlines, ';', blank lines, and a comment to verify the parser
+        # accepts both separators and ignores noise.
+        with tempfile.TemporaryDirectory() as td:
+            other = Path(td) / "other"
+            other.mkdir()
+            config = self._load_config({
+                "REPOS": (
+                    "# multi-repo example\n"
+                    f"alpha/one|{td}|main\n"
+                    "\n"
+                    f"beta/two|{other}|develop;gamma/three|{td}|master"
+                ),
+            })
+
+            specs = config.default_repo_specs()
+            self.assertEqual([s.slug for s in specs],
+                             ["alpha/one", "beta/two", "gamma/three"])
+            self.assertEqual([s.base_branch for s in specs],
+                             ["main", "develop", "master"])
+            self.assertEqual(specs[1].target_root, other)
+            # Returned list is a fresh copy so callers can't mutate the cache.
+            specs.append("not-a-spec")  # type: ignore[arg-type]
+            self.assertEqual(len(config.default_repo_specs()), 3)
+
+    def test_repos_overrides_legacy_trio(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = self._load_config({
+                "REPO": "ignored/legacy",
+                "TARGET_REPO_ROOT": "/nonexistent",
+                "BASE_BRANCH": "ignored",
+                "REPOS": f"alpha/one|{td}|main",
+            })
+
+            specs = config.default_repo_specs()
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].slug, "alpha/one")
+            self.assertEqual(specs[0].target_root, Path(td))
+            self.assertEqual(specs[0].base_branch, "main")
+
+    def test_duplicate_slug_aborts_at_import(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit) as cm:
+                self._load_config({
+                    "REPOS": (
+                        f"alpha/one|{td}|main\n"
+                        f"alpha/one|{td}|develop"
+                    ),
+                })
+            msg = str(cm.exception)
+            self.assertIn("duplicate slug", msg)
+            self.assertIn("alpha/one", msg)
+
+    def test_malformed_entry_aborts_at_import(self) -> None:
+        # Wrong number of '|' segments.
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REPOS": "owner/repo|/tmp"})
+        self.assertIn("malformed", str(cm.exception))
+
+    def test_empty_slug_aborts_at_import(self) -> None:
+        # Slug must contain '/'.
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REPOS": "no-slash|/tmp|main"})
+        self.assertIn("owner/name", str(cm.exception))
+
+    def test_empty_base_branch_aborts_at_import(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REPOS": "owner/repo|/tmp|"})
+        self.assertIn("base_branch", str(cm.exception))
+
+    def test_empty_target_root_aborts_at_import(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REPOS": "owner/repo||main"})
+        self.assertIn("target_root", str(cm.exception))
+
+    def test_repos_with_only_comments_aborts(self) -> None:
+        # `REPOS` set but yielding zero entries is a misconfiguration --
+        # better to fail loudly than silently fall back to the legacy trio
+        # (which the user explicitly opted out of by setting REPOS).
+        with self.assertRaises(SystemExit) as cm:
+            self._load_config({"REPOS": "# just a comment\n  \n"})
+        self.assertIn("no valid entries", str(cm.exception))
+
+    def test_missing_target_root_warns_but_does_not_abort(self) -> None:
+        # Captures the stderr warning to confirm "warn loudly" semantics.
+        import io
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            config = self._load_config(
+                {"REPOS": "alpha/one|/this/path/does/not/exist|main"}
+            )
+        specs = config.default_repo_specs()
+        self.assertEqual(len(specs), 1)
+        self.assertIn("does not exist", buf.getvalue())
+        self.assertIn("alpha/one", buf.getvalue())
 
 
 if __name__ == "__main__":
