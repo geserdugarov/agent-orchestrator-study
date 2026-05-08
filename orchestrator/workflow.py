@@ -961,7 +961,10 @@ def _handle_pickup(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # by adding a workflow label themselves -- the guard only fires here.
     if config.ALLOWED_ISSUE_AUTHORS:
         author = getattr(getattr(issue, "user", None), "login", None) or ""
-        if author not in config.ALLOWED_ISSUE_AUTHORS:
+        # GitHub logins are case-insensitive (Alice and alice resolve to the
+        # same account), so normalize both sides before comparing.
+        allowed = {h.lower() for h in config.ALLOWED_ISSUE_AUTHORS}
+        if author.lower() not in allowed:
             log.info(
                 "repo=%s issue=#%s author=%r not in ALLOWED_ISSUE_AUTHORS; skipping pickup",
                 spec.slug, issue.number, author,

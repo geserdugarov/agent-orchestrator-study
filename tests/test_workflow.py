@@ -518,6 +518,25 @@ class HandlePickupTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIn((1, "implementing"), gh.label_history)
         self.assertIn("created_at", gh.pinned_data(1))
 
+    def test_pickup_matches_author_case_insensitively(self) -> None:
+        # GitHub logins are case-insensitive: "Alice" and "alice" resolve
+        # to the same account. The allowlist must accept either casing on
+        # both sides so a maintainer's mixed-case configuration doesn't
+        # silently reject legitimate issues.
+        gh = FakeGitHubClient()
+        issue = make_issue(1, author="Alice")
+        gh.add_issue(issue)
+
+        with patch.object(config, "ALLOWED_ISSUE_AUTHORS", ("alice",)), \
+             patch.object(config, "DECOMPOSE", False):
+            self._run(
+                lambda: workflow._handle_pickup(gh, _TEST_SPEC, issue),
+                run_agent=_agent(last_message="need clarification"),
+                has_new_commits=False,
+            )
+
+        self.assertIn((1, "implementing"), gh.label_history)
+
     def test_empty_allowlist_lets_anyone_through(self) -> None:
         # Default config: empty tuple disables the filter so existing
         # single-user setups (and any deployment that hasn't opted in)
