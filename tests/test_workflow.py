@@ -275,6 +275,38 @@ class RedactSecretsTest(unittest.TestCase):
             )
         self.assertNotIn("sk-proj-loglinevaluexyz", tail)
 
+    def test_diagnostics_redacts_multiline_secret_at_eof(self) -> None:
+        # Regression for the rstrip-before-redact ordering bug: a
+        # multi-line secret whose env value itself ends in `\n` (e.g. a
+        # PEM/SSH key) echoed at the end of stderr. If rstrip ran first,
+        # the trailing newline would be eaten and `str.replace(value,
+        # "***")` would no longer match the env value verbatim, leaking
+        # the secret into the park comment.
+        secret = "-----BEGIN PRIVATE KEY-----\nAAAABBBBCCCCDDDD\n-----END PRIVATE KEY-----\n"
+        with self._patched_env(SSH_PRIVATE_KEY=secret):
+            block = workflow._format_stderr_diagnostics(
+                AgentResult(
+                    session_id="s", last_message="", exit_code=1,
+                    timed_out=False, stdout="",
+                    stderr="boom: " + secret,
+                ),
+                "Agent",
+            )
+        self.assertNotIn("AAAABBBBCCCCDDDD", block)
+        self.assertIn("***", block)
+
+    def test_log_tail_redacts_multiline_secret_at_eof(self) -> None:
+        secret = "line1-of-secret-value\nline2-of-secret-value\n"
+        with self._patched_env(API_TOKEN=secret):
+            tail = workflow._stderr_log_tail(
+                AgentResult(
+                    session_id="s", last_message="", exit_code=1,
+                    timed_out=False, stdout="",
+                    stderr="leaked: " + secret,
+                ),
+            )
+        self.assertNotIn("line2-of-secret-value", tail)
+
 
 class PushBranchTest(unittest.TestCase):
     """`_push_branch` handles the divergence cases that bit issue-5.

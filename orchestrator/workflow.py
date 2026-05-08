@@ -159,8 +159,14 @@ def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str
     unconditionally without a trailing dead section. Otherwise returns a
     block beginning with two newlines so it slots cleanly after an existing
     `_Last … message:_` body.
+
+    Redaction happens on the raw stderr before any trimming: a multi-line
+    secret env value (e.g. an SSH/PEM key whose env-var value ends in `\\n`)
+    echoed at the end of stderr would otherwise have its trailing newline
+    stripped first, so `str.replace` would no longer find the env value
+    verbatim and the secret would leak.
     """
-    tail = _redact_secrets((result.stderr or "").rstrip())
+    tail = _redact_secrets(result.stderr or "").rstrip()
     if not tail:
         return ""
     if len(tail) > _STDERR_TAIL_BUDGET:
@@ -174,8 +180,13 @@ def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str
 
 def _stderr_log_tail(result: AgentResult, max_chars: int = 400) -> str:
     """Short stderr tail for log lines -- tighter than the park-comment cap
-    so a single WARNING fits on one screen."""
-    tail = _redact_secrets((result.stderr or "").rstrip())
+    so a single WARNING fits on one screen.
+
+    Redact before trimming for the same reason as `_format_stderr_diagnostics`:
+    a multi-line secret value ending in `\\n` would not match `str.replace`
+    if `rstrip` ate the trailing newline first.
+    """
+    tail = _redact_secrets(result.stderr or "").rstrip()
     if len(tail) > max_chars:
         tail = tail[-max_chars:]
     return tail
