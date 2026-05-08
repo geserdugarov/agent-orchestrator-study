@@ -108,10 +108,13 @@ _STDERR_TAIL_BUDGET = 1024
 # prompt-injected command that echoed one of those values to stderr would
 # otherwise be republished verbatim in the park comment we post to the
 # issue. Match by suffix to cover the long tail of provider names
-# (HF_TOKEN, GEMINI_API_KEY, ...) without an explicit enumeration; the
+# (HF_TOKEN, GEMINI_API_KEY, ...) without an explicit enumeration. The
 # orchestrator's own GITHUB_TOKEN is stripped from the agent env upstream
-# but still lives in this process, so the same scrub also covers stderr
-# captured from orchestrator-spawned git/gh subprocesses.
+# but still lives in this process; env-derived ones are caught by the
+# loop below, and the token-file path (ORCHESTRATOR_TOKEN_FILE / default
+# ~/.config/<repo>/token) is caught by the explicit config.GITHUB_TOKEN
+# pass in `_redact_secrets` -- without that pass the file-loaded token
+# would never appear in os.environ and would leak unredacted.
 _SECRET_KEY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PAT", "_CREDENTIAL")
 # Exact names cover two cases the suffix predicate misses: GitHub-token
 # aliases that don't end in any suffix above, and bare-named secrets
@@ -149,6 +152,14 @@ def _redact_secrets(text: str) -> str:
             upper.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES
         ):
             redacted = redacted.replace(value, "***")
+    # GITHUB_TOKEN may have been resolved from ORCHESTRATOR_TOKEN_FILE (or
+    # the default ~/.config/<repo>/token path) rather than the process env,
+    # in which case the env loop above never sees it. Without this explicit
+    # pass, a prompt-injected command that cat'd that file -- or any git/gh
+    # subprocess stderr quoting the token -- would publish it unredacted.
+    token = config.GITHUB_TOKEN
+    if token and len(token) >= _REDACT_MIN_VALUE_LEN:
+        redacted = redacted.replace(token, "***")
     return redacted
 
 

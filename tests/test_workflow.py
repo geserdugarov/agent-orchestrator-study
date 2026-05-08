@@ -211,6 +211,22 @@ class RedactSecretsTest(unittest.TestCase):
             out = workflow._redact_secrets("remote: bad credential ghp_thisisthetokenvalue")
         self.assertNotIn("ghp_thisisthetokenvalue", out)
 
+    def test_redacts_github_token_loaded_from_file(self) -> None:
+        # Token-file path (ORCHESTRATOR_TOKEN_FILE / default
+        # ~/.config/<repo>/token) populates config.GITHUB_TOKEN without
+        # touching os.environ. The env-loop alone would miss it, so we
+        # also pass config.GITHUB_TOKEN explicitly. Regression: without
+        # that pass, agent stderr that cat'd the token file would leak
+        # the credential into the park comment.
+        token = "ghp_filebackedtokenvalue9876"
+        # Ensure the env path wouldn't catch it on its own.
+        env_without_token = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
+        with patch.dict(os.environ, env_without_token, clear=True), \
+                patch.object(config, "GITHUB_TOKEN", token):
+            out = workflow._redact_secrets(f"cat ran: {token} got captured")
+        self.assertNotIn(token, out)
+        self.assertIn("***", out)
+
     def test_redacts_arbitrary_provider_via_suffix(self) -> None:
         # The suffix list is what catches the long tail (HF_TOKEN,
         # GEMINI_API_KEY, ...) without us enumerating every provider.
