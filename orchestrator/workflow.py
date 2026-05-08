@@ -97,6 +97,41 @@ def _post_issue_comment(
     return c
 
 
+# Cap the stderr tail surfaced in park comments. A multi-MB Cloudflare
+# anti-bot interstitial (the original motivation for surfacing stderr at
+# all -- see #36) would otherwise bloat the issue body past GitHub's limit.
+_STDERR_TAIL_BUDGET = 1024
+
+
+def _format_stderr_diagnostics(result: AgentResult, label: str = "Agent") -> str:
+    """Render a stderr/exit-code diagnostic block to append to a park comment.
+
+    Returns "" when the agent produced no stderr -- callers can concatenate
+    unconditionally without a trailing dead section. Otherwise returns a
+    block beginning with two newlines so it slots cleanly after an existing
+    `_Last … message:_` body.
+    """
+    tail = (result.stderr or "").rstrip()
+    if not tail:
+        return ""
+    if len(tail) > _STDERR_TAIL_BUDGET:
+        tail = tail[-_STDERR_TAIL_BUDGET:]
+    quoted = "> " + tail.replace("\n", "\n> ")
+    return (
+        f"\n\n_{label} stderr (last 1KB):_\n\n{quoted}\n\n"
+        f"_{label} exit code:_ {result.exit_code}"
+    )
+
+
+def _stderr_log_tail(result: AgentResult, max_chars: int = 400) -> str:
+    """Short stderr tail for log lines -- tighter than the park-comment cap
+    so a single WARNING fits on one screen."""
+    tail = (result.stderr or "").rstrip()
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
 def _post_pr_comment(
     gh: GitHubClient, pr_number: int, state: PinnedState, body: str,
 ):
@@ -1332,13 +1367,28 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                     f"_Last decomposer message:_\n\n{quoted}",
                 )
             else:
-                raw = last_msg.strip() or "(decomposer produced no final message)"
+                stripped = last_msg.strip()
+                raw = stripped or "(decomposer produced no final message)"
                 quoted = "> " + raw.replace("\n", "\n> ")
+                # Only attach stderr diagnostics on the silent path -- a
+                # real content question from the decomposer doesn't need
+                # the operator wading through subprocess noise.
+                diag = (
+                    "" if stripped
+                    else _format_stderr_diagnostics(result, "Decomposer")
+                )
                 _park_awaiting_human(
                     gh, issue, state,
                     f"{config.HITL_MENTIONS} decomposer needs your input to "
-                    f"proceed:\n\n{quoted}",
+                    f"proceed:\n\n{quoted}{diag}",
                 )
+                if not stripped:
+                    log.warning(
+                        "issue=#%s decomposer produced no final message; "
+                        "exit_code=%d timed_out=%s stderr_tail=%r",
+                        issue.number, result.exit_code, result.timed_out,
+                        _stderr_log_tail(result),
+                    )
             gh.write_pinned_state(issue, state)
             return
 
@@ -2231,10 +2281,26 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     if verdict == "unknown":
         raw = (review.last_message or "").strip() or "(reviewer produced no final message)"
         quoted = "> " + raw.replace("\n", "\n> ")
+        # Surface stderr only on the silent-review path (empty last_message).
+        # If the reviewer DID emit text but it just lacked a VERDICT line,
+        # the human is reading real model output and stderr noise would
+        # only distract.
+        diag = (
+            _format_stderr_diagnostics(review, "Reviewer")
+            if not (review.last_message or "").strip()
+            else ""
+        )
         _park_awaiting_human(
             gh, issue, state,
             f"{config.HITL_MENTIONS} reviewer did not emit a VERDICT line; "
-            f"manual adjudication needed.\n\n_Last reviewer message:_\n\n{quoted}",
+            f"manual adjudication needed.\n\n_Last reviewer message:_\n\n"
+            f"{quoted}{diag}",
+        )
+        log.warning(
+            "issue=#%s reviewer emitted no VERDICT; exit_code=%d "
+            "timed_out=%s stderr_tail=%r",
+            issue.number, review.exit_code, review.timed_out,
+            _stderr_log_tail(review),
         )
         gh.write_pinned_state(issue, state)
         return
@@ -3083,10 +3149,17 @@ def _on_question(
         # consecutive silent parks, and surface the situation accurately
         # to the operator instead of impersonating a real "agent has a
         # question" park.
+        diag = _format_stderr_diagnostics(result, "Agent")
         _post_issue_comment(
             gh, issue, state,
             f"{config.HITL_MENTIONS} agent produced no output (likely a "
-            "session-resume failure); manual intervention needed.",
+            f"session-resume failure); manual intervention needed.{diag}",
+        )
+        log.warning(
+            "issue=#%s agent produced no output; exit_code=%d "
+            "timed_out=%s stderr_tail=%r",
+            issue.number, result.exit_code, result.timed_out,
+            _stderr_log_tail(result),
         )
         state.set("awaiting_human", True)
         state.set("park_reason", "agent_silent")

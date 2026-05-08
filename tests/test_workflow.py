@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from unittest.mock import patch
 
 os.environ.setdefault("ORCHESTRATOR_SKIP_DOTENV", "1")
@@ -44,14 +45,16 @@ def _agent(
     session_id: str = "sess-1",
     last_message: str = "",
     timed_out: bool = False,
+    stderr: str = "",
+    exit_code: Optional[int] = None,
 ) -> AgentResult:
     return AgentResult(
         session_id=session_id,
         last_message=last_message,
-        exit_code=-1 if timed_out else 0,
+        exit_code=exit_code if exit_code is not None else (-1 if timed_out else 0),
         timed_out=timed_out,
         stdout="",
-        stderr="",
+        stderr=stderr,
     )
 
 
@@ -495,6 +498,34 @@ class HandleImplementingFreshRunTest(unittest.TestCase, _PatchedWorkflowMixin):
         # No quoted empty-message body either.
         self.assertNotIn("> (agent did not produce a final message)", last_comment)
 
+    def test_silent_failure_park_includes_stderr_diagnostics(self) -> None:
+        # Same shape as the silent-failure park, but the agent left
+        # something on stderr (e.g. a Cloudflare blob, an auth error).
+        # The park comment must surface that tail and the exit code so
+        # the operator can triage without reading ~/.codex/log/.
+        gh, issue = self._seeded()
+        with self.assertLogs("orchestrator.workflow", level="WARNING") as logs:
+            self._run(
+                lambda: workflow._handle_implementing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    last_message="",
+                    stderr="401 Unauthorized: token expired",
+                    exit_code=1,
+                ),
+                has_new_commits=False,
+            )
+
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("agent produced no output", last_comment)
+        self.assertIn("_Agent stderr (last 1KB):_", last_comment)
+        self.assertIn("401 Unauthorized", last_comment)
+        self.assertIn("_Agent exit code:_ 1", last_comment)
+        self.assertTrue(any(
+            "agent produced no output" in r.getMessage()
+            and "exit_code=1" in r.getMessage()
+            for r in logs.records
+        ))
+
     def test_codex_timeout_parks_with_timeout_message(self) -> None:
         gh, issue = self._seeded()
         mocks = self._run(
@@ -903,15 +934,83 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         gh, issue = self._seeded()
         self._run(
             lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
-            run_agent=_agent(last_message="I'm not sure what to think"),
+            run_agent=_agent(
+                last_message="I'm not sure what to think",
+                stderr="some subprocess noise",
+            ),
         )
 
         self.assertTrue(gh.pinned_data(5).get("awaiting_human"))
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("did not emit a VERDICT line", last_comment)
         self.assertIn("> I'm not sure what to think", last_comment)
+        # Real reviewer text is present, so the operator does not need
+        # subprocess stderr in addition -- skip the diagnostic block.
+        self.assertNotIn("Reviewer stderr", last_comment)
         # Label stays validating: no in_review transition.
         self.assertNotIn((5, "in_review"), gh.label_history)
+
+    def test_empty_review_park_surfaces_stderr_and_exit_code(self) -> None:
+        # Codex hit a Cloudflare interstitial: the agent exited with
+        # nothing on stdout but the CF blob landed on stderr (#36). The
+        # park comment must carry that tail so the operator can
+        # distinguish CF / quota / auth from a true silent review.
+        gh, issue = self._seeded()
+        cf_blob = (
+            "cf_chl_opt … Enable JavaScript and cookies to continue. "
+            "Verifying you are human. This may take a few seconds."
+        )
+        with self.assertLogs("orchestrator.workflow", level="WARNING") as logs:
+            self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    last_message="",
+                    stderr=cf_blob,
+                    exit_code=2,
+                ),
+            )
+
+        self.assertTrue(gh.pinned_data(5).get("awaiting_human"))
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("did not emit a VERDICT line", last_comment)
+        self.assertIn("(reviewer produced no final message)", last_comment)
+        self.assertIn("_Reviewer stderr (last 1KB):_", last_comment)
+        self.assertIn("Enable JavaScript and cookies", last_comment)
+        self.assertIn("_Reviewer exit code:_ 2", last_comment)
+        # Same data flowed to a WARNING log so operators tailing the
+        # orchestrator log don't have to read GitHub to triage.
+        self.assertTrue(any(
+            "reviewer emitted no VERDICT" in r.getMessage()
+            and "exit_code=2" in r.getMessage()
+            for r in logs.records
+        ))
+
+    def test_empty_review_park_truncates_long_stderr(self) -> None:
+        # A multi-MB CF response must not bloat the issue body. The
+        # park comment caps stderr at 1KB.
+        gh, issue = self._seeded()
+        huge = "X" * 8192 + "TAIL_MARKER"
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=_agent(last_message="", stderr=huge, exit_code=1),
+        )
+
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("TAIL_MARKER", last_comment)
+        # The leading head of the noise must be dropped by the cap.
+        self.assertNotIn("X" * 4096, last_comment)
+
+    def test_empty_review_park_with_no_stderr_omits_block(self) -> None:
+        gh, issue = self._seeded()
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=_agent(last_message="", stderr=""),
+        )
+
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("did not emit a VERDICT line", last_comment)
+        self.assertNotIn("_Reviewer stderr", last_comment)
+        self.assertNotIn("_Reviewer exit code:_", last_comment)
 
     def test_reviewer_timeout_parks(self) -> None:
         gh, issue = self._seeded()
@@ -6042,6 +6141,7 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
             run_agent=_agent(
                 session_id="dec-sess",
                 last_message="Should the new commands accept a --json flag?",
+                stderr="benign warning",
             ),
         )
 
@@ -6050,6 +6150,39 @@ class HandleDecomposingTest(unittest.TestCase, _PatchedWorkflowMixin):
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("needs your input", last_comment)
         self.assertIn("--json flag", last_comment)
+        # Real decomposer text -> no stderr block (would be noise).
+        self.assertNotIn("Decomposer stderr", last_comment)
+
+    def test_decompose_silent_failure_surfaces_stderr(self) -> None:
+        # No manifest AND no final message: the decomposer subprocess
+        # produced literally nothing. Surface its stderr/exit_code in
+        # the park so the operator can tell a CF / quota / auth failure
+        # apart from a model that just had no opinion.
+        gh = FakeGitHubClient()
+        issue = make_issue(115, label="decomposing")
+        gh.add_issue(issue)
+
+        with self.assertLogs("orchestrator.workflow", level="WARNING") as logs:
+            self._run(
+                lambda: workflow._handle_decomposing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dec-sess",
+                    last_message="",
+                    stderr="rate limit exceeded; retry after 60s",
+                    exit_code=3,
+                ),
+            )
+
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("(decomposer produced no final message)", last_comment)
+        self.assertIn("_Decomposer stderr (last 1KB):_", last_comment)
+        self.assertIn("rate limit exceeded", last_comment)
+        self.assertIn("_Decomposer exit code:_ 3", last_comment)
+        self.assertTrue(any(
+            "decomposer produced no final message" in r.getMessage()
+            and "exit_code=3" in r.getMessage()
+            for r in logs.records
+        ))
 
     def test_decompose_resume_on_human_reply(self) -> None:
         gh = FakeGitHubClient()
