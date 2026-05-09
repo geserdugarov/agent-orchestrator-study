@@ -85,14 +85,22 @@ class GitHubClient:
         self.repo: Repository = self._gh.get_repo(slug)
 
     def list_pollable_issues(self, since: Optional[datetime] = None) -> Iterable[Issue]:
-        """Open issues plus closed issues still labeled `in_review`.
+        """Open issues plus closed issues still labeled `in_review` or
+        `resolving_conflict`.
 
-        The closed-in_review sweep is what makes the manual-merge path work:
-        when a human merges a PR with a `Resolves #N` footer, GitHub closes
-        the linked issue automatically. Without this sweep the next tick would
-        not see issue #N at all and `_handle_in_review` could never flip the
-        label to `done`. Once flipped the issue no longer carries `in_review`
-        so the sweep stays bounded in steady state.
+        The closed-issue sweep is what makes the manual-merge path work:
+        when a human merges a PR with a `Resolves #N` footer, GitHub
+        closes the linked issue automatically. Without this sweep the
+        next tick would not see issue #N at all and the dispatcher could
+        never finalize the workflow label to `done`. Once flipped the
+        issue no longer carries either sweep label, so the cost stays
+        bounded in steady state.
+
+        `resolving_conflict` is included alongside `in_review` because
+        an external merge can land while the orchestrator is mid-resolution
+        too: `Resolves #N` closes the issue, the PR moves to merged, and
+        `_handle_resolving_conflict`'s terminal branch handles it -- but
+        only if the closed issue actually surfaces here.
         """
         seen: set[int] = set()
 
@@ -114,31 +122,34 @@ class GitHubClient:
         # propagates out of this generator on the second `for` -- past the
         # per-issue try/except in `tick()` -- it would silently break every
         # tick after open issues processed and leave externally-merged
-        # in_review issues stuck closed-but-`in_review` forever. Look up
-        # the Label once per call; treat a missing label as "nothing to
-        # sweep" and skip rather than raising.
-        try:
-            in_review_label = self.repo.get_label("in_review")
-        except GithubException as e:
-            log.warning(
-                "could not look up 'in_review' label for closed-issue "
-                "sweep (HTTP %s); skipping. Externally-merged in_review "
-                "issues will not finalize to `done` until the label exists.",
-                e.status,
-            )
-            return
-        closed_kwargs: dict[str, Any] = {
-            "state": "closed",
-            "labels": [in_review_label],
-            "sort": "updated",
-            "direction": "desc",
-        }
-        if since is not None:
-            closed_kwargs["since"] = since
-        for issue in self.repo.get_issues(**closed_kwargs):
-            if issue.pull_request is None and issue.number not in seen:
-                seen.add(issue.number)
-                yield issue
+        # in_review issues stuck closed-but-labeled forever. Look up
+        # each Label once per call; treat a missing label as "nothing to
+        # sweep" and skip rather than raising. Multi-label-OR is achieved
+        # by issuing one query per label (the GitHub Issues API treats
+        # `labels` as AND, not OR).
+        for label_name in ("in_review", "resolving_conflict"):
+            try:
+                label_obj = self.repo.get_label(label_name)
+            except GithubException as e:
+                log.warning(
+                    "could not look up %r label for closed-issue sweep "
+                    "(HTTP %s); skipping. Externally-merged %s issues will "
+                    "not finalize to `done` until the label exists.",
+                    label_name, e.status, label_name,
+                )
+                continue
+            closed_kwargs: dict[str, Any] = {
+                "state": "closed",
+                "labels": [label_obj],
+                "sort": "updated",
+                "direction": "desc",
+            }
+            if since is not None:
+                closed_kwargs["since"] = since
+            for issue in self.repo.get_issues(**closed_kwargs):
+                if issue.pull_request is None and issue.number not in seen:
+                    seen.add(issue.number)
+                    yield issue
 
     @staticmethod
     def workflow_label(issue: Issue) -> Optional[str]:

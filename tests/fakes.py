@@ -190,10 +190,13 @@ class FakeGitHubClient:
         self._issues[issue.number] = issue
 
     def list_pollable_issues(self) -> Iterable[FakeIssue]:
-        """Mirror the real client: open issues plus closed-but-`in_review`
-        issues. The closed-in_review sweep is what catches an external manual
-        merge -- the linked issue auto-closes via "Resolves #N" before the
-        orchestrator can flip its label to `done`.
+        """Mirror the real client: open issues plus closed issues still
+        labeled `in_review` OR `resolving_conflict`. The closed-issue
+        sweep is what catches an external manual merge -- the linked
+        issue auto-closes via "Resolves #N" before the orchestrator can
+        flip its label to `done`. `resolving_conflict` joins the sweep
+        because an external merge can land while the orchestrator is
+        mid-resolution too.
         """
         out: list[FakeIssue] = []
         seen: set[int] = set()
@@ -205,7 +208,10 @@ class FakeGitHubClient:
         for issue in self._issues.values():
             if not issue.closed or issue.number in seen:
                 continue
-            if any(l.name == "in_review" for l in issue.labels):
+            if any(
+                l.name in ("in_review", "resolving_conflict")
+                for l in issue.labels
+            ):
                 seen.add(issue.number)
                 out.append(issue)
         return out

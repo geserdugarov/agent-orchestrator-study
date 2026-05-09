@@ -88,6 +88,7 @@ class _PatchedWorkflowMixin:
         head_shas=("",),
         first_commit_subject="",
         squash_result=(True, None, 0, None),
+        branch_ahead_behind=(0, 0),
     ):
         from unittest.mock import MagicMock
 
@@ -103,6 +104,22 @@ class _PatchedWorkflowMixin:
         push_mock = MagicMock(return_value=bool(push_branch))
         head_mock = MagicMock(side_effect=list(head_shas))
         wt_mock = MagicMock(return_value=_FAKE_WT)
+        # `_ensure_pr_worktree` is the resolving_conflict-specific helper
+        # that restores from `origin/<branch>`; mock it on the same fake
+        # path so resolving_conflict tests don't shell out either.
+        pr_wt_mock = MagicMock(return_value=_FAKE_WT)
+        # `_authed_fetch` runs an actual subprocess in production; mock
+        # it to a successful CompletedProcess so resolving_conflict tests
+        # don't need a real askpass / token / network.
+        authed_fetch_ok = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="", stderr="")
+        )
+        # `_branch_ahead_behind` runs `git rev-list` in the worktree;
+        # default to (0, 0) ("in sync") so existing tests don't have to
+        # opt into the SHA-alignment recovery path. Tests that DO want
+        # to exercise the recovery / stale / diverged branches pass a
+        # different tuple via the `branch_ahead_behind` kwarg.
+        ahead_behind_mock = MagicMock(return_value=tuple(branch_ahead_behind))
         # Decomposer worktree helpers run real `git` calls in production.
         # Mock them with the same _FAKE_WT so `_handle_decomposing` tests
         # don't shell out (and the cleanup helper is a no-op).
@@ -120,6 +137,7 @@ class _PatchedWorkflowMixin:
 
         with patch.object(workflow, "run_agent", rc_mock), \
              patch.object(workflow, "_ensure_worktree", wt_mock), \
+             patch.object(workflow, "_ensure_pr_worktree", pr_wt_mock), \
              patch.object(workflow, "_ensure_decompose_worktree", decompose_wt_mock), \
              patch.object(workflow, "_decompose_worktree_path", decompose_path_mock), \
              patch.object(workflow, "_cleanup_decompose_worktree", cleanup_decompose_mock), \
@@ -129,12 +147,15 @@ class _PatchedWorkflowMixin:
              patch.object(workflow, "_push_branch", push_mock), \
              patch.object(workflow, "_head_sha", head_mock), \
              patch.object(workflow, "_first_commit_subject", first_subject_mock), \
-             patch.object(workflow, "_squash_and_force_push", squash_mock):
+             patch.object(workflow, "_squash_and_force_push", squash_mock), \
+             patch.object(workflow, "_authed_fetch", authed_fetch_ok), \
+             patch.object(workflow, "_branch_ahead_behind", ahead_behind_mock):
             callable_()
 
         return {
             "run_agent": rc_mock,
             "_ensure_worktree": wt_mock,
+            "_ensure_pr_worktree": pr_wt_mock,
             "_ensure_decompose_worktree": decompose_wt_mock,
             "_decompose_worktree_path": decompose_path_mock,
             "_cleanup_decompose_worktree": cleanup_decompose_mock,
@@ -145,6 +166,8 @@ class _PatchedWorkflowMixin:
             "_head_sha": head_mock,
             "_first_commit_subject": first_subject_mock,
             "_squash_and_force_push": squash_mock,
+            "_authed_fetch": authed_fetch_ok,
+            "_branch_ahead_behind": ahead_behind_mock,
         }
 
 
@@ -1873,7 +1896,11 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIn("checks are 'failure'", last_comment)
         self.assertIn(f"PR #{self.PR_NUMBER}", last_comment)
 
-    def test_in_review_auto_merge_blocked_on_unmergeable(self) -> None:
+    def test_in_review_auto_merge_unmergeable_routes_to_resolving_conflict(self) -> None:
+        # AUTO_MERGE on + PR not mergeable: instead of parking awaiting
+        # human, the orchestrator flips the label to `resolving_conflict`,
+        # seeds a fresh `conflict_round` counter, and lets the dedicated
+        # handler attempt an automated merge of the base branch.
         pr = self._open_pr(approved=True, mergeable=False, check_state="success")
         gh, issue = self._seed(pr=pr)
 
@@ -1884,9 +1911,113 @@ class HandleInReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
             )
 
         self.assertEqual(gh.merge_calls, [])
-        self.assertTrue(gh.pinned_data(30).get("awaiting_human"))
+        self.assertIn((30, "resolving_conflict"), gh.label_history)
+        data = gh.pinned_data(30)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertEqual(data.get("conflict_round"), 0)
+        # PR comment notifies that auto-resolution is being attempted.
+        self.assertTrue(gh.posted_pr_comments)
+        last_pr_comment = gh.posted_pr_comments[-1][1]
+        self.assertIn("auto-resolution", last_pr_comment)
+
+    def test_in_review_unmergeable_preserves_existing_conflict_round(self) -> None:
+        # A PR that already went through one auto-resolution round and
+        # bounced back to `in_review` still unmergeable (e.g. branch
+        # protection) must NOT have its conflict_round reset on re-entry.
+        # Resetting would make `MAX_CONFLICT_ROUNDS` ineffective for the
+        # branch-protection / out-of-date-base heuristic case.
+        pr = self._open_pr(approved=True, mergeable=False, check_state="success")
+        gh, issue = self._seed(pr=pr, extra_state={"conflict_round": 2})
+
+        with patch.object(config, "AUTO_MERGE", True):
+            self._run(
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+            )
+
+        self.assertIn((30, "resolving_conflict"), gh.label_history)
+        data = gh.pinned_data(30)
+        # Counter preserved at 2, not reset to 0.
+        self.assertEqual(data.get("conflict_round"), 2)
+
+    def test_in_review_unmergeable_unapproved_does_not_route(self) -> None:
+        # Resolving_conflict resumes / pushes dev work; routing an
+        # unapproved PR there would push unreviewed merges past the
+        # original gating that the old `unmergeable` park honored. The
+        # approval gate must run BEFORE the unmergeable check.
+        pr = self._open_pr(
+            approved=False, mergeable=False, check_state="success",
+        )
+        gh, issue = self._seed(pr=pr)
+
+        with patch.object(config, "AUTO_MERGE", True):
+            mocks = self._run(
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+            )
+
+        mocks["run_agent"].assert_not_called()
+        self.assertEqual(gh.merge_calls, [])
+        # No resolving_conflict relabel and no PR comment about
+        # auto-resolution.
+        self.assertNotIn((30, "resolving_conflict"), gh.label_history)
+        self.assertEqual(gh.posted_pr_comments, [])
+        data = gh.pinned_data(30)
+        self.assertFalse(data.get("awaiting_human"))
+        # No conflict_round seeded -- we never entered the route.
+        self.assertNotIn("conflict_round", data)
+
+    def test_in_review_unmergeable_changes_requested_does_not_route(self) -> None:
+        # A standing human CHANGES_REQUESTED on the current head vetoes
+        # the resolving_conflict route. Without this gate, the dev
+        # session would resume and push merge work over the human's
+        # objection.
+        pr = self._open_pr(
+            approved=True, mergeable=False, check_state="success",
+            changes_requested=True,
+        )
+        gh, issue = self._seed(pr=pr)
+
+        with patch.object(config, "AUTO_MERGE", True):
+            mocks = self._run(
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+            )
+
+        mocks["run_agent"].assert_not_called()
+        self.assertEqual(gh.merge_calls, [])
+        self.assertNotIn((30, "resolving_conflict"), gh.label_history)
+        self.assertEqual(gh.posted_pr_comments, [])
+        data = gh.pinned_data(30)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertNotIn("conflict_round", data)
+
+    def test_in_review_auto_merge_off_unmergeable_parks_legacy(self) -> None:
+        # Legacy fallback: AUTO_MERGE off + unmergeable parks awaiting
+        # human with `park_reason="unmergeable"`. Operators who haven't
+        # opted into AUTO_MERGE still get visibility into the unmergeable
+        # state, and the existing transient-park recovery picks the issue
+        # back up if AUTO_MERGE is later flipped on.
+        pr = self._open_pr(approved=True, mergeable=False, check_state="success")
+        gh, issue = self._seed(pr=pr)
+
+        with patch.object(config, "AUTO_MERGE", False):
+            mocks = self._run(
+                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+            )
+
+        mocks["run_agent"].assert_not_called()
+        self.assertEqual(gh.merge_calls, [])
+        # AUTO_MERGE off must NOT route to resolving_conflict.
+        self.assertNotIn((30, "resolving_conflict"), gh.label_history)
+        data = gh.pinned_data(30)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "unmergeable")
         last_comment = gh.posted_comments[-1][1]
         self.assertIn("not mergeable", last_comment)
+        # AUTO_MERGE off does not seed the conflict_round budget.
+        self.assertNotIn("conflict_round", data)
 
     def test_in_review_auto_merge_mergeable_pending(self) -> None:
         # mergeable=None means GitHub is still computing. Don't merge, don't
@@ -2933,7 +3064,12 @@ class InReviewParkWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
         # No additional comments posted (no second park, no dev-resume ping).
         self.assertEqual(len(gh.posted_comments), comments_after_park)
 
-    def test_unmergeable_park_does_not_replay_on_next_tick(self) -> None:
+    def test_unmergeable_in_review_route_does_not_replay_on_next_tick(self) -> None:
+        # An unmergeable PR routes to `resolving_conflict` on the first
+        # in_review tick. The label change means the dispatcher hands the
+        # next tick to `_handle_resolving_conflict`, not `_handle_in_review`,
+        # so the in_review handler must not be re-triggered against the
+        # auto-resolution-in-progress PR.
         gh = FakeGitHubClient()
         issue = make_issue(61, label="in_review")
         gh.add_issue(issue)
@@ -2955,16 +3091,11 @@ class InReviewParkWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
                 lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
                 run_agent=_agent(),
             )
-        self.assertTrue(gh.pinned_data(61).get("awaiting_human"))
-        latest_id = gh.latest_comment_id(issue)
-        self.assertEqual(gh.pinned_data(61).get("pr_last_comment_id"), latest_id)
-
-        with patch.object(config, "AUTO_MERGE", True):
-            mocks = self._run(
-                lambda: workflow._handle_in_review(gh, _TEST_SPEC, issue),
-                run_agent=_agent(),
-            )
-        mocks["run_agent"].assert_not_called()
+        # First tick flips to resolving_conflict (no awaiting_human park).
+        self.assertIn((61, "resolving_conflict"), gh.label_history)
+        data = gh.pinned_data(61)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertEqual(data.get("conflict_round"), 0)
 
 
 class InReviewSplitWatermarkTest(unittest.TestCase, _PatchedWorkflowMixin):
@@ -5076,27 +5207,39 @@ class GitHubClientClosedIssueSweepLabelTest(unittest.TestCase):
         # Bypass __init__: it would require a real PAT and Github client.
         client = GitHubClient.__new__(GitHubClient)
         client.repo = MagicMock()
-        # First get_issues call (open sweep) returns nothing; second call
-        # (closed sweep) returns nothing too -- we only care about the
-        # arguments PASSED to that second call.
+        # All get_issues calls (open sweep + per-label closed sweeps)
+        # return nothing -- we only care about the call arguments.
         client.repo.get_issues.return_value = iter([])
         in_review_label = MagicMock(name="in_review_label")
-        client.repo.get_label.return_value = in_review_label
+        resolving_label = MagicMock(name="resolving_conflict_label")
+
+        def fake_get_label(name: str):
+            return {
+                "in_review": in_review_label,
+                "resolving_conflict": resolving_label,
+            }[name]
+
+        client.repo.get_label.side_effect = fake_get_label
 
         list(client.list_pollable_issues())
 
-        # The label was looked up by name.
-        client.repo.get_label.assert_called_once_with("in_review")
-        # The closed sweep was invoked with the Label OBJECT, not a string.
-        closed_call = next(
-            (
-                ca for ca in client.repo.get_issues.call_args_list
-                if ca.kwargs.get("state") == "closed"
-            ),
-            None,
-        )
-        self.assertIsNotNone(closed_call, "closed sweep was not invoked")
-        self.assertEqual(closed_call.kwargs["labels"], [in_review_label])
+        # Both labels are looked up by name (one query per label because
+        # the GitHub Issues API treats `labels` as AND, not OR -- a single
+        # query for "either label" is impossible).
+        looked_up = [
+            ca.args[0] for ca in client.repo.get_label.call_args_list
+        ]
+        self.assertIn("in_review", looked_up)
+        self.assertIn("resolving_conflict", looked_up)
+        # The closed sweeps were invoked with Label OBJECTS, not strings.
+        closed_calls = [
+            ca for ca in client.repo.get_issues.call_args_list
+            if ca.kwargs.get("state") == "closed"
+        ]
+        self.assertEqual(len(closed_calls), 2)
+        labels_passed = [ca.kwargs["labels"] for ca in closed_calls]
+        self.assertIn([in_review_label], labels_passed)
+        self.assertIn([resolving_label], labels_passed)
 
     def test_missing_label_skips_closed_sweep_without_raising(self) -> None:
         # If `get_label` raises (under-scoped PAT, label not yet bootstrapped)
@@ -7928,10 +8071,413 @@ class HandleUmbrellaTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertFalse(parent.closed)
 
 
+class EnsurePrWorktreeRestoresFromRemoteBranchTest(unittest.TestCase):
+    """When the local PR branch has been pruned (host restart, manual
+    cleanup, `git branch -D`), `_ensure_pr_worktree` must restore it
+    from `origin/<branch>` -- NOT from `origin/<base>`. Rebuilding from
+    base would silently discard the PR's commits and the conflict
+    resolution would never converge.
+    """
+
+    ISSUE_NUMBER = 300
+    BRANCH = "orchestrator/issue-300"
+
+    def _git_recorder(self, *, local_branch_present: bool):
+        """Return a `_git` stand-in that records every invocation and
+        answers `rev-parse --verify <branch>` per the flag.
+        """
+        from unittest.mock import MagicMock
+
+        calls: list[tuple] = []
+
+        def fake_git(*args, cwd):
+            calls.append((args, cwd))
+            cmd = args[0] if args else ""
+            if cmd == "rev-parse":
+                rc = 0 if local_branch_present else 1
+                return MagicMock(returncode=rc, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        return MagicMock(side_effect=fake_git), calls
+
+    def test_missing_local_branch_restores_from_origin_branch(self) -> None:
+        # The most common bad outcome: someone deletes the local branch.
+        # Without our fix, `_ensure_worktree`'s fallback would create a
+        # NEW branch from `origin/<base>`, discarding all the PR's
+        # commits. Our helper must use `origin/<branch>` instead.
+        from unittest.mock import MagicMock
+
+        git_mock, calls = self._git_recorder(local_branch_present=False)
+
+        wt_path = MagicMock()
+        wt_path.exists.return_value = False  # worktree dir absent too
+
+        with patch.object(workflow, "_git", git_mock), \
+             patch.object(workflow, "_worktree_path", return_value=wt_path), \
+             patch.object(workflow, "_repo_worktrees_root", return_value=MagicMock()):
+            workflow._ensure_pr_worktree(_TEST_SPEC, self.ISSUE_NUMBER)
+
+        # Find the `worktree add` invocation and verify it anchored on
+        # `origin/<branch>`, not `origin/<base>`.
+        worktree_adds = [
+            args for args, _ in calls if args and args[0] == "worktree" and args[1] == "add"
+        ]
+        self.assertTrue(worktree_adds, "expected at least one `worktree add` call")
+        add_args = worktree_adds[0]
+        # Form is: ("worktree", "add", "-b", branch, str(wt), "origin/<branch>")
+        self.assertEqual(add_args[2], "-b")
+        self.assertEqual(add_args[3], self.BRANCH)
+        self.assertEqual(add_args[5], f"origin/{self.BRANCH}")
+        # NOT `origin/<base>` -- that would discard the PR's commits.
+        self.assertNotEqual(add_args[5], f"origin/{_TEST_SPEC.base_branch}")
+
+    def test_present_local_branch_uses_existing_ref(self) -> None:
+        # When the local branch still exists, attach the worktree to it
+        # directly (no -b restoration needed).
+        from unittest.mock import MagicMock
+
+        git_mock, calls = self._git_recorder(local_branch_present=True)
+
+        wt_path = MagicMock()
+        wt_path.exists.return_value = False
+
+        with patch.object(workflow, "_git", git_mock), \
+             patch.object(workflow, "_worktree_path", return_value=wt_path), \
+             patch.object(workflow, "_repo_worktrees_root", return_value=MagicMock()):
+            workflow._ensure_pr_worktree(_TEST_SPEC, self.ISSUE_NUMBER)
+
+        worktree_adds = [
+            args for args, _ in calls if args and args[0] == "worktree" and args[1] == "add"
+        ]
+        self.assertTrue(worktree_adds)
+        add_args = worktree_adds[0]
+        # No `-b` -- attach to the existing local branch as-is.
+        self.assertNotIn("-b", add_args)
+        self.assertEqual(add_args[3], self.BRANCH)
+
+    def test_fetches_run_in_target_root_not_worktree(self) -> None:
+        # All git invocations must run from `spec.target_root`. Running
+        # fetch in the agent-writable worktree under `_git_hardened`
+        # would block credential helpers and break HTTPS auth.
+        from unittest.mock import MagicMock
+
+        git_mock, calls = self._git_recorder(local_branch_present=True)
+
+        wt_path = MagicMock()
+        wt_path.exists.return_value = False
+
+        with patch.object(workflow, "_git", git_mock), \
+             patch.object(workflow, "_worktree_path", return_value=wt_path), \
+             patch.object(workflow, "_repo_worktrees_root", return_value=MagicMock()):
+            workflow._ensure_pr_worktree(_TEST_SPEC, self.ISSUE_NUMBER)
+
+        for args, cwd in calls:
+            self.assertEqual(
+                cwd, _TEST_SPEC.target_root,
+                f"git invocation {args} ran from {cwd}, "
+                f"expected {_TEST_SPEC.target_root}",
+            )
+
+    def test_branch_fetch_uses_explicit_refspec(self) -> None:
+        # Single-branch / narrowed-refspec clones do NOT auto-update
+        # `refs/remotes/origin/<branch>` for a `git fetch origin <branch>`;
+        # they only touch FETCH_HEAD. The fallback `worktree add ...
+        # origin/<branch>` would then fail with "unknown revision". Force
+        # the refspec so the remote-tracking ref is created.
+        from unittest.mock import MagicMock
+
+        git_mock, calls = self._git_recorder(local_branch_present=True)
+
+        wt_path = MagicMock()
+        wt_path.exists.return_value = False
+
+        with patch.object(workflow, "_git", git_mock), \
+             patch.object(workflow, "_worktree_path", return_value=wt_path), \
+             patch.object(workflow, "_repo_worktrees_root", return_value=MagicMock()):
+            workflow._ensure_pr_worktree(_TEST_SPEC, self.ISSUE_NUMBER)
+
+        # Find the per-branch fetch (not the base-branch fetch).
+        branch_fetches = [
+            args for args, _ in calls
+            if args and args[0] == "fetch"
+            and any(self.BRANCH in str(a) for a in args)
+        ]
+        self.assertTrue(branch_fetches, "expected branch fetch")
+        fetch_args = branch_fetches[0]
+        # Refspec form: `+refs/heads/<branch>:refs/remotes/origin/<branch>`
+        refspec = fetch_args[-1]
+        self.assertIn(f"refs/heads/{self.BRANCH}", refspec)
+        self.assertIn(f"refs/remotes/origin/{self.BRANCH}", refspec)
+        self.assertTrue(
+            refspec.startswith("+"),
+            f"refspec {refspec!r} should start with '+' for force-update",
+        )
+
+
+class HandleResolvingConflictUsesAuthedFetchTest(
+    unittest.TestCase, _PatchedWorkflowMixin
+):
+    """The conflict-resolution fetch must run inside the agent-writable
+    worktree under the same security envelope as `_push_branch`: askpass-
+    based auth, detached global/system config, blocked hooks/fsmonitor/
+    credential helpers. `_handle_resolving_conflict` MUST route the
+    fetch through `_authed_fetch` (not plain `_git`) so a planted url
+    rewrite / credential helper / hooksPath cannot exfiltrate the token.
+    """
+
+    def test_fetch_call_targets_authed_fetch_with_explicit_refspec(self) -> None:
+        from unittest.mock import MagicMock
+        gh = FakeGitHubClient()
+        issue = make_issue(450, label="resolving_conflict")
+        gh.add_issue(issue)
+        pr = FakePR(
+            number=850, head_branch="orchestrator/issue-450",
+            head=FakePRRef(sha="cafe1234"),
+            mergeable=False, check_state="success",
+        )
+        gh.add_pr(pr)
+        gh.seed_state(
+            450, pr_number=850, branch="orchestrator/issue-450",
+            dev_agent="claude", dev_session_id="dev-sess",
+            conflict_round=0,
+        )
+
+        merge_mock = MagicMock(return_value=(True, []))
+
+        # The mixin's `_run` itself patches `_authed_fetch` to a default
+        # success mock, so we read the call back from the returned
+        # mocks dict rather than installing our own outer patch (which
+        # `_run`'s inner `with` would override).
+        with patch.object(
+            workflow, "_merge_base_into_worktree", merge_mock,
+        ):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+                head_shas=["sha", "sha"],
+            )
+
+        authed_fetch_mock = mocks["_authed_fetch"]
+        # Two fetches per fresh resolving_conflict round: first for the
+        # PR branch (so the SHA-alignment / unpushed-recovery check sees
+        # current `origin/<branch>`), then for the base branch (so the
+        # upcoming `git merge` sees current `origin/<base>`).
+        self.assertEqual(authed_fetch_mock.call_count, 2)
+        refspecs = [call.args[1] for call in authed_fetch_mock.call_args_list]
+        cwds = [call.kwargs["cwd"] for call in authed_fetch_mock.call_args_list]
+        # All fetches run inside the WORKTREE (agent-writable), where
+        # the hardening actually matters -- not `target_root`.
+        for cwd in cwds:
+            self.assertEqual(cwd, _FAKE_WT)
+        # All refspecs use the explicit `+refs/heads/X:refs/remotes/origin/X`
+        # form so single-branch clones still create the remote-tracking ref.
+        for refspec in refspecs:
+            self.assertTrue(
+                refspec.startswith("+"),
+                f"refspec {refspec!r} should start with '+' for force-update",
+            )
+        # Verify both refs are fetched: the PR branch and the base branch.
+        joined = " ".join(refspecs)
+        self.assertIn(
+            f"refs/remotes/origin/{_TEST_SPEC.base_branch}", joined,
+            "expected base-branch fetch refspec",
+        )
+        self.assertIn(
+            f"refs/remotes/origin/orchestrator/issue-450", joined,
+            "expected PR-branch fetch refspec",
+        )
+
+
+class GitHardenedInjectsIdentityTest(unittest.TestCase):
+    """`_git_hardened` strips global/system git config (where `user.name`
+    / `user.email` typically live), so without explicit `GIT_AUTHOR_*` /
+    `GIT_COMMITTER_*` env vars a `git merge --no-edit` that needs to
+    create a merge commit fails with "Committer identity unknown" and
+    parks the issue as a non-conflict failure rather than resolving.
+    """
+
+    def test_env_includes_committer_and_author_identity(self) -> None:
+        from unittest.mock import patch as mock_patch
+
+        captured: dict[str, dict] = {}
+
+        def fake_run(args, *, cwd, capture_output, text, env):
+            captured["env"] = env
+            from unittest.mock import MagicMock
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock_patch("subprocess.run", side_effect=fake_run):
+            workflow._git_hardened("merge", "--no-edit", "x", cwd=Path("/tmp"))
+
+        env = captured["env"]
+        self.assertEqual(env.get("GIT_AUTHOR_NAME"), config.AGENT_GIT_NAME)
+        self.assertEqual(env.get("GIT_AUTHOR_EMAIL"), config.AGENT_GIT_EMAIL)
+        self.assertEqual(env.get("GIT_COMMITTER_NAME"), config.AGENT_GIT_NAME)
+        self.assertEqual(env.get("GIT_COMMITTER_EMAIL"), config.AGENT_GIT_EMAIL)
+        # Hardening still applied: global/system config blocked.
+        self.assertEqual(env.get("GIT_CONFIG_GLOBAL"), os.devnull)
+        self.assertEqual(env.get("GIT_CONFIG_SYSTEM"), os.devnull)
+
+
+class AuthedFetchHardeningTest(unittest.TestCase):
+    """`_authed_fetch` is the in-worktree authenticated fetch helper used
+    by `_handle_resolving_conflict`. Mirrors `_push_branch`'s security
+    envelope: askpass-based auth, detached global/system config, blocked
+    hooks/fsmonitor/credential helpers, refusal to run when the worktree
+    carries url-rewrite rules.
+    """
+
+    def test_env_includes_askpass_token_and_blocks_inherited_config(self) -> None:
+        from unittest.mock import patch as mock_patch, MagicMock
+
+        # First subprocess.run call is the rewrite-rule probe (returncode=1
+        # = no rewrite rules); second is the real fetch -- capture its env.
+        captured: dict[str, dict] = {}
+
+        rewrite_check = MagicMock(returncode=1, stdout="", stderr="")
+        fetch_result = MagicMock(returncode=0, stdout="", stderr="")
+
+        def fake_run(args, **kwargs):
+            if args and args[:3] == ["git", "config", "--local"]:
+                return rewrite_check
+            captured["args"] = args
+            captured["env"] = kwargs.get("env")
+            captured["cwd"] = kwargs.get("cwd")
+            return fetch_result
+
+        with mock_patch("subprocess.run", side_effect=fake_run), \
+             mock_patch.object(config, "GITHUB_TOKEN", "fake-token-xyz"):
+            workflow._authed_fetch(
+                _TEST_SPEC,
+                f"+refs/heads/main:refs/remotes/origin/main",
+                cwd=Path("/tmp"),
+            )
+
+        env = captured["env"]
+        # askpass wires the token via env, NOT argv.
+        self.assertIn("GIT_ASKPASS", env)
+        self.assertEqual(env.get("GIT_TOKEN"), "fake-token-xyz")
+        # Token must NOT appear in argv.
+        for arg in captured["args"]:
+            self.assertNotIn("fake-token-xyz", str(arg))
+        # Global/system config detached so url rewrites planted there
+        # cannot redirect the fetch to an attacker-controlled host.
+        self.assertEqual(env.get("GIT_CONFIG_GLOBAL"), os.devnull)
+        self.assertEqual(env.get("GIT_CONFIG_SYSTEM"), os.devnull)
+        # Hooks / fsmonitor / credential helpers blocked via -c overrides.
+        argv = captured["args"]
+        self.assertIn("core.hooksPath=/dev/null", argv)
+        self.assertIn("credential.helper=", argv)
+        self.assertIn("core.fsmonitor=", argv)
+        # Auth URL carries only the username, not the token.
+        self.assertTrue(
+            any(
+                isinstance(a, str)
+                and a.startswith("https://x-access-token@github.com/")
+                for a in argv
+            ),
+            f"expected x-access-token auth URL in argv, got {argv!r}",
+        )
+
+    def test_refuses_when_worktree_has_url_rewrite_rule(self) -> None:
+        from unittest.mock import patch as mock_patch, MagicMock
+
+        # Rewrite-rule probe returns a hit; the real fetch must NOT run.
+        rewrite_check = MagicMock(
+            returncode=0,
+            stdout="url.https://evil.example/.insteadof https://github.com/\n",
+            stderr="",
+        )
+        fetch_result = MagicMock(returncode=0, stdout="", stderr="")
+        runs: list = []
+
+        def fake_run(args, **kwargs):
+            runs.append(args)
+            if args and args[:3] == ["git", "config", "--local"]:
+                return rewrite_check
+            return fetch_result
+
+        with mock_patch("subprocess.run", side_effect=fake_run), \
+             mock_patch.object(config, "GITHUB_TOKEN", "fake-token-xyz"):
+            r = workflow._authed_fetch(
+                _TEST_SPEC,
+                f"+refs/heads/main:refs/remotes/origin/main",
+                cwd=Path("/tmp"),
+            )
+
+        # Only the rewrite probe ran -- the fetch was refused.
+        self.assertEqual(len(runs), 1)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_no_token_returns_failure_without_subprocess(self) -> None:
+        from unittest.mock import patch as mock_patch, MagicMock
+
+        runs: list = []
+
+        def fake_run(args, **kwargs):
+            runs.append(args)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock_patch("subprocess.run", side_effect=fake_run), \
+             mock_patch.object(config, "GITHUB_TOKEN", ""):
+            r = workflow._authed_fetch(
+                _TEST_SPEC, "refs/heads/main:refs/remotes/origin/main",
+                cwd=Path("/tmp"),
+            )
+
+        # No subprocess at all when the token is missing.
+        self.assertEqual(runs, [])
+        self.assertNotEqual(r.returncode, 0)
+
+
+class ListPollableIssuesIncludesResolvingConflictTest(unittest.TestCase):
+    """An external merge can land while the orchestrator is mid-resolution:
+    `Resolves #N` closes the issue, but the orchestrator must still poll
+    closed-but-`resolving_conflict` issues so `_handle_resolving_conflict`'s
+    terminal `pr_status == "merged"` branch can finalize to `done`.
+    """
+
+    def test_closed_resolving_conflict_issue_is_polled(self) -> None:
+        gh = FakeGitHubClient()
+        # Close an issue still labeled `resolving_conflict` (mirrors
+        # GitHub auto-closing via `Resolves #N` after a human merge).
+        issue = make_issue(900, label="resolving_conflict")
+        issue.closed = True
+        gh.add_issue(issue)
+
+        polled = list(gh.list_pollable_issues())
+        self.assertIn(issue, polled)
+
+    def test_closed_in_review_issue_still_polled(self) -> None:
+        # Regression: extending the sweep must NOT drop the existing
+        # closed-in_review path.
+        gh = FakeGitHubClient()
+        issue = make_issue(901, label="in_review")
+        issue.closed = True
+        gh.add_issue(issue)
+
+        polled = list(gh.list_pollable_issues())
+        self.assertIn(issue, polled)
+
+    def test_closed_unrelated_label_is_not_polled(self) -> None:
+        # Closed issues with neither `in_review` nor `resolving_conflict`
+        # must stay out of the sweep so it does not balloon.
+        gh = FakeGitHubClient()
+        issue = make_issue(902, label="done")
+        issue.closed = True
+        gh.add_issue(issue)
+
+        polled = list(gh.list_pollable_issues())
+        self.assertNotIn(issue, polled)
+
+
 class HandleResolvingConflictDispatchTest(unittest.TestCase):
-    """The `resolving_conflict` label is a placeholder slot for a follow-up
-    child to fill in. For now the dispatcher just needs to route to the
-    no-op handler instead of warning "not implemented yet"."""
+    """The dispatcher must route `resolving_conflict` to the dedicated
+    handler -- this is a label-rollout regression check that survives
+    the placeholder being replaced by the real implementation."""
 
     def test_dispatcher_routes_resolving_conflict_to_handler(self) -> None:
         gh = FakeGitHubClient()
@@ -7945,18 +8491,621 @@ class HandleResolvingConflictDispatchTest(unittest.TestCase):
 
         handler.assert_called_once_with(gh, _TEST_SPEC, issue)
 
-    def test_handler_is_a_quiet_noop(self) -> None:
+
+class HandleResolvingConflictTest(
+    unittest.TestCase, _PatchedWorkflowMixin
+):
+    """Drive `_handle_resolving_conflict` through the merge / push / cap /
+    PR-state branches with `_git`, `_merge_base_into_worktree`, and the
+    push helper mocked so no shell-out happens.
+    """
+
+    BRANCH = "orchestrator/issue-200"
+    PR_NUMBER = 800
+
+    def _seed(
+        self,
+        *,
+        merge_succeeded: bool = True,
+        conflicted_files=(),
+        head_shas=("before", "after"),
+        push_branch: bool = True,
+        run_agent_result=None,
+        pr_state: str = "open",
+        pr_merged: bool = False,
+        extra_state=None,
+    ):
         gh = FakeGitHubClient()
-        issue = make_issue(43, label="resolving_conflict")
+        issue = make_issue(200, label="resolving_conflict")
         gh.add_issue(issue)
+        pr = FakePR(
+            number=self.PR_NUMBER, head_branch=self.BRANCH,
+            head=FakePRRef(sha="cafe1234"),
+            mergeable=False, check_state="success",
+            merged=pr_merged, state=pr_state,
+        )
+        gh.add_pr(pr)
+        state = dict(
+            pr_number=self.PR_NUMBER, branch=self.BRANCH,
+            dev_agent="claude", dev_session_id="dev-sess",
+            review_round=2,
+            conflict_round=0,
+        )
+        if extra_state:
+            state.update(extra_state)
+        gh.seed_state(200, **state)
+        return gh, issue, pr
 
-        workflow._handle_resolving_conflict(gh, _TEST_SPEC, issue)
+    def _run_with_merge(
+        self,
+        gh,
+        issue,
+        *,
+        merge_succeeded: bool,
+        conflicted_files=(),
+        head_shas=("before", "after"),
+        push_branch: bool = True,
+        run_agent_result=None,
+        fetch_returncode: int = 0,
+        dirty_files=(),
+    ):
+        from unittest.mock import MagicMock
 
-        # No comments, no label changes, no pinned-state writes -- the
-        # placeholder must not perturb the issue at all.
-        self.assertEqual(gh.posted_comments, [])
+        agent = run_agent_result or _agent(
+            session_id="dev-sess", last_message="resolved",
+        )
+        merge_mock = MagicMock(
+            return_value=(merge_succeeded, list(conflicted_files))
+        )
+        fetch_result = MagicMock(returncode=fetch_returncode, stdout="", stderr="")
+        # `_git_hardened` is what the fetch in `_handle_resolving_conflict`
+        # actually calls; `_git` covers the diff helper inside the merge
+        # wrapper. Both must be mocked or the real subprocess.run() fires
+        # on `_FAKE_WT`.
+        git_mock = MagicMock(return_value=fetch_result)
+        git_hardened_mock = MagicMock(return_value=fetch_result)
+        with patch.object(
+            workflow, "_merge_base_into_worktree", merge_mock
+        ), patch.object(workflow, "_git", git_mock), patch.object(
+            workflow, "_git_hardened", git_hardened_mock,
+        ):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=agent,
+                push_branch=push_branch,
+                head_shas=head_shas,
+                dirty_files=dirty_files,
+            )
+        return mocks, merge_mock, git_mock
+
+    def test_clean_merge_pushes_and_flips_to_validating(self) -> None:
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=True,
+            head_shas=["beforehead", "merged"],
+            push_branch=True,
+        )
+        # Agent must NOT be spawned -- a clean base-merge does not need
+        # the dev to do anything.
+        mocks["run_agent"].assert_not_called()
+        merge_mock.assert_called_once()
+        mocks["_push_branch"].assert_called_once()
+        self.assertIn((200, "validating"), gh.label_history)
+        data = gh.pinned_data(200)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertEqual(data.get("conflict_round"), 1)
+        self.assertIn("last_conflict_resolved_at", data)
+
+    def test_clean_merge_already_up_to_date_skips_push_and_ticks_round(
+        self,
+    ) -> None:
+        # When the base hasn't moved (e.g. unmergeability is purely due to
+        # branch protection), the merge is a no-op and there is nothing to
+        # push. The handler must still increment `conflict_round` so the
+        # cap eventually fires -- otherwise the in_review <-> resolving
+        # cycle would loop forever.
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=True,
+            head_shas=["samehead", "samehead"],
+            push_branch=True,
+        )
+        mocks["run_agent"].assert_not_called()
+        # Nothing to push when base hasn't moved relative to the branch.
+        mocks["_push_branch"].assert_not_called()
+        self.assertIn((200, "validating"), gh.label_history)
+        data = gh.pinned_data(200)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertEqual(data.get("conflict_round"), 1)
+
+    def test_no_op_merge_loops_until_cap_fires(self) -> None:
+        # A PR stuck unmergeable purely due to branch protection would
+        # bounce between in_review and resolving_conflict with the merge
+        # always a no-op. The cap must fire after MAX_CONFLICT_ROUNDS
+        # such no-op rounds.
+        gh, issue, pr = self._seed(extra_state={"conflict_round": 2})
+        with patch.object(config, "MAX_CONFLICT_ROUNDS", 3):
+            mocks, merge_mock, git_mock = self._run_with_merge(
+                gh, issue,
+                merge_succeeded=True,
+                head_shas=["samehead", "samehead"],
+                push_branch=True,
+            )
+        # One more no-op round consumed: 2 -> 3.
+        self.assertEqual(gh.pinned_data(200).get("conflict_round"), 3)
+        # On the next tick we'd be at the cap; simulate by re-running:
+        with patch.object(config, "MAX_CONFLICT_ROUNDS", 3):
+            mocks2, merge_mock2, _ = self._run_with_merge(
+                gh, issue,
+                merge_succeeded=True,
+                head_shas=["samehead", "samehead"],
+                push_branch=True,
+            )
+        merge_mock2.assert_not_called()
+        self.assertTrue(gh.pinned_data(200).get("awaiting_human"))
+
+    def test_conflict_resolved_by_agent_pushes_and_flips_to_validating(
+        self,
+    ) -> None:
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=False,
+            conflicted_files=["a.py", "b.py"],
+            head_shas=["beforehead", "merged"],
+            push_branch=True,
+        )
+        # Agent IS spawned with the conflict-resolution prompt.
+        self.assertEqual(mocks["run_agent"].call_count, 1)
+        prompt = mocks["run_agent"].call_args.args[1]
+        self.assertIn("a.py", prompt)
+        self.assertIn("b.py", prompt)
+        self.assertIn("merge", prompt.lower())
+        mocks["_push_branch"].assert_called_once()
+        self.assertIn((200, "validating"), gh.label_history)
+        data = gh.pinned_data(200)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertEqual(data.get("conflict_round"), 1)
+        self.assertIn("last_conflict_resolved_at", data)
+
+    def test_cap_exhausted_parks_awaiting_human(self) -> None:
+        # `MAX_CONFLICT_ROUNDS` defaults to 3; once the counter reaches it,
+        # the handler must park instead of attempting another round.
+        gh, issue, pr = self._seed(extra_state={"conflict_round": 3})
+        with patch.object(config, "MAX_CONFLICT_ROUNDS", 3):
+            mocks, merge_mock, git_mock = self._run_with_merge(
+                gh, issue, merge_succeeded=True,
+            )
+        # Neither merge nor agent runs on the cap branch.
+        merge_mock.assert_not_called()
+        mocks["run_agent"].assert_not_called()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        # Label stays on `resolving_conflict` -- no flip.
+        self.assertNotIn((200, "validating"), gh.label_history)
+        self.assertNotIn((200, "done"), gh.label_history)
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("MAX_CONFLICT_ROUNDS", last_comment)
+
+    def test_pr_already_merged_externally_finalizes_to_done(self) -> None:
+        # Mirror the in_review terminal: a human merged the PR (perhaps
+        # after manually resolving conflicts) while we were resolving.
+        gh, issue, pr = self._seed(pr_merged=True, pr_state="closed")
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue, merge_succeeded=True,
+        )
+        # No merge / agent / push attempt -- terminal short-circuit.
+        merge_mock.assert_not_called()
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        self.assertIn((200, "done"), gh.label_history)
+        self.assertIn("merged_at", gh.pinned_data(200))
+        self.assertTrue(issue.closed)
+
+    def test_pr_closed_unmerged_finalizes_to_rejected(self) -> None:
+        gh, issue, pr = self._seed(pr_state="closed")
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue, merge_succeeded=True,
+        )
+        merge_mock.assert_not_called()
+        mocks["run_agent"].assert_not_called()
+        self.assertIn((200, "rejected"), gh.label_history)
+        self.assertIn("closed_without_merge_at", gh.pinned_data(200))
+
+    def test_agent_timeout_parks_awaiting_human(self) -> None:
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=False,
+            conflicted_files=["a.py"],
+            head_shas=["beforehead", "after"],
+            run_agent_result=_agent(
+                session_id="dev-sess", last_message="", timed_out=True,
+            ),
+        )
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        # Label stays on resolving_conflict -- the dispatcher will keep
+        # routing here until the operator clears the park.
+        self.assertNotIn((200, "validating"), gh.label_history)
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("timed out", last_comment)
+
+    def test_agent_left_dirty_worktree_parks_awaiting_human(self) -> None:
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(False, ["a.py"]))
+        git_mock = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="", stderr="")
+        )
+        # Note: the mixin's `_run` patches `_worktree_dirty_files` itself,
+        # so wire dirty_files through the kwarg rather than a separate
+        # outer patch (which `_run`'s patch would override).
+        with patch.object(
+            workflow, "_merge_base_into_worktree", merge_mock
+        ), patch.object(workflow, "_git", git_mock), patch.object(
+            workflow, "_git_hardened", git_mock,
+        ):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="halfway there",
+                ),
+                push_branch=True,
+                head_shas=["beforehead", "after"],
+                dirty_files=["a.py"],
+            )
+
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((200, "validating"), gh.label_history)
+
+    def test_push_failure_parks_awaiting_human(self) -> None:
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, git_mock = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=False,
+            conflicted_files=["a.py"],
+            head_shas=["beforehead", "merged"],
+            push_branch=False,
+        )
+        # Agent ran successfully and committed, but the push failed.
+        self.assertEqual(mocks["run_agent"].call_count, 1)
+        mocks["_push_branch"].assert_called_once()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        # No label flip -- still resolving_conflict.
+        self.assertNotIn((200, "validating"), gh.label_history)
+
+    def test_awaiting_human_no_new_comments_is_quiet(self) -> None:
+        # Once parked, ticks without a new human reply must not retry --
+        # otherwise the cap is meaningless and a poisoned merge would
+        # burn tokens. The parked state stays put.
+        gh, issue, pr = self._seed(
+            extra_state={
+                "awaiting_human": True,
+                "conflict_round": 1,
+                # Watermark above any comment so `comments_after` is empty.
+                "last_action_comment_id": 999_999,
+            },
+        )
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+        git_mock = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="", stderr="")
+        )
+        with patch.object(
+            workflow, "_merge_base_into_worktree", merge_mock
+        ), patch.object(workflow, "_git", git_mock), patch.object(
+            workflow, "_git_hardened", git_mock,
+        ):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+        merge_mock.assert_not_called()
+        mocks["run_agent"].assert_not_called()
         self.assertEqual(gh.label_history, [])
-        self.assertEqual(gh.write_state_calls, 0)
+
+    def test_awaiting_human_with_new_comment_resumes_dev(self) -> None:
+        # `_on_question` / `_on_dirty_worktree` parks tell the human
+        # "reply with guidance and the orchestrator will resume the
+        # session". Honor that contract: a fresh comment past the
+        # watermark must resume the dev on the in-progress merge
+        # worktree, NOT keep the issue stuck until a manual relabel.
+        gh, issue, pr = self._seed(
+            extra_state={
+                "awaiting_human": True,
+                "conflict_round": 1,
+                "last_action_comment_id": 1000,
+            },
+        )
+        # Fresh comment above the watermark.
+        issue.comments.append(
+            FakeComment(
+                id=2000, body="try harder; conflict in foo.py is structural",
+                user=FakeUser("alice"),
+            )
+        )
+
+        mocks, merge_mock, _ = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=True,  # unused on resume path
+            head_shas=["beforehead", "merged"],
+            push_branch=True,
+        )
+
+        # Resume runs the agent with the human's text; merge is NOT
+        # re-attempted (the worktree is mid-merge already).
+        mocks["run_agent"].assert_called_once()
+        prompt = mocks["run_agent"].call_args.args[1]
+        self.assertIn("try harder", prompt)
+        merge_mock.assert_not_called()
+        # Successful resume pushes the branch and flips to validating.
+        mocks["_push_branch"].assert_called_once()
+        data = gh.pinned_data(200)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertEqual(data.get("conflict_round"), 2)
+        self.assertIn((200, "validating"), gh.label_history)
+        # Watermark advanced past the consumed comment.
+        self.assertEqual(data.get("last_action_comment_id"), 2000)
+
+    def test_awaiting_human_resume_with_question_parks_again(self) -> None:
+        # Resumed agent that produces no new commit (asks another
+        # question) must re-park rather than push or flip the label.
+        gh, issue, pr = self._seed(
+            extra_state={
+                "awaiting_human": True,
+                "conflict_round": 1,
+                "last_action_comment_id": 1000,
+            },
+        )
+        issue.comments.append(
+            FakeComment(
+                id=2000, body="try harder",
+                user=FakeUser("alice"),
+            )
+        )
+
+        mocks, merge_mock, _ = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=True,
+            # Same SHA before and after -- agent did nothing.
+            head_shas=["samehead", "samehead"],
+            push_branch=True,
+            run_agent_result=_agent(
+                session_id="dev-sess",
+                last_message="I still need clarification on bar.py",
+            ),
+        )
+
+        mocks["run_agent"].assert_called_once()
+        merge_mock.assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(200)
+        # Re-parked: counter unchanged, no label flip.
+        self.assertEqual(data.get("conflict_round"), 1)
+        self.assertNotIn((200, "validating"), gh.label_history)
+        self.assertTrue(data.get("awaiting_human"))
+
+    def test_no_pr_number_parks(self) -> None:
+        gh = FakeGitHubClient()
+        issue = make_issue(201, label="resolving_conflict")
+        gh.add_issue(issue)
+        gh.seed_state(201)
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+        git_mock = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="", stderr="")
+        )
+        with patch.object(
+            workflow, "_merge_base_into_worktree", merge_mock,
+        ), patch.object(workflow, "_git", git_mock), patch.object(
+            workflow, "_git_hardened", git_mock,
+        ):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+        merge_mock.assert_not_called()
+        mocks["run_agent"].assert_not_called()
+        self.assertTrue(gh.pinned_data(201).get("awaiting_human"))
+
+    def test_unpushed_local_commits_pushed_on_recovery(self) -> None:
+        # Crash recovery: a previous tick committed a conflict resolution
+        # but crashed before `_push_branch` returned (or before the post-
+        # push state write landed). The next tick must push the local
+        # commit and complete the round, NOT treat it as "no work needed"
+        # and flip to validating with the resolution unpushed.
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+
+        with patch.object(workflow, "_merge_base_into_worktree", merge_mock):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+                # HEAD ahead of `origin/<branch>` by one commit (the
+                # unpushed resolution); not behind.
+                branch_ahead_behind=(1, 0),
+            )
+        # Recovered work pushed; merge NOT attempted (we already have a
+        # resolution waiting to ship).
+        mocks["_push_branch"].assert_called_once()
+        merge_mock.assert_not_called()
+        # No agent spawn -- the recovery is a pure push, the dev already
+        # produced the commit on the previous tick.
+        mocks["run_agent"].assert_not_called()
+        # Round completed: counter incremented, label flipped, marker
+        # stamped exactly as on the happy-path resolve.
+        data = gh.pinned_data(200)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertEqual(data.get("conflict_round"), 1)
+        self.assertIn("last_conflict_resolved_at", data)
+        self.assertIn((200, "validating"), gh.label_history)
+
+    def test_stale_worktree_parks_awaiting_human(self) -> None:
+        # Worktree behind `origin/<branch>` (someone pushed to the PR
+        # branch out-of-band). Force-pushing the local state would
+        # clobber the real PR head; refuse and park.
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+
+        with patch.object(workflow, "_merge_base_into_worktree", merge_mock):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+                branch_ahead_behind=(0, 2),
+            )
+        merge_mock.assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        mocks["run_agent"].assert_not_called()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((200, "validating"), gh.label_history)
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("stale or diverged", last_comment)
+
+    def test_diverged_worktree_parks_awaiting_human(self) -> None:
+        # Both ahead and behind: histories diverged. Cannot safely push
+        # without rewriting remote history that may have value.
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+
+        with patch.object(workflow, "_merge_base_into_worktree", merge_mock):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+                branch_ahead_behind=(1, 1),
+            )
+        merge_mock.assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((200, "validating"), gh.label_history)
+
+    def test_unpushed_recovery_push_failure_parks(self) -> None:
+        # Recovery push fails (e.g. force-with-lease lease miss because
+        # the remote actually moved). Park rather than silently flipping
+        # to validating with an unsynced local SHA.
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+
+        with patch.object(workflow, "_merge_base_into_worktree", merge_mock):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=False,
+                branch_ahead_behind=(1, 0),
+            )
+        mocks["_push_branch"].assert_called_once()
+        merge_mock.assert_not_called()
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((200, "validating"), gh.label_history)
+
+    def test_dirty_recovered_commits_parks_without_push(self) -> None:
+        # Crash recovery with leftover dirty files: a previous tick
+        # committed a resolution but ALSO left uncommitted edits, then
+        # crashed before the dirty check ran. Pushing now would publish
+        # a SHA that silently omits the leftover edits, and the reviewer
+        # at validating would later run on a tree that does not match
+        # the PR. Park instead.
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        merge_mock = MagicMock(return_value=(True, []))
+
+        with patch.object(workflow, "_merge_base_into_worktree", merge_mock):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+                branch_ahead_behind=(1, 0),
+                dirty_files=["leftover.py"],
+            )
+        # No push, no merge attempt, no label flip.
+        mocks["_push_branch"].assert_not_called()
+        merge_mock.assert_not_called()
+        self.assertNotIn((200, "validating"), gh.label_history)
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+        last_comment = gh.posted_comments[-1][1]
+        self.assertIn("uncommitted", last_comment)
+
+    def test_dirty_clean_merge_with_new_commit_parks_without_push(self) -> None:
+        # Clean merge produced a merge commit (HEAD changed) but the
+        # worktree carries pre-existing dirty files. Pushing the merge
+        # commit without those edits would publish an incomplete branch.
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, _ = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=True,
+            head_shas=["beforehead", "merged"],
+            push_branch=True,
+            dirty_files=["leftover.py"],
+        )
+        mocks["_push_branch"].assert_not_called()
+        self.assertNotIn((200, "validating"), gh.label_history)
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+
+    def test_dirty_clean_merge_no_op_parks_without_flip(self) -> None:
+        # Clean no-op merge (HEAD didn't change because base hadn't
+        # moved) but the worktree carries dirty files. The reviewer
+        # at validating reads the worktree directly, so flipping with a
+        # dirty tree would let the agent vote on something that does NOT
+        # match the PR head. Park instead.
+        gh, issue, pr = self._seed()
+        mocks, merge_mock, _ = self._run_with_merge(
+            gh, issue,
+            merge_succeeded=True,
+            head_shas=["samehead", "samehead"],
+            push_branch=True,
+            dirty_files=["leftover.py"],
+        )
+        mocks["_push_branch"].assert_not_called()
+        self.assertNotIn((200, "validating"), gh.label_history)
+        data = gh.pinned_data(200)
+        self.assertTrue(data.get("awaiting_human"))
+
+
 
 
 class CreateChildIssueAlwaysUsesParentRepoTest(unittest.TestCase):

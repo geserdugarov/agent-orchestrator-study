@@ -328,5 +328,32 @@ class AllowedIssueAuthorsConfigTest(unittest.TestCase):
         )
 
 
+class MaxConflictRoundsConfigTest(unittest.TestCase):
+    """`MAX_CONFLICT_ROUNDS` parses identically to `MAX_REVIEW_ROUNDS`:
+    integer, defaults to 3, env override wins.
+    """
+
+    def _load_config(self, env: dict[str, str] | None = None):
+        full_env = {
+            "ORCHESTRATOR_SKIP_DOTENV": "1",
+            "ORCHESTRATOR_TOKEN_FILE": "/tmp/agent-orchestrator-token-missing",
+        }
+        if env:
+            full_env.update(env)
+        with patch.dict(os.environ, full_env, clear=True):
+            sys.modules.pop("orchestrator.config", None)
+            import orchestrator.config as config
+
+            return config
+
+    def test_default_is_three(self) -> None:
+        config = self._load_config()
+        self.assertEqual(config.MAX_CONFLICT_ROUNDS, 3)
+
+    def test_env_override(self) -> None:
+        config = self._load_config({"MAX_CONFLICT_ROUNDS": "7"})
+        self.assertEqual(config.MAX_CONFLICT_ROUNDS, 7)
+
+
 if __name__ == "__main__":
     unittest.main()
