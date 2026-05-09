@@ -3,4 +3,6 @@ name = "agent-orchestrator"
 version = "0.0.1"
 description = "GitHub-Issue-driven AI agent workflow."
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = ["PyGithub>=2.1"]
