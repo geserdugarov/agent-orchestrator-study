@@ -173,6 +173,28 @@ class RunCodexEnvScrubTest(unittest.TestCase):
         self.assertEqual(passed_env.get("ANTHROPIC_API_KEY"), "sk-keep-me")
 
 
+class RunCodexCwdTest(unittest.TestCase):
+    def test_dash_C_receives_absolute_path_for_relative_cwd(self) -> None:
+        # codex applies `-C` AFTER it has already chdir'd into the subprocess
+        # cwd, so a relative path resolves twice and codex hits "No such file
+        # or directory (os error 2)". Pinning this guarantees the path passed
+        # to `-C` is absolute even when WORKTREES_DIR (and the worktree path
+        # derived from it) is relative.
+        rel_cwd = Path("../wt-orchestrator/foo/issue-1")
+        with patch(
+            "orchestrator.agents.subprocess.Popen",
+            return_value=_completed(),
+        ) as run_mock:
+            _run_codex("p", rel_cwd)
+        argv = run_mock.call_args.args[0]
+        c_value = argv[argv.index("-C") + 1]
+        self.assertTrue(
+            Path(c_value).is_absolute(),
+            f"-C path should be absolute, got {c_value!r}",
+        )
+        self.assertEqual(Path(c_value), rel_cwd.resolve())
+
+
 class RunClaudeResumeTest(unittest.TestCase):
     def test_resume_passes_resume_session_id_arg(self) -> None:
         sid = "deadbeef-1234-1234-1234-1234deadbeef"

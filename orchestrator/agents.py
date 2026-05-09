@@ -184,6 +184,12 @@ def _run_codex(
     fd, last_msg_path_str = tempfile.mkstemp(prefix="codex-last-", suffix=".txt")
     os.close(fd)
     last_msg_path = Path(last_msg_path_str)
+    # codex applies `-C` AFTER it has already chdir'd into the subprocess cwd,
+    # so a relative path resolves twice (once by Popen, once by codex) and
+    # codex hits "No such file or directory (os error 2)". Pass an absolute
+    # path so the second resolution is a no-op. WORKTREES_DIR=../wt-...
+    # in .env is the common shape that triggers this.
+    cwd_abs = Path(cwd).resolve()
     try:
         # `codex exec resume` does not accept -C; we rely on subprocess cwd for it.
         common = [
@@ -194,7 +200,7 @@ def _run_codex(
         if resume_session_id:
             cmd = [config.CODEX_BIN, "exec", "resume", *common, resume_session_id, prompt]
         else:
-            cmd = [config.CODEX_BIN, "exec", "-C", str(cwd), *common, prompt]
+            cmd = [config.CODEX_BIN, "exec", "-C", str(cwd_abs), *common, prompt]
 
         env = _agent_env(extra_env)
         log.info(
