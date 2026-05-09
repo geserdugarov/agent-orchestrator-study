@@ -1,3 +1,5 @@
+# Copyright 2026 Geser Dugarov
+# SPDX-License-Identifier: Apache-2.0
 """Spawn a local coding-agent CLI (codex or claude) as a subprocess.
 
 Both backends emit JSONL events on stdout. We don't pin their event-shape

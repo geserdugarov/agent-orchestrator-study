@@ -1,3 +1,5 @@
+# Copyright 2026 Geser Dugarov
+# SPDX-License-Identifier: Apache-2.0
 """Polling-loop entry point.
 
 Run with `python -m orchestrator.main` (or `--once` for a single tick).

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Geser Dugarov
+# SPDX-License-Identifier: Apache-2.0
 # Self-restarting orchestrator wrapper. Exits cleanly when the orchestrator
 # detects a self-modifying merge so the new code is picked up on next loop.
 set -uo pipefail
