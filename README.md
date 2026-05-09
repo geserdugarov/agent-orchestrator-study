@@ -148,3 +148,7 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 ## Current scope
 
 The orchestrator currently drives (no label) → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `done`/`rejected`, with configurable dev/review/decompose backend splits, a per-issue retry budget (`MAX_RETRIES_PER_DAY`), a review/fix loop capped by `MAX_REVIEW_ROUNDS`, and a debounced PR-comment-resume loop in `in_review`. The decomposer asks the agent for a fenced `orchestrator-manifest` JSON block; on `decision=single` the parent flips straight to `ready`, on `decision=split` it creates child issues, persists the dep graph, and parks on `blocked` until `_handle_blocked` walks the children. Auto-merge on approve+green-CI is gated by `AUTO_MERGE` (default `off`); enable it once dogfooded. The decomposer can be disabled with `DECOMPOSE=off`, which reverts to the legacy direct-to-`implementing` pickup; the same flag also routes any issue already labeled `decomposing` (e.g. parked there awaiting a human) to `implementing` on the next tick, so the kill switch applies to in-flight issues, not just new ones. See [`plans/roadmap.md`](plans/roadmap.md).
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the full text.
