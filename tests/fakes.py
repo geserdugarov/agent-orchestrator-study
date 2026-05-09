@@ -1,3 +1,5 @@
+# Copyright 2026 Geser Dugarov
+# SPDX-License-Identifier: Apache-2.0
 """Minimal in-memory fakes for the orchestrator's GitHub surface.
 
 Only the methods workflow.py actually calls are implemented. State lives in

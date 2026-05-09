@@ -1,3 +1,5 @@
+# Copyright 2026 Geser Dugarov
+# SPDX-License-Identifier: Apache-2.0
 """Configuration loaded from .env / process environment.
 
 Secrets are deliberately NOT loaded from REPO_ROOT/.env. The implementer agent

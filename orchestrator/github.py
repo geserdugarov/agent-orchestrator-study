@@ -1,3 +1,5 @@
+# Copyright 2026 Geser Dugarov
+# SPDX-License-Identifier: Apache-2.0
 """Thin GitHub client built on PyGithub.
 
 Per-issue state is stored in a single 'pinned' comment whose body matches
