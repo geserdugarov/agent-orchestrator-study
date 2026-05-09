@@ -1189,6 +1189,53 @@ class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertIn("reviewer timed out", last_comment)
         self.assertNotIn((5, "in_review"), gh.label_history)
 
+    def test_reviewer_silent_crash_parks_with_reviewer_failed_reason(self) -> None:
+        # The reviewer agent crashed (e.g. codex returned `Error: No such
+        # file or directory (os error 2)`): empty last_message + non-zero
+        # exit code. Tag the park as `reviewer_failed` so the next tick's
+        # transient-recovery branch re-spawns the reviewer silently
+        # without needing a human comment.
+        gh, issue = self._seeded()
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=_agent(last_message="", stderr="boom", exit_code=2),
+        )
+
+        data = gh.pinned_data(5)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "reviewer_failed")
+
+    def test_reviewer_unknown_verdict_with_text_does_not_tag_failed(self) -> None:
+        # When the reviewer DID emit text but no VERDICT line, the park
+        # is real adjudication and must NOT be silently retried -- a
+        # human needs to read the message. Park reason stays cleared.
+        gh, issue = self._seeded()
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=_agent(
+                last_message="not sure what to think", exit_code=0,
+            ),
+        )
+
+        data = gh.pinned_data(5)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+
+    def test_reviewer_empty_message_with_zero_exit_does_not_tag_failed(self) -> None:
+        # Defensive: empty last_message but exit_code == 0 is not a
+        # crash -- the agent reported success without producing output.
+        # Don't tag transient; a clean exit with no text needs human
+        # adjudication, not a silent retry that would loop the same way.
+        gh, issue = self._seeded()
+        self._run(
+            lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+            run_agent=_agent(last_message="", stderr="", exit_code=0),
+        )
+
+        data = gh.pinned_data(5)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+
 
 class HandleValidatingFixLoopEdgeCasesTest(unittest.TestCase, _PatchedWorkflowMixin):
     def _seeded(self, **state):
@@ -4115,6 +4162,131 @@ class ValidatingTransientParkRecoveryTest(
         # review_round MUST NOT advance: a timeout produced no fix, so
         # bumping would burn through MAX_REVIEW_ROUNDS without progress.
         self.assertEqual(data.get("review_round"), 1)
+
+    def test_reviewer_failed_park_recovers_silently(self) -> None:
+        # The reviewer crashed with empty stdout + non-zero exit on the
+        # previous tick. Recovery must clear the flags so the next tick
+        # re-spawns the reviewer with a fresh budget -- without this,
+        # the issue waits for a human comment that the codex / network
+        # blip cannot produce.
+        gh, issue = self._parked_issue(park_reason="reviewer_failed")
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+                push_branch=True,
+            )
+
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+        self.assertEqual(gh.posted_comments, [])
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+        # No fix landed; a reviewer crash produces no commit, so the
+        # round must stay flat (mirrors the reviewer_timeout branch).
+        self.assertEqual(data.get("review_round"), 1)
+
+    def test_reviewer_failed_park_with_new_comment_routes_to_reviewer(self) -> None:
+        # A human "Retry" / "Continue" nudge after a reviewer-side park
+        # must wake the REVIEWER, not the dev. Pre-fix this branch fed
+        # the comment to `_resume_developer_on_human_reply`, which woke
+        # the dev session; the dev correctly answered "nothing to do,
+        # the reviewer should re-run" and the issue wedged.
+        gh, issue = self._parked_issue(park_reason="reviewer_failed")
+        issue.comments.append(
+            FakeComment(
+                id=10_500, body="retry please",
+                user=FakeUser("alice"),
+            )
+        )
+
+        review = _agent(
+            session_id="rev-sess",
+            last_message="LGTM\n\nVERDICT: APPROVED",
+        )
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=review,
+                head_shas=["cafe1234"],
+            )
+
+        # Exactly one agent ran: the reviewer (not the dev). The agent
+        # call must use the reviewer config, not the dev session resume.
+        self.assertEqual(mocks["run_agent"].call_count, 1)
+        call = mocks["run_agent"].call_args
+        self.assertEqual(call.args[0], config.REVIEW_AGENT)
+        self.assertNotIn("resume_session_id", call.kwargs)
+        # Park flags cleared and the human's comment is consumed so it
+        # cannot replay on the next tick.
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+        self.assertEqual(data.get("last_action_comment_id"), 10_500)
+
+    def test_reviewer_timeout_park_with_new_comment_routes_to_reviewer(self) -> None:
+        # Same routing rule for the reviewer_timeout park reason: a
+        # human nudge must reach the reviewer, not the dev session.
+        gh, issue = self._parked_issue(park_reason="reviewer_timeout")
+        issue.comments.append(
+            FakeComment(
+                id=10_500, body="retry please",
+                user=FakeUser("alice"),
+            )
+        )
+
+        review = _agent(
+            session_id="rev-sess",
+            last_message="LGTM\n\nVERDICT: APPROVED",
+        )
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=review,
+                head_shas=["cafe1234"],
+            )
+
+        self.assertEqual(mocks["run_agent"].call_count, 1)
+        call = mocks["run_agent"].call_args
+        self.assertEqual(call.args[0], config.REVIEW_AGENT)
+        self.assertNotIn("resume_session_id", call.kwargs)
+        data = gh.pinned_data(170)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertIsNone(data.get("park_reason"))
+
+    def test_agent_timeout_park_with_new_comment_still_routes_to_dev(self) -> None:
+        # Regression: dev-side park reasons (agent_timeout) must keep
+        # routing to the dev session on a human comment. Only
+        # reviewer-side reasons get the new fall-through.
+        gh, issue = self._parked_issue(
+            park_reason="agent_timeout",
+            pre_dev_fix_sha="cafe1234",
+        )
+        issue.comments.append(
+            FakeComment(
+                id=10_500, body="please rebase first",
+                user=FakeUser("alice"),
+            )
+        )
+
+        with patch.object(workflow, "_worktree_path", return_value=Path("/tmp")):
+            mocks = self._run(
+                lambda: workflow._handle_validating(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="rebased",
+                ),
+                push_branch=True,
+                head_shas=["aaa", "bbb"],
+            )
+
+        # The dev was resumed with the human's feedback (NOT the reviewer).
+        mocks["run_agent"].assert_called_once()
+        call = mocks["run_agent"].call_args
+        self.assertEqual(call.kwargs.get("resume_session_id"), "dev-sess")
+        followup = call.args[1]
+        self.assertIn("please rebase first", followup)
 
     def test_agent_timeout_clean_tree_no_commits_recovers_silently(self) -> None:
         # Common timeout shape: the dev burned the budget without

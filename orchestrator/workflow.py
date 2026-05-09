@@ -2303,24 +2303,41 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             state.set("park_reason", None)
             gh.write_pinned_state(issue, state)
             return
-        wt = _worktree_path(spec, issue.number)
-        if not wt.exists():
-            wt = _ensure_worktree(spec, issue.number)
-        before_sha = _head_sha(wt)
-        resumed = _resume_developer_on_human_reply(gh, spec, issue, state)
-        if resumed is None:
-            return
-        wt, result = resumed
-        state.set("last_agent_action_at", _now_iso())
-        if not _handle_dev_fix_result(
-            gh, spec, issue, state, wt, result, before_sha
+        if (
+            new_comments
+            and park_reason in ("reviewer_timeout", "reviewer_failed")
         ):
+            # The park was reviewer-side (timeout or silent crash); a
+            # human "Retry" / "Continue" nudge should re-spawn the
+            # REVIEWER, not the dev. The dev session has nothing to act
+            # on -- the failure produced no review output -- and waking
+            # it just yields a "nothing to do" question that re-parks
+            # the issue. Advance the watermark past the consumed
+            # comments, clear the park flags, and fall through to the
+            # reviewer-spawn block below.
+            consumed_max = max(c.id for c in new_comments)
+            state.set("last_action_comment_id", consumed_max)
+            state.set("awaiting_human", False)
+            state.set("park_reason", None)
+        else:
+            wt = _worktree_path(spec, issue.number)
+            if not wt.exists():
+                wt = _ensure_worktree(spec, issue.number)
+            before_sha = _head_sha(wt)
+            resumed = _resume_developer_on_human_reply(gh, spec, issue, state)
+            if resumed is None:
+                return
+            wt, result = resumed
+            state.set("last_agent_action_at", _now_iso())
+            if not _handle_dev_fix_result(
+                gh, spec, issue, state, wt, result, before_sha
+            ):
+                gh.write_pinned_state(issue, state)
+                return
+            round_n = int(state.get("review_round") or 0)
+            state.set("review_round", round_n + 1)
             gh.write_pinned_state(issue, state)
             return
-        round_n = int(state.get("review_round") or 0)
-        state.set("review_round", round_n + 1)
-        gh.write_pinned_state(issue, state)
-        return
 
     round_n = int(state.get("review_round") or 0)
     if round_n >= config.MAX_REVIEW_ROUNDS:
@@ -2519,6 +2536,9 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # If the reviewer DID emit text but it just lacked a VERDICT line,
         # the human is reading real model output and stderr noise would
         # only distract.
+        silent_crash = (
+            not (review.last_message or "").strip() and review.exit_code != 0
+        )
         diag = (
             _format_stderr_diagnostics(review, "Reviewer")
             if not (review.last_message or "").strip()
@@ -2530,6 +2550,14 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             f"manual adjudication needed.\n\n_Last reviewer message:_\n\n"
             f"{quoted}{diag}",
         )
+        if silent_crash:
+            # Tag as transient so the next tick re-spawns the reviewer
+            # instead of waking the dev on a human "Retry" comment.
+            # Mirrors `reviewer_timeout`: a crash with empty stdout +
+            # non-zero exit (codex-side error, network blip) leaves no
+            # output the dev could act on, and `_resume_developer_on_human_reply`
+            # would otherwise hand the wrong agent a do-nothing prompt.
+            state.set("park_reason", "reviewer_failed")
         log.warning(
             "issue=#%s reviewer emitted no VERDICT; exit_code=%d "
             "timed_out=%s stderr_tail=%r",
@@ -2832,7 +2860,7 @@ _TRANSIENT_PARK_REASONS = frozenset({"failed_checks", "unmergeable"})
 # Reasons that need human content (a question, a dirty worktree, a verdict
 # the agent could not produce) stay parked until a comment arrives.
 _VALIDATING_TRANSIENT_PARK_REASONS = frozenset(
-    {"push_failed", "agent_timeout", "reviewer_timeout"}
+    {"push_failed", "agent_timeout", "reviewer_timeout", "reviewer_failed"}
 )
 
 
@@ -2867,10 +2895,13 @@ def _try_recover_validating_transient_park(
         round_n = int(state.get("review_round") or 0)
         state.set("review_round", round_n + 1)
         return True
-    if park_reason == "reviewer_timeout":
+    if park_reason in ("reviewer_timeout", "reviewer_failed"):
         # Reviewer agent only reads the worktree; nothing to reconcile
         # locally. Clear flags so the next tick re-spawns the reviewer
-        # with a fresh budget.
+        # with a fresh budget. `reviewer_failed` (silent crash with
+        # empty stdout + non-zero exit) self-heals the same way as
+        # `reviewer_timeout`: there is no dev-side state to reconcile,
+        # and the next tick simply spawns a fresh reviewer.
         return True
     if park_reason == "agent_timeout":
         # The dev agent could have committed or left uncommitted edits
