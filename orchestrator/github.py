@@ -71,7 +71,15 @@ class GitHubClient:
             slug = repo_spec.slug
         else:
             slug = repo_slug or config.REPO
-        token = token or config.GITHUB_TOKEN
+        # Resolve per-slug at construction time rather than reusing the
+        # cached `config.GITHUB_TOKEN` (which was looked up once for
+        # `config.REPO`), so a multi-repo deployment with one token file
+        # per slug under `~/.config/<owner>/<repo>/token` actually picks
+        # up the right token for each spec. Legacy single-repo callers
+        # see identical behavior because `_resolve_github_token(REPO)`
+        # returns the same value.
+        if token is None:
+            token = config._resolve_github_token(slug)
         if not token:
             raise RuntimeError(
                 "GITHUB_TOKEN is empty. Export it in the orchestrator's "

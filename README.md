@@ -125,7 +125,8 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | ------------------------- | --------------------------------------------- | --------------------------------------------------------- |
 | `GITHUB_TOKEN`            | _(required, env-only — not read from `.env`)_ | fine-grained PAT                                          |
 | `ORCHESTRATOR_TOKEN_FILE` | `~/.config/<owner>/<repo>/token` (from `REPO`) | path to PAT file (used when `GITHUB_TOKEN` is not in env) |
-| `REPO`                    | `geserdugarov/agent-orchestrator`  | `owner/name` of the repo to manage                        |
+| `REPO`                    | `geserdugarov/agent-orchestrator`  | `owner/name` of the single repo to manage (ignored when `REPOS` is set) |
+| `REPOS`                   | _(unset)_                                     | multi-repo configuration, see [Managing multiple repositories](#managing-multiple-repositories) |
 | `POLL_INTERVAL`           | `60`                                          | seconds between polling ticks                             |
 | `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
 | `REVIEW_TIMEOUT`          | (= `AGENT_TIMEOUT`)                           | wall-clock cap per reviewer invocation, seconds           |
@@ -145,6 +146,20 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | `BASE_BRANCH`             | `main`                                        | branch PRs target                                         |
 | `AUTO_MERGE`              | `off`                                         | merge approved PRs (green CI + mergeable) from `in_review`; flip to `on` once dogfooded |
 | `IN_REVIEW_DEBOUNCE_SECONDS` | `600`                                       | quiet window after the latest PR/issue comment before resuming the dev session |
+
+## Managing multiple repositories
+
+Set `REPOS` to drive several target repositories from one orchestrator process. Each entry is `owner/name|target_root|base_branch`; entries are separated by newlines or `;` (the latter so the value fits on a single `.env` line). Example `.env` snippet:
+
+```dotenv
+REPOS=acme/api|/srv/clones/acme-api|main;acme/web|/srv/clones/acme-web|master
+```
+
+When `REPOS` is set the legacy `REPO` / `TARGET_REPO_ROOT` / `BASE_BRANCH` trio is ignored. Validation happens at import — a malformed entry, empty owner/name, empty base branch, or a duplicate slug aborts startup with a clear error. A `target_root` that does not exist on disk is warned to stderr but does not block startup, so a partial deploy can still surface the misconfiguration on the first tick.
+
+Each tick iterates every configured spec and runs `workflow.tick(gh, spec)` once per repo with a per-spec `GitHubClient`; a failure in one repo's tick is logged and skipped so the remaining repos still advance. Worktrees are namespaced under `WORKTREES_DIR/<owner>__<name>/issue-N` (and `decompose-N`) so two repos that share an issue number cannot collide on disk.
+
+Tokens are resolved per slug: `GitHubClient` reads `GITHUB_TOKEN` from the environment first (works for any repo the PAT has access to), and otherwise falls back to `~/.config/<owner>/<repo>/token` derived from the spec's slug — so each repo can have its own fine-grained PAT in its own file. Override the file path globally with `ORCHESTRATOR_TOKEN_FILE` if you need a non-default location.
 
 ## Current scope
 

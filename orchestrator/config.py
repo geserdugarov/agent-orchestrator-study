@@ -203,18 +203,102 @@ class RepoSpec:
     base_branch: str
 
 
-def default_repo_specs() -> list[RepoSpec]:
-    """Single-element list built from the legacy `REPO` / `TARGET_REPO_ROOT` /
-    `BASE_BRANCH` env vars, so existing single-repo deployments keep working
-    unchanged. Multi-repo env parsing arrives in a follow-up child.
+def _parse_repos_env(raw: str) -> list[RepoSpec]:
+    """Parse the REPOS env value into a list of RepoSpecs.
+
+    Format: one entry per line, ``owner/name|target_root|base_branch``.
+    Blank lines and lines starting with ``#`` are skipped. ``;`` is also
+    accepted as an entry separator so the value fits on a single line in a
+    ``.env`` file (the simple parser in `_load_dotenv` cannot represent
+    multi-line values). Aborts (SystemExit) on malformed entries or
+    duplicate slugs; a missing ``target_root`` is warned to stderr but not
+    fatal so a freshly-cloned host can still start the orchestrator and
+    notice the problem on the first tick rather than at import.
     """
-    return [
+    specs: list[RepoSpec] = []
+    seen: set[str] = set()
+    # ';' accepted in addition to '\n' so the value can be one line in .env.
+    for entry_no, raw_line in enumerate(
+        raw.replace(";", "\n").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if len(parts) != 3:
+            raise SystemExit(
+                f"orchestrator: REPOS entry #{entry_no} is malformed "
+                f"(expected 'owner/name|target_root|base_branch'): {line!r}"
+            )
+        slug, target_root, base_branch = (p.strip() for p in parts)
+        # Require exactly two non-empty components separated by a single
+        # '/'. A bare substring check would accept 'owner//repo' (empty
+        # owner or repo) and 'owner/repo/extra' (extra path segment).
+        slug_components = slug.split("/")
+        if len(slug_components) != 2 or not all(slug_components):
+            raise SystemExit(
+                f"orchestrator: REPOS entry #{entry_no} has invalid "
+                f"owner/name {slug!r}; expected exactly 'owner/name' "
+                "with non-empty owner and name"
+            )
+        if not target_root:
+            raise SystemExit(
+                f"orchestrator: REPOS entry #{entry_no} has empty target_root"
+            )
+        if not base_branch:
+            raise SystemExit(
+                f"orchestrator: REPOS entry #{entry_no} has empty base_branch"
+            )
+        if slug in seen:
+            raise SystemExit(
+                f"orchestrator: REPOS lists duplicate slug {slug!r}; "
+                "each repo can appear only once"
+            )
+        seen.add(slug)
+        target_path = Path(target_root)
+        if not target_path.exists():
+            print(
+                f"orchestrator: REPOS entry {slug!r} target_root "
+                f"{target_path} does not exist; worktree creation will fail",
+                file=sys.stderr,
+            )
+        specs.append(
+            RepoSpec(
+                slug=slug, target_root=target_path, base_branch=base_branch
+            )
+        )
+    if not specs:
+        raise SystemExit(
+            "orchestrator: REPOS is set but contains no valid entries; "
+            "either unset it or provide at least one "
+            "'owner/name|target_root|base_branch' entry"
+        )
+    return specs
+
+
+_REPOS_RAW: str = os.environ.get("REPOS", "")
+_REPO_SPECS: list[RepoSpec] = (
+    _parse_repos_env(_REPOS_RAW)
+    if _REPOS_RAW.strip()
+    else [
         RepoSpec(
             slug=REPO,
             target_root=TARGET_REPO_ROOT,
             base_branch=BASE_BRANCH,
         )
     ]
+)
+
+
+def default_repo_specs() -> list[RepoSpec]:
+    """The configured RepoSpecs (validated at import).
+
+    A single element built from `REPO` / `TARGET_REPO_ROOT` / `BASE_BRANCH`
+    when `REPOS` is unset (so existing single-repo deployments keep working
+    unchanged); otherwise one element per `REPOS` entry. Returns a fresh
+    list copy so callers cannot mutate the cached result.
+    """
+    return list(_REPO_SPECS)
 
 # Base branch of the orchestrator's *own* repo (REPO_ROOT). Used only by the
 # self-update path: `_self_modifying_merge_happened` watches `origin/<this>`

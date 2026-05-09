@@ -101,9 +101,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    # Single-repo today; the helper returns a one-element list so the next
-    # multi-repo child can extend `default_repo_specs()` without touching
-    # main.py's loop shape.
+    # `default_repo_specs()` returns one element for legacy single-repo
+    # deployments and N elements when `REPOS` is configured. Connecting and
+    # ensuring labels happens once per spec at startup; the polling loop
+    # then fans `workflow.tick(gh, spec)` out across the precomputed
+    # client list every tick.
     specs = config.default_repo_specs()
     clients: list[tuple[config.RepoSpec, GitHubClient]] = []
     for spec in specs:
@@ -113,8 +115,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         clients.append((spec, gh))
 
     if args.once:
-        for spec, gh in clients:
-            workflow.tick(gh, spec)
+        _run_tick(clients)
         return 0
 
     own_sha = _own_head_sha()
@@ -124,17 +125,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         if own_sha and _self_modifying_merge_happened(own_sha):
             log.info("self-modifying merge detected; exiting for restart")
             return 0
-        for spec, gh in clients:
-            log.info("tick: repo=%s", spec.slug)
-            try:
-                workflow.tick(gh, spec)
-            except Exception:
-                log.exception("tick failed for repo=%s; continuing", spec.slug)
+        _run_tick(clients)
         for _ in range(config.POLL_INTERVAL):
             if not _running:
                 break
             time.sleep(1)
     return 0
+
+
+def _run_tick(
+    clients: list[tuple[config.RepoSpec, GitHubClient]],
+) -> None:
+    """Drive a single tick across every configured repo.
+
+    Per-repo exceptions are caught and logged so one failing repo cannot
+    stop the others from advancing this tick. Shared between `--once` and
+    the polling loop so both paths fan out identically.
+    """
+    for spec, gh in clients:
+        log.info("tick: repo=%s", spec.slug)
+        try:
+            workflow.tick(gh, spec)
+        except Exception:
+            log.exception("tick failed for repo=%s; continuing", spec.slug)
 
 
 if __name__ == "__main__":
