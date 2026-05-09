@@ -325,6 +325,84 @@ def _ensure_worktree(spec: RepoSpec, issue_number: int) -> Path:
     return wt
 
 
+def _ensure_pr_worktree(spec: RepoSpec, issue_number: int) -> Path:
+    """Like `_ensure_worktree`, but restores the local branch from
+    `origin/<branch>` when it is missing instead of branching from
+    `origin/<base>`.
+
+    `_ensure_worktree`'s fallback (`worktree add -b <branch> ... origin/<base>`)
+    is right for a fresh implementing run -- a brand-new PR branch should
+    start at the base. It is the WRONG fallback for `_handle_resolving_conflict`:
+    once a PR exists, the conflict resolver MUST land on the same branch
+    the PR is open against, with the dev's commits intact. A host
+    restart, manual cleanup, or `git branch -D` between ticks deletes
+    the local ref but leaves the PR's `origin/<branch>` ref alive on
+    GitHub; rebuilding off `origin/<base>` would silently discard the
+    PR's commits and leave the PR's conflicts unresolved forever.
+
+    All git invocations run from `spec.target_root` (the orchestrator's
+    own clone, not the agent-writable worktree) so authenticated fetch
+    uses the operator's git config / credential helpers / SSH keys
+    directly. The hardening that `_push_branch` applies is unnecessary
+    here because nothing in `target_root` is agent-writable.
+    """
+    _repo_worktrees_root(spec).mkdir(parents=True, exist_ok=True)
+    wt = _worktree_path(spec, issue_number)
+    branch = _branch_name(issue_number)
+
+    if wt.exists():
+        if _has_new_commits(spec, wt):
+            log.info(
+                "issue=#%d worktree has unpushed commits; reusing",
+                issue_number,
+            )
+            return wt
+        _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
+
+    # Fetch both base and the PR's remote branch so either path
+    # below has a fresh ref to anchor on.
+    _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
+    # The PR branch fetch is best-effort: a freshly created PR may not
+    # have a remote ref yet (the orchestrator's own push opened it),
+    # but in that case the local branch must already exist (we just
+    # pushed it). Treat fetch failure as non-fatal and let the local
+    # ref check below decide.
+    #
+    # Use an explicit refspec so single-branch / narrowed clones still
+    # create the `refs/remotes/origin/<branch>` ref. A bare `git fetch
+    # origin <branch>` on a single-branch clone only updates FETCH_HEAD
+    # and leaves no `origin/<branch>` for the `worktree add ... origin/<branch>`
+    # fallback to anchor on. The `+` prefix forces non-fast-forward
+    # update, which we want because the orchestrator pushes with
+    # `--force-with-lease` and the local remote-tracking ref may be
+    # stale relative to the just-rewritten remote tip.
+    _git(
+        "fetch", "--quiet", "origin",
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        cwd=spec.target_root,
+    )
+
+    have_local = _git(
+        "rev-parse", "--verify", branch, cwd=spec.target_root,
+    ).returncode == 0
+    if have_local:
+        result = _git(
+            "worktree", "add", str(wt), branch, cwd=spec.target_root,
+        )
+    else:
+        # Restore the local branch from the PR's remote head, NOT from
+        # `origin/<base>` -- the dev's commits live on `origin/<branch>`
+        # and rebuilding from base would discard them.
+        result = _git(
+            "worktree", "add", "-b", branch, str(wt),
+            f"origin/{branch}",
+            cwd=spec.target_root,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {result.stderr}")
+    return wt
+
+
 def _has_new_commits(spec: RepoSpec, worktree: Path) -> bool:
     r = _git(
         "rev-list", "--count", f"origin/{spec.base_branch}..HEAD",
@@ -333,6 +411,41 @@ def _has_new_commits(spec: RepoSpec, worktree: Path) -> bool:
     if r.returncode != 0:
         return False
     return int((r.stdout or "0").strip() or "0") > 0
+
+
+def _branch_ahead_behind(
+    spec: RepoSpec, worktree: Path, branch: str
+) -> Tuple[int, int]:
+    """Return `(ahead, behind)` commit counts for HEAD relative to
+    `origin/<branch>` in `worktree`.
+
+    `ahead` = commits in HEAD not in `origin/<branch>` (unpushed local
+    work). `behind` = commits in `origin/<branch>` not in HEAD (the
+    local branch is stale relative to the remote PR head). `(0, 0)`
+    means HEAD and the remote-tracking ref are identical.
+
+    The caller must have fetched `origin/<branch>` immediately before
+    calling so the comparison is against the current remote tip.
+    Returns `(0, 0)` on git error so a transient failure does not
+    silently re-route the workflow; the caller's subsequent steps
+    (the merge attempt, the push) surface the underlying problem.
+    """
+    r = _git_hardened(
+        "rev-list", "--left-right", "--count",
+        f"refs/remotes/origin/{branch}...HEAD",
+        cwd=worktree,
+    )
+    if r.returncode != 0:
+        return (0, 0)
+    parts = (r.stdout or "").strip().split()
+    if len(parts) != 2:
+        return (0, 0)
+    try:
+        behind = int(parts[0])
+        ahead = int(parts[1])
+    except ValueError:
+        return (0, 0)
+    return (ahead, behind)
 
 
 def _first_commit_subject(worktree: Path) -> str:
@@ -3234,9 +3347,43 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         gh.write_pinned_state(issue, state)
         return
 
-    # No new comments -- consider auto-merging.
+    # No new comments. The two AUTO_MERGE branches diverge on what
+    # "unmergeable" means:
+    #
+    #   * AUTO_MERGE off: legacy fallback path. Humans drive the merge,
+    #     so an unmergeable PR just needs visibility -- park awaiting
+    #     human regardless of approval state. Unauthenticated humans
+    #     re-approve as part of fixing the unmergeable state, so gating
+    #     the legacy park on approval would silently hide the unmergeable
+    #     condition for any PR that hasn't been re-approved yet.
+    #
+    #   * AUTO_MERGE on: the resolving_conflict route REPLACES the old
+    #     unmergeable park, which only fired AFTER the changes-requested
+    #     and approval gates. Resuming dev work for an unapproved PR (or
+    #     one carrying a standing human CHANGES_REQUESTED) would push
+    #     unreviewed work past a human veto, so the gates run first and
+    #     the unmergeable check is gated behind them.
     if not config.AUTO_MERGE:
-        return
+        mergeable = gh.pr_is_mergeable(pr)
+        if mergeable is None:
+            return  # GitHub still computing; try next tick
+        if not mergeable:
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} PR #{pr_number} is not mergeable "
+                "(branch protection, conflicts, or out-of-date base); "
+                "manual merge needed.",
+            )
+            state.set("park_reason", "unmergeable")
+            _bump_in_review_watermarks(gh, issue, state)
+            gh.write_pinned_state(issue, state)
+            return
+        return  # mergeable: humans drive the merge from here
+
+    # AUTO_MERGE on. Run the original gating order: changes-requested
+    # and approval first, then mergeable. This matches the pre-rollout
+    # behavior and ensures the resolving_conflict route only fires for
+    # PRs that would have hit the old unmergeable park.
     head_sha = pr.head.sha
     # A human CHANGES_REQUESTED on the current head vetoes auto-merge
     # regardless of how the reviewer agent voted. Without this check, the
@@ -3270,14 +3417,37 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # all gates against the new head on the next tick.
         return
     if not mergeable:
-        _park_awaiting_human(
-            gh, issue, state,
-            f"{config.HITL_MENTIONS} PR #{pr_number} is not mergeable "
-            "(branch protection, conflicts, or out-of-date base); manual "
-            "merge needed.",
-        )
-        state.set("park_reason", "unmergeable")
+        # Approved + no human veto + still unmergeable: route to
+        # `resolving_conflict` for an automated merge-of-base /
+        # conflict-resolve attempt. PyGithub does not distinguish a
+        # content conflict from branch-protection / out-of-date-base
+        # on `mergeable=False`; we treat any unmergeable PR here as
+        # eligible. If the underlying cause is branch protection, the
+        # merge attempt is a no-op fast-forward and the `conflict_round`
+        # counter still ticks (so a perpetually-unmergeable PR cannot
+        # loop in_review <-> resolving_conflict forever).
+        #
+        # Initialize `conflict_round` only when absent: a PR that bounces
+        # back to `in_review` with the counter already set must NOT
+        # reset it -- the cap would be ineffective if every re-entry
+        # zeroed the counter, and a branch-protection-only PR would
+        # ping-pong between handlers indefinitely.
+        if state.get("conflict_round") is None:
+            state.set("conflict_round", 0)
+        try:
+            _post_pr_comment(
+                gh, int(pr_number), state,
+                f":mag: PR is not mergeable; orchestrator is attempting "
+                f"auto-resolution by merging `origin/{spec.base_branch}` "
+                "into the branch (label: `resolving_conflict`).",
+            )
+        except Exception:
+            log.exception(
+                "issue=#%s could not post conflict-resolution notice to "
+                "PR #%s", issue.number, pr_number,
+            )
         _bump_in_review_watermarks(gh, issue, state)
+        gh.set_workflow_label(issue, "resolving_conflict")
         gh.write_pinned_state(issue, state)
         return
     check = gh.pr_combined_check_state(pr)
@@ -3319,17 +3489,569 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     _cleanup_merged_branch(gh, spec, issue.number)
 
 
+def _git_hardened(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    """`_git` plus the agent-hostile-environment hardening from `_push_branch`.
+
+    Used for `git merge` inside a worktree the agent can write to: a
+    planted `core.hooksPath`, `core.fsmonitor`, or url rewrite rule in
+    the worktree's `.git/config` (or in `~/.gitconfig`) would otherwise
+    execute attacker code mid-merge or redirect a transient fetch to an
+    attacker-controlled host. Drops global/system git config so url
+    `insteadOf` rewrites and host-wide hooks cannot apply, and disables
+    repo-local hooks / fsmonitor / credential helpers via `-c` overrides.
+    No askpass is wired in -- this helper is for local-only operations
+    (merge); push remains the only call site that handles GIT_TOKEN.
+
+    Injects `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars (matching the
+    agent spawn's `_agent_env`) so a `git merge --no-edit` that needs
+    to create a merge commit doesn't fail with "Committer identity
+    unknown" -- stripping global config also strips any `user.name` /
+    `user.email` set there, and env vars take precedence over config
+    so the orchestrator's identity stamps the merge commit cleanly.
+    """
+    git_prefix = [
+        "git",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "credential.helper=",
+        "-c", "core.fsmonitor=",
+    ]
+    env = {
+        **os.environ,
+        **_GIT_NO_PROMPT_ENV,
+        "GIT_AUTHOR_NAME": config.AGENT_GIT_NAME,
+        "GIT_AUTHOR_EMAIL": config.AGENT_GIT_EMAIL,
+        "GIT_COMMITTER_NAME": config.AGENT_GIT_NAME,
+        "GIT_COMMITTER_EMAIL": config.AGENT_GIT_EMAIL,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    return subprocess.run(
+        [*git_prefix, *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _merge_base_into_worktree(
+    spec: RepoSpec, worktree: Path
+) -> Tuple[bool, list[str]]:
+    """Run `git merge --no-edit origin/<base>` in the worktree.
+
+    Returns `(succeeded, conflicted_files)`. On success, `conflicted_files`
+    is empty -- whether the merge fast-forwarded (no commit) or produced a
+    merge commit is the caller's job to detect via the HEAD-SHA delta.
+    On failure, the conflicted-file list is the unmerged paths from
+    `git diff --name-only --diff-filter=U`; an empty list means the merge
+    failed for a non-conflict reason (hooks, permissions, etc.) and the
+    caller should park rather than ask the agent to resolve nothing.
+
+    Both subprocess calls run under `_git_hardened`: the diff is
+    read-only but still executes inside an agent-writable worktree, so
+    a planted hooksPath / fsmonitor would otherwise execute attacker
+    code under the orchestrator's UID at diff time.
+    """
+    r = _git_hardened(
+        "merge", "--no-edit", f"origin/{spec.base_branch}", cwd=worktree,
+    )
+    if r.returncode == 0:
+        return True, []
+    conflicted = _git_hardened(
+        "diff", "--name-only", "--diff-filter=U", cwd=worktree,
+    )
+    files = [
+        line.strip() for line in (conflicted.stdout or "").splitlines()
+        if line.strip()
+    ]
+    return False, files
+
+
+def _authed_fetch(
+    spec: RepoSpec, refspec: str, *, cwd: Path
+) -> subprocess.CompletedProcess:
+    """Authenticated, hardened `git fetch` -- the same security envelope as
+    `_push_branch`.
+
+    Used for fetches from inside an agent-writable worktree where any
+    of the following vectors could leak GIT_TOKEN to an attacker host:
+      * a planted credential helper in the worktree's `.git/config`,
+      * a planted `core.hooksPath` / `core.fsmonitor` that runs an
+        attacker-controlled binary with GIT_TOKEN in env,
+      * a planted `url.<host>.insteadOf` rewrite in the worktree's
+        local config OR in `~/.gitconfig` redirecting fetch to an
+        attacker-controlled host.
+
+    The auth URL carries only the username (`x-access-token`); the
+    token itself is read from $GIT_TOKEN by a tempfile askpass script
+    so it never appears in argv. Global/system git config is detached
+    via `GIT_CONFIG_GLOBAL=/dev/null` / `GIT_CONFIG_SYSTEM=/dev/null`
+    so url-rewrite rules planted there cannot apply. We also refuse
+    to run if the worktree's local config already carries any url
+    rewrite rule, mirroring `_push_branch`'s pre-flight check.
+
+    `refspec` is the fetch refspec; pass an explicit form like
+    `+refs/heads/<branch>:refs/remotes/origin/<branch>` so single-branch
+    clones still update the remote-tracking ref instead of leaving the
+    fetched payload only in FETCH_HEAD.
+    """
+    if not config.GITHUB_TOKEN:
+        log.error("GITHUB_TOKEN missing; cannot fetch")
+        return subprocess.CompletedProcess(
+            args=["git", "fetch"], returncode=1, stdout="",
+            stderr="GITHUB_TOKEN missing",
+        )
+    rewrite = subprocess.run(
+        ["git", "config", "--local", "--get-regexp",
+         r"^url\..*\.(insteadof|pushinsteadof)$"],
+        cwd=str(cwd), capture_output=True, text=True,
+    )
+    if rewrite.returncode == 0 and rewrite.stdout.strip():
+        log.error(
+            "refusing to fetch into %s: worktree .git/config has url "
+            "rewrite rules: %s", cwd, rewrite.stdout.strip(),
+        )
+        return subprocess.CompletedProcess(
+            args=["git", "fetch"], returncode=1, stdout="",
+            stderr="url rewrite rules in worktree .git/config",
+        )
+    auth_url = f"https://x-access-token@github.com/{spec.slug}.git"
+    with tempfile.TemporaryDirectory(prefix="orch-askpass-") as td:
+        askpass = Path(td) / "askpass.sh"
+        askpass.write_text('#!/bin/sh\nprintf %s "$GIT_TOKEN"\n')
+        askpass.chmod(0o700)
+        env = {
+            **os.environ,
+            **_GIT_NO_PROMPT_ENV,
+            "GIT_ASKPASS": str(askpass),
+            "GIT_TOKEN": config.GITHUB_TOKEN,
+            "GIT_AUTHOR_NAME": config.AGENT_GIT_NAME,
+            "GIT_AUTHOR_EMAIL": config.AGENT_GIT_EMAIL,
+            "GIT_COMMITTER_NAME": config.AGENT_GIT_NAME,
+            "GIT_COMMITTER_EMAIL": config.AGENT_GIT_EMAIL,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        git_prefix = [
+            "git",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "credential.helper=",
+            "-c", "core.fsmonitor=",
+        ]
+        return subprocess.run(
+            [*git_prefix, "fetch", "--quiet", auth_url, refspec],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+
+def _build_conflict_resolution_prompt(
+    base_branch: str, files: list[str]
+) -> str:
+    shown = files[:20]
+    files_md = "\n".join(f"- `{p}`" for p in shown)
+    if len(files) > len(shown):
+        files_md += f"\n- ... ({len(files) - len(shown)} more)"
+    return (
+        f"`git merge origin/{base_branch}` left {len(files)} conflicted "
+        "file(s) in your worktree. Resolve each conflict and COMMIT the "
+        "merge in your current worktree. Do NOT push -- the orchestrator "
+        "pushes and re-runs the reviewer.\n\n"
+        f"Conflicted paths:\n\n{files_md}\n\n"
+        "Workflow: edit each file to a coherent resolution, `git add` it, "
+        "then commit (`git commit --no-edit` accepts the default merge "
+        "commit message). Use `git status` to inspect the in-progress "
+        "merge.\n\n"
+        "If you genuinely cannot resolve a conflict, end your final "
+        "message with a question for the human and leave the worktree "
+        "mid-merge; the orchestrator will park the issue for human review."
+    )
+
+
 def _handle_resolving_conflict(
     gh: GitHubClient, spec: RepoSpec, issue: Issue
 ) -> None:
-    """Placeholder for the conflict-resolution stage. No behavior yet -- the
-    label and dispatcher branch exist so a follow-up child can wire in the
-    actual rebase/retry logic without another label-rollout step.
+    """Drive an unmergeable PR back to mergeable.
+
+    Merge `origin/<base>` into the per-issue branch. On a clean merge,
+    push and flip back to `validating` so the reviewer agent re-runs on
+    the merged head; if the base hasn't moved (branch already
+    up-to-date) skip the push and just flip the label. On real content
+    conflicts, resume the dev session on the locked backend with a
+    conflict-resolution prompt, then push the resolved commit. Cap loops
+    via `MAX_CONFLICT_ROUNDS` (parks awaiting human on exhaustion). On
+    agent timeout / dirty tree / push failure, park awaiting human and
+    let the operator unstick.
+
+    Merge over rebase: simpler (one commit either way) and less
+    destructive. Rebase rewrites every commit's SHA, which would
+    invalidate any stored `agent_approved_sha` in surprising ways and
+    force the reviewer to re-approve the entire branch even when only
+    the base content changed.
     """
-    log.info(
-        "repo=%s issue=#%s resolving_conflict (no-op placeholder)",
-        spec.slug, issue.number,
+    state = gh.read_pinned_state(issue)
+    pr_number = state.get("pr_number")
+
+    if pr_number is None:
+        if state.get("awaiting_human"):
+            return
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} `resolving_conflict` without a pinned "
+            "`pr_number`; manual relabeling suspected. Set the workflow "
+            "label back to `validating` after fixing.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    pr = gh.get_pr(int(pr_number))
+    pr_status = gh.pr_state(pr)
+
+    if pr_status == "merged":
+        # Mirror the in_review terminal: a human merged the PR (perhaps
+        # after manually resolving conflicts) while we were resolving.
+        state.set("merged_at", _now_iso())
+        gh.set_workflow_label(issue, "done")
+        gh.write_pinned_state(issue, state)
+        try:
+            issue.edit(state="closed")
+        except Exception:
+            log.exception(
+                "issue=#%s could not close after merge", issue.number,
+            )
+        _cleanup_merged_branch(gh, spec, issue.number)
+        return
+
+    if pr_status == "closed":
+        state.set("closed_without_merge_at", _now_iso())
+        gh.set_workflow_label(issue, "rejected")
+        gh.write_pinned_state(issue, state)
+        try:
+            issue.edit(state="closed")
+        except Exception:
+            log.exception(
+                "issue=#%s could not close after reject", issue.number,
+            )
+        return
+
+    # PR is open but the issue itself was closed manually (the closed
+    # sweep in `list_pollable_issues` yielded it). Mirror in_review's
+    # human-stop handling: closing the issue while its PR is still open
+    # is a deliberate human signal; flip to `rejected` rather than
+    # continuing to spawn the dev agent.
+    if getattr(issue, "state", "open") == "closed":
+        state.set("closed_without_merge_at", _now_iso())
+        gh.set_workflow_label(issue, "rejected")
+        gh.write_pinned_state(issue, state)
+        return
+
+    conflict_round = int(state.get("conflict_round") or 0)
+
+    # Resume-on-human-reply: when parked awaiting human and a new
+    # comment arrived, resume the dev session on the in-progress merge
+    # worktree with the human's text. Mirrors `_handle_implementing`'s
+    # awaiting-human path so a `_on_question` / `_on_dirty_worktree`
+    # park can be unstuck by a comment (the park messages explicitly
+    # invite that flow). Without this branch, those parks would require
+    # a manual relabel even though their HITL text says "reply with
+    # guidance and the orchestrator will resume the session".
+    if state.get("awaiting_human"):
+        last_action_id = state.get("last_action_comment_id")
+        new_comments = gh.comments_after(issue, last_action_id)
+        if not new_comments:
+            return  # no human reply yet
+        consumed_max = max(c.id for c in new_comments)
+        state.set("last_action_comment_id", consumed_max)
+        followup = "\n\n".join(
+            f"@{c.user.login if c.user else 'user'}: {c.body}"
+            for c in new_comments if c.body
+        )
+        wt = _worktree_path(spec, issue.number)
+        if not wt.exists():
+            wt = _ensure_pr_worktree(spec, issue.number)
+        before_sha = _head_sha(wt)
+        wt, result = _resume_dev_with_text(gh, spec, issue, state, followup)
+        state.set("last_agent_action_at", _now_iso())
+        _post_conflict_resolution_result(
+            gh, spec, issue, state, wt, result, before_sha, conflict_round,
+        )
+        return
+
+    if conflict_round >= config.MAX_CONFLICT_ROUNDS:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} auto-conflict-resolution still failing "
+            f"after {conflict_round} round(s) "
+            f"(`MAX_CONFLICT_ROUNDS={config.MAX_CONFLICT_ROUNDS}`); manual "
+            "intervention needed.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    wt = _worktree_path(spec, issue.number)
+    if not wt.exists():
+        # PR-aware variant: restores the local branch from
+        # `origin/<branch>` if it has been pruned. `_ensure_worktree`
+        # would rebuild from `origin/<base>` and silently discard the
+        # PR's commits.
+        wt = _ensure_pr_worktree(spec, issue.number)
+
+    # Refresh `origin/<branch>` (the PR branch's remote tip) via the
+    # same hardened authenticated path `_push_branch` uses. We need a
+    # current ref before the ahead/behind check below: a stale local
+    # `origin/<branch>` would mis-classify a real "remote moved out from
+    # under us" situation as in-sync.
+    branch = _branch_name(issue.number)
+    fetch_branch = _authed_fetch(
+        spec,
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        cwd=wt,
     )
+    if fetch_branch.returncode != 0:
+        log.error(
+            "issue=#%d branch fetch failed in resolving_conflict: %s",
+            issue.number, (fetch_branch.stderr or "").strip(),
+        )
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} `git fetch origin {branch}` failed "
+            "during conflict resolution; see orchestrator logs.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    # Check the worktree against the freshly-fetched remote PR head.
+    # Three outcomes:
+    #   * `(0, 0)`: in sync -- proceed to the base-merge below.
+    #   * `(>0, 0)`: HEAD has unpushed commits ahead of the remote PR
+    #     head. This is the crash-recovery case: a previous tick committed
+    #     a conflict resolution but crashed before `_push_branch` returned
+    #     (or before the post-push state write landed). Without this
+    #     branch the next tick's `git merge` would be a no-op (HEAD
+    #     already contains origin/<base>) and we would flip to validating
+    #     with the dev's resolution still unpushed -- letting the reviewer
+    #     vote on a SHA that is not on the PR. Mirrors the implementing
+    #     handler's `_has_new_commits` recovery shortcut.
+    #   * Anything with `behind > 0`: stale or diverged worktree. Force-
+    #     pushing the local state would clobber the real PR head, and
+    #     merging origin/<base> into a stale branch then force-pushing
+    #     would silently revert anything that landed on `origin/<branch>`
+    #     out-of-band. Refuse and park.
+    ahead, behind = _branch_ahead_behind(spec, wt, branch)
+    if behind > 0:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} worktree on `{branch}` is {ahead} "
+            f"ahead and {behind} behind `origin/{branch}` (PR head "
+            f"`{pr.head.sha[:8]}`); refusing to merge a stale or diverged "
+            "branch -- force-pushing the local state would clobber the "
+            "real PR head. Manual intervention needed.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+    if ahead > 0:
+        # Dirty check before pushing recovered work: if the previous
+        # tick crashed before its own dirty check ran, the worktree
+        # may carry uncommitted edits that the unpushed commit does
+        # NOT contain. Pushing in that state would publish a SHA that
+        # silently omits those edits, and the reviewer at validating
+        # would later run on a local tree that does not match the PR.
+        # Mirror `_on_dirty_worktree`: park awaiting human, no flip.
+        dirty = _worktree_dirty_files(wt)
+        if dirty:
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} worktree has {len(dirty)} "
+                "uncommitted change(s) alongside recovered conflict "
+                "resolution; refusing to push an incomplete branch. "
+                "Resolve the dirty tree manually before resuming.",
+            )
+            gh.write_pinned_state(issue, state)
+            return
+        log.info(
+            "issue=#%d resolving_conflict: pushing %d recovered commit(s) "
+            "ahead of origin/%s before attempting base merge",
+            issue.number, ahead, branch,
+        )
+        if not _push_branch(spec, wt, branch):
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} git push of recovered conflict "
+                "resolution failed; see orchestrator logs.",
+            )
+            gh.write_pinned_state(issue, state)
+            return
+        state.set("review_round", 0)
+        state.set("conflict_round", conflict_round + 1)
+        state.set("last_conflict_resolved_at", _now_iso())
+        gh.set_workflow_label(issue, "validating")
+        gh.write_pinned_state(issue, state)
+        return
+
+    # In sync. Refresh `origin/<base>` so the upcoming
+    # `git merge origin/<base>` sees the current base tip.
+    fetch_base = _authed_fetch(
+        spec,
+        f"+refs/heads/{spec.base_branch}:refs/remotes/origin/{spec.base_branch}",
+        cwd=wt,
+    )
+    if fetch_base.returncode != 0:
+        log.error(
+            "issue=#%d base fetch failed in resolving_conflict: %s",
+            issue.number, (fetch_base.stderr or "").strip(),
+        )
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} `git fetch origin {spec.base_branch}` "
+            "failed during conflict resolution; see orchestrator logs.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    before_sha = _head_sha(wt)
+    succeeded, conflicted_files = _merge_base_into_worktree(spec, wt)
+
+    if succeeded:
+        # Dirty check before EITHER clean-merge exit (no-op flip OR
+        # merge-commit push): a pre-existing uncommitted edit (left by a
+        # previous tick that crashed before its own dirty check ran)
+        # would otherwise survive a no-op flip into validating, where
+        # the reviewer agent reads the worktree directly. The reviewer
+        # would then vote on a tree that does NOT match the PR head;
+        # AUTO_MERGE would later refuse the SHA mismatch but the agent
+        # approval is already sitting against an incorrect SHA. Park
+        # rather than push or flip in that state, mirroring
+        # `_on_dirty_worktree`'s "refuse to publish an incomplete
+        # branch" rule.
+        dirty = _worktree_dirty_files(wt)
+        if dirty:
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} worktree has {len(dirty)} "
+                f"uncommitted change(s) after `git merge "
+                f"origin/{spec.base_branch}`; refusing to push or hand "
+                "back to validating with a dirty tree.",
+            )
+            gh.write_pinned_state(issue, state)
+            return
+        after_sha = _head_sha(wt)
+        if not after_sha or after_sha == before_sha:
+            # Already up-to-date with base. Nothing to push -- just hand
+            # back to validating and let AUTO_MERGE re-evaluate.
+            #
+            # Increment `conflict_round` even though no diff was applied:
+            # if the PR is unmergeable purely due to branch protection /
+            # required reviewers (PyGithub cannot distinguish those from a
+            # content conflict), the no-op merge would otherwise loop
+            # in_review <-> resolving_conflict forever with the cap never
+            # firing. Counting the no-op against the cap surfaces the
+            # situation to the operator within `MAX_CONFLICT_ROUNDS` ticks.
+            log.info(
+                "issue=#%d resolving_conflict: branch already up-to-date "
+                "with origin/%s", issue.number, spec.base_branch,
+            )
+            state.set("review_round", 0)
+            state.set("conflict_round", conflict_round + 1)
+            gh.set_workflow_label(issue, "validating")
+            gh.write_pinned_state(issue, state)
+            return
+        if not _push_branch(spec, wt, _branch_name(issue.number)):
+            _park_awaiting_human(
+                gh, issue, state,
+                f"{config.HITL_MENTIONS} git push failed after auto-merging "
+                f"`origin/{spec.base_branch}`; see orchestrator logs.",
+            )
+            gh.write_pinned_state(issue, state)
+            return
+        state.set("review_round", 0)
+        state.set("conflict_round", conflict_round + 1)
+        state.set("last_conflict_resolved_at", _now_iso())
+        gh.set_workflow_label(issue, "validating")
+        gh.write_pinned_state(issue, state)
+        return
+
+    if not conflicted_files:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} `git merge origin/{spec.base_branch}` "
+            "failed without listing conflicted files; manual intervention "
+            "needed.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    fix_prompt = _build_conflict_resolution_prompt(
+        spec.base_branch, conflicted_files
+    )
+    wt, result = _resume_dev_with_text(gh, spec, issue, state, fix_prompt)
+    state.set("last_agent_action_at", _now_iso())
+    _post_conflict_resolution_result(
+        gh, spec, issue, state, wt, result, before_sha, conflict_round,
+    )
+
+
+def _post_conflict_resolution_result(
+    gh: GitHubClient,
+    spec: RepoSpec,
+    issue: Issue,
+    state: PinnedState,
+    wt: Path,
+    result: AgentResult,
+    before_sha: str,
+    conflict_round: int,
+) -> None:
+    """Common post-agent handling for both fresh conflict resolution
+    and the awaiting-human resume path in `_handle_resolving_conflict`.
+
+    Always calls `gh.write_pinned_state` before returning so the caller
+    can return immediately after invoking this helper. Increments
+    `conflict_round` only on the success path -- failure paths leave
+    the counter alone so a human-reply resume that lands cleanly still
+    consumes a slot, but a timeout/dirty/push-failure on the same
+    counter does not.
+    """
+    if result.timed_out:
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} dev agent timed out resolving merge "
+            f"conflicts after {config.AGENT_TIMEOUT}s; manual intervention "
+            "needed.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    after_sha = _head_sha(wt)
+    if not after_sha or after_sha == before_sha:
+        # Agent did not produce a merge commit. Treat as a question /
+        # silence park, mirroring the implementing handler.
+        _on_question(gh, issue, state, result)
+        gh.write_pinned_state(issue, state)
+        return
+
+    dirty = _worktree_dirty_files(wt)
+    if dirty:
+        _on_dirty_worktree(gh, issue, state, result, dirty)
+        gh.write_pinned_state(issue, state)
+        return
+
+    if not _push_branch(spec, wt, _branch_name(issue.number)):
+        _park_awaiting_human(
+            gh, issue, state,
+            f"{config.HITL_MENTIONS} git push failed after conflict "
+            "resolution; see orchestrator logs.",
+        )
+        gh.write_pinned_state(issue, state)
+        return
+
+    state.set("review_round", 0)
+    state.set("conflict_round", conflict_round + 1)
+    state.set("last_conflict_resolved_at", _now_iso())
+    gh.set_workflow_label(issue, "validating")
+    gh.write_pinned_state(issue, state)
 
 
 def _on_commits(

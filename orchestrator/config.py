@@ -108,6 +108,11 @@ AGENT_TIMEOUT: int = int(os.environ.get("AGENT_TIMEOUT", "1800"))
 LOG_DIR: Path = Path(os.environ.get("LOG_DIR", str(REPO_ROOT / "logs")))
 REVIEW_TIMEOUT: int = int(os.environ.get("REVIEW_TIMEOUT", str(AGENT_TIMEOUT)))
 MAX_REVIEW_ROUNDS: int = int(os.environ.get("MAX_REVIEW_ROUNDS", "3"))
+# Cap on how many auto-conflict-resolution attempts one PR can use before
+# `_handle_resolving_conflict` parks awaiting human. Mirrors the
+# `MAX_REVIEW_ROUNDS` shape so a stuck rebase loop cannot burn tokens
+# indefinitely.
+MAX_CONFLICT_ROUNDS: int = int(os.environ.get("MAX_CONFLICT_ROUNDS", "3"))
 # Cap on how many fresh implementing-codex spawns one issue can use within a
 # 24h window opened at the first counted attempt. The window resets once 24h
 # elapses since that start. Resumes on human reply do not count. 0 = unbounded

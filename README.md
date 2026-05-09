@@ -130,6 +130,7 @@ All settings load from `.env` (or process environment). See [`.env.example`](.en
 | `AGENT_TIMEOUT`           | `1800`                                        | wall-clock cap per agent invocation, seconds              |
 | `REVIEW_TIMEOUT`          | (= `AGENT_TIMEOUT`)                           | wall-clock cap per reviewer invocation, seconds           |
 | `MAX_REVIEW_ROUNDS`       | `3`                                           | review/fix iterations before parking on `awaiting_human` |
+| `MAX_CONFLICT_ROUNDS`     | `3`                                           | auto-conflict-resolution rounds before parking on `awaiting_human` |
 | `MAX_RETRIES_PER_DAY`     | `3`                                           | fresh implementer spawns per issue per 24h window (`0` = unbounded) |
 | `DEV_AGENT`               | `claude`                                      | implementer backend; one of `codex` / `claude`            |
 | `REVIEW_AGENT`            | `codex`                                       | reviewer backend; one of `codex` / `claude`               |
