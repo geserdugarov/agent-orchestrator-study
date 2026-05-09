@@ -8470,7 +8470,10 @@ class AuthedFetchHardeningTest(unittest.TestCase):
             return fetch_result
 
         with mock_patch("subprocess.run", side_effect=fake_run), \
-             mock_patch.object(config, "GITHUB_TOKEN", "fake-token-xyz"):
+             mock_patch.object(
+                 workflow.config, "_resolve_github_token",
+                 return_value="fake-token-xyz",
+             ):
             workflow._authed_fetch(
                 _TEST_SPEC,
                 f"+refs/heads/main:refs/remotes/origin/main",
@@ -8522,7 +8525,10 @@ class AuthedFetchHardeningTest(unittest.TestCase):
             return fetch_result
 
         with mock_patch("subprocess.run", side_effect=fake_run), \
-             mock_patch.object(config, "GITHUB_TOKEN", "fake-token-xyz"):
+             mock_patch.object(
+                 workflow.config, "_resolve_github_token",
+                 return_value="fake-token-xyz",
+             ):
             r = workflow._authed_fetch(
                 _TEST_SPEC,
                 f"+refs/heads/main:refs/remotes/origin/main",
@@ -8543,7 +8549,9 @@ class AuthedFetchHardeningTest(unittest.TestCase):
             return MagicMock(returncode=0, stdout="", stderr="")
 
         with mock_patch("subprocess.run", side_effect=fake_run), \
-             mock_patch.object(config, "GITHUB_TOKEN", ""):
+             mock_patch.object(
+                 workflow.config, "_resolve_github_token", return_value=""
+             ):
             r = workflow._authed_fetch(
                 _TEST_SPEC, "refs/heads/main:refs/remotes/origin/main",
                 cwd=Path("/tmp"),
@@ -8552,6 +8560,97 @@ class AuthedFetchHardeningTest(unittest.TestCase):
         # No subprocess at all when the token is missing.
         self.assertEqual(runs, [])
         self.assertNotEqual(r.returncode, 0)
+
+    def test_uses_per_spec_token_for_git_fetch(self) -> None:
+        # Multi-repo regression guard: `_authed_fetch` must resolve the token
+        # from `spec.slug` (so a per-repo `~/.config/<owner>/<repo>/token`
+        # file is honored), not from the cached single-repo
+        # `config.GITHUB_TOKEN` looked up once for `config.REPO`. Without
+        # this, `_handle_resolving_conflict` fetches origin/<branch> /
+        # origin/<base> with the wrong (or empty) token for any repo other
+        # than the legacy single-repo `REPO`.
+        from unittest.mock import patch as mock_patch, MagicMock
+
+        rewrite_check = MagicMock(returncode=1, stdout="", stderr="")
+        fetch_result = MagicMock(returncode=0, stdout="", stderr="")
+        captured: dict[str, object] = {}
+
+        def fake_run(args, **kwargs):
+            if args and args[:3] == ["git", "config", "--local"]:
+                return rewrite_check
+            captured["args"] = args
+            captured["env"] = kwargs.get("env")
+            return fetch_result
+
+        resolved: list[str] = []
+
+        def fake_resolve(slug: str) -> str:
+            resolved.append(slug)
+            # Distinct token per slug so a regression that fell back to
+            # `config.GITHUB_TOKEN` would surface in GIT_TOKEN below.
+            return f"ghp-token-for-{slug.replace('/', '-')}"
+
+        other_spec = config.RepoSpec(
+            slug="acme/widgets",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="main",
+        )
+        with mock_patch("subprocess.run", side_effect=fake_run), \
+             mock_patch.object(
+                 workflow.config, "_resolve_github_token", fake_resolve
+             ):
+            r = workflow._authed_fetch(
+                other_spec,
+                "+refs/heads/main:refs/remotes/origin/main",
+                cwd=Path("/tmp"),
+            )
+        self.assertEqual(r.returncode, 0)
+        # Token resolved exactly once, for the spec's slug -- not for
+        # `config.REPO`.
+        self.assertEqual(resolved, ["acme/widgets"])
+        env = captured["env"]
+        self.assertEqual(env.get("GIT_TOKEN"), "ghp-token-for-acme-widgets")
+        # Auth URL targets the spec's slug, not the cached config.REPO.
+        self.assertIn(
+            "https://x-access-token@github.com/acme/widgets.git",
+            captured["args"],
+        )
+
+    def test_missing_per_spec_token_logs_slug(self) -> None:
+        # A multi-repo deployment that forgot to populate the per-slug token
+        # file should fail the fetch with the misconfigured slug surfaced in
+        # the error log -- the resolving_conflict handler then parks awaiting
+        # human, which is far more debuggable than a generic "GITHUB_TOKEN
+        # missing" with no repo identifier.
+        from unittest.mock import patch as mock_patch, MagicMock
+
+        runs: list = []
+
+        def fake_run(args, **kwargs):
+            runs.append(args)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        other_spec = config.RepoSpec(
+            slug="acme/widgets",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="main",
+        )
+        with mock_patch("subprocess.run", side_effect=fake_run), \
+             mock_patch.object(
+                 workflow.config, "_resolve_github_token", return_value=""
+             ), self.assertLogs(workflow.log, level="ERROR") as cm:
+            r = workflow._authed_fetch(
+                other_spec,
+                "+refs/heads/main:refs/remotes/origin/main",
+                cwd=Path("/tmp"),
+            )
+        # Fetch aborted before any subprocess ran.
+        self.assertEqual(runs, [])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(
+            any("acme/widgets" in line for line in cm.output),
+            f"expected slug 'acme/widgets' in log output, got {cm.output!r}",
+        )
 
 
 class ListPollableIssuesIncludesResolvingConflictTest(unittest.TestCase):
