@@ -26,12 +26,14 @@ The coding agent runs as a **transient child subprocess**, not a daemon — spaw
 
 ## Per-tick flow (`workflow.tick`)
 
-Each tick, `gh.list_pollable_issues()` yields all open non-PR issues plus closed non-PR issues still labeled `in_review` or `resolving_conflict`. The closed-`in_review`/`resolving_conflict` sweep is what makes the manual-merge path land cleanly: a human-merged PR with a `Resolves #N` footer auto-closes issue N before the orchestrator can flip the label, and without the sweep `_handle_in_review` / `_handle_resolving_conflict` would never run on it.
+Each tick the polling loop fans out across **every configured repo**. `config.default_repo_specs()` returns a list of `RepoSpec(slug, target_root, base_branch)` — one entry per `REPOS` line, or a single entry derived from the legacy `REPO` / `TARGET_REPO_ROOT` / `BASE_BRANCH` trio when `REPOS` is unset. `main._run_tick` iterates every `(spec, gh)` pair and calls `workflow.tick(gh, spec)` once per repo; a per-repo exception is logged and swallowed so one wedged repo cannot stop the others from advancing this tick. Each `GitHubClient` is constructed once at startup with `repo_spec=spec` and `ensure_workflow_labels` runs per repo so a fresh target repo bootstraps its labels on first connect.
+
+Inside `workflow.tick(gh, spec)`, `gh.list_pollable_issues()` yields all open non-PR issues plus closed non-PR issues still labeled `in_review` or `resolving_conflict`. The closed-`in_review`/`resolving_conflict` sweep is what makes the manual-merge path land cleanly: a human-merged PR with a `Resolves #N` footer auto-closes issue N before the orchestrator can flip the label, and without the sweep `_handle_in_review` / `_handle_resolving_conflict` would never run on it.
 
 For every yielded issue:
 
 1. Read its workflow label (one of `decomposing/ready/blocked/implementing/validating/in_review/resolving_conflict/done/rejected`).
-2. Dispatch by label. The full lifecycle (no label → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `resolving_conflict` (optional detour) → `done`/`rejected`) is implemented; `done` and `rejected` are terminal no-ops, every other label routes to its handler.
+2. Dispatch by label. The full lifecycle (no label → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `resolving_conflict` (optional detour) → `done`/`rejected`) is implemented; `done` and `rejected` are terminal no-ops, every other label routes to its handler. Every handler receives the active `RepoSpec`, so `git worktree add`, `git fetch origin <base>`, push-token resolution (`config._resolve_github_token(spec.slug)`), and PR-base selection all flow from the spec rather than module-level `config.REPO` / `config.TARGET_REPO_ROOT` / `config.BASE_BRANCH` reads.
 
 Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!--orchestrator-state {...json...}-->`), holding `dev_agent` + `dev_session_id` (the backend that handled this issue and its session), `review_agent`, `decomposer_agent` + `decomposer_session_id` (parents only; same lock-on-first-spawn semantics as `dev_agent`), `children` (parents only — child issue numbers, used by `_handle_blocked`), `dep_graph` (parents only — `{child_idx_str: [child_idx, ...]}` because GitHub has no first-class blocks-issue relation), `decomposed_at`, `pickup_comment_id`, `branch`, `pr_number`, `review_round`, `retry_window_start` + `retry_count` (per-issue 24h fresh-spawn budget; shared between implementing and decomposing), `awaiting_human`, `last_action_comment_id`, `pr_last_comment_id` (in_review high-watermark across the issue thread + PR conversation comments, which share the IssueComment id space; seeded at validating → in_review handoff so the orchestrator's own automated comments don't replay as fresh feedback, and bumped past any park comment so an HITL ping doesn't replay either), `pr_last_review_comment_id` (separate watermark for inline PR review comments, which live in their own id space), `pr_last_review_summary_id` (separate watermark in the PullRequestReview id space, distinct from both IssueComment and PullRequestComment ids; the watermark *only* advances from review IDs that survived `gh.pr_reviews_after`'s state/body filter — non-empty `CHANGES_REQUESTED` or `COMMENTED` — so `APPROVED`, `DISMISSED`, `PENDING`, and empty-body reviews **never** bump it. `_bump_in_review_watermarks` mirrors the same filter and advances strictly from the filtered list. This is safe because the same filter runs on every scan, so an `APPROVED` review id sitting above the watermark is harmlessly re-skipped each tick rather than re-forwarded), `agent_approved_sha` (the head SHA the reviewer agent OK'd; `_handle_in_review` keys AUTO_MERGE on this since the agent posts an issue comment, not a real PR review), `merged_at` / `closed_without_merge_at` (terminal stamps), etc. (`github.py:99`). The legacy `codex_session_id` key written before the configurable-backend rollout is still honored on read and treated as codex.
 
@@ -84,7 +86,7 @@ Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!
 - **Input**: issue + comments + pinned state (`dev_agent`/`dev_session_id`, retry-budget keys, etc.).
 - **Internal flow**:
   1. If `awaiting_human`: re-check for new human comments since `last_action_comment_id`; if any, **resume** the dev session via `run_agent(dev_agent, ...)` with that text. The backend is locked to whichever wrote `dev_session_id` (or the legacy `codex_session_id`) for this issue — flipping `DEV_AGENT` does not migrate in-flight issues. If no new comments, return.
-  2. Otherwise: ensure a per-issue worktree at `<WORKTREES_DIR>/issue-<n>` on branch `orchestrator/issue-<n>`. Worktrees with unpushed commits are reused (crash recovery); otherwise force-removed and recreated from `origin/main`.
+  2. Otherwise: ensure a per-issue worktree at `<WORKTREES_DIR>/<owner>__<name>/issue-<n>` (the slug subdir keeps two repos with the same issue number isolated on disk) on branch `orchestrator/issue-<n>`. Worktrees with unpushed commits are reused (crash recovery); otherwise force-removed and recreated from `origin/<spec.base_branch>` in `spec.target_root`.
   3. If the worktree already has commits (recovered), skip the agent and go straight to push.
   4. Else gate the run on the **per-issue retry budget** (`MAX_RETRIES_PER_DAY`, default 3): a 24h window opens at the first counted spawn and resets after 24h; only fresh spawns count, not human-resume runs or recovered-worktree pushes. If the cap is exhausted, park awaiting human and return.
   5. Else build the **implementer prompt** (issue body + recent comments + "commit, do not push") and `run_agent(config.DEV_AGENT, ...)`. On a new session id, persist `dev_agent` + `dev_session_id`.
@@ -172,8 +174,8 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
 | Component | Type | Trigger | Cadence |
 |---|---|---|---|
 | `main` polling loop | long-lived Python process | manual start (or wrapper) | every `POLL_INTERVAL`s |
-| `workflow.tick` | function call | each loop iteration | once per tick |
-| `_handle_*` per issue | function call | issue's workflow label | once per tick per open issue |
+| `workflow.tick(gh, spec)` | function call | each loop iteration | once per tick **per configured `RepoSpec`** (single-repo legacy mode collapses to N=1) |
+| `_handle_*` per issue | function call | issue's workflow label | once per tick per open issue (within its repo's `tick`) |
 | decomposer agent (`DECOMPOSE_AGENT`) | subprocess (fresh or resumed, locked backend) | `_handle_decomposing` (retry budget OK) or HITL resume | one shot per tick when needed |
 | implementer agent (`DEV_AGENT`) | subprocess | `_handle_implementing` (no commits yet, retry budget OK) or HITL resume | one shot per tick when needed |
 | reviewer agent (`REVIEW_AGENT`) | subprocess (fresh session) | `_handle_validating`, round < max | one shot per tick |
@@ -187,23 +189,28 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
 
 ```
                      ┌──────────────────────────────────────┐
-                     │   GitHub repo (REPO)                 │
+                     │   GitHub repo(s) (REPO or REPOS)     │
+                     │   ─ one orchestrator drives N repos  │
                      │   ─ issues (with workflow labels)    │
                      │   ─ pinned state comment per issue   │
                      │   ─ branches / PRs                   │
                      └──────────────┬───────────────────────┘
-                                    │ PyGithub (token)
+                                    │ PyGithub (one token per slug)
                                     │
    ┌────────────────────────────────┴─────────────────────────────────────┐
    │  orchestrator process  (python -m orchestrator.main)                 │
    │  ───────────────────────────────────────────────────                 │
    │   main.py                                                            │
+   │     startup: build [(spec, GitHubClient(repo_spec=spec)), ...] from  │
+   │              config.default_repo_specs() and ensure_workflow_labels  │
+   │              once per spec                                           │
    │     loop every POLL_INTERVAL s:                                      │
    │       1. self-restart check (origin/main moved & touches orch/?)     │
-   │       2. workflow.tick(gh)                                           │
+   │       2. for (spec, gh) in clients: workflow.tick(gh, spec)          │
+   │          (per-repo exception logged + skipped, never aborts the tick)│
    │                    │                                                 │
    │                    ▼                                                 │
-   │   workflow.tick → for each open issue → dispatch by label:           │
+   │   workflow.tick(gh, spec) → for each open issue → dispatch by label: │
    │                                                                      │
    │     (no label) ──► _handle_pickup                            │       │
    │                       ├─ DECOMPOSE=on  ─► decomposing        │       │
@@ -313,9 +320,11 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
                   │ commits to                            │ pushes branch to
                   ▼                                       ▼
    ┌─────────────────────────────────────────────────────────────────────┐
-   │  git worktree:  <WORKTREES_DIR>/issue-<n>                           │
+   │  git worktree:  <WORKTREES_DIR>/<owner>__<name>/issue-<n>           │
    │  branch:        orchestrator/issue-<n>                              │
-   │  ─ created from origin/main (or reused if has unpushed commits)     │
+   │  ─ slug subdir keeps two repos with the same issue # from colliding │
+   │  ─ created from origin/<spec.base_branch> in spec.target_root       │
+   │    (or reused if has unpushed commits)                              │
    └─────────────────────────────────────────────────────────────────────┘
 ```
 

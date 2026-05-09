@@ -3605,8 +3605,16 @@ def _authed_fetch(
     clones still update the remote-tracking ref instead of leaving the
     fetched payload only in FETCH_HEAD.
     """
-    if not config.GITHUB_TOKEN:
-        log.error("GITHUB_TOKEN missing; cannot fetch")
+    # Resolve the token from `spec.slug` rather than the cached
+    # `config.GITHUB_TOKEN` (which was looked up once for `config.REPO`),
+    # so a multi-repo deployment with one token file per slug under
+    # `~/.config/<owner>/<repo>/token` fetches with the right repo's token.
+    # Mirrors `_push_branch`'s per-spec token resolution; without this,
+    # `_handle_resolving_conflict` would fail conflict resolution for any
+    # repo other than the legacy `REPO` (or use the wrong token).
+    token = config._resolve_github_token(spec.slug)
+    if not token:
+        log.error("GITHUB_TOKEN missing for %s; cannot fetch", spec.slug)
         return subprocess.CompletedProcess(
             args=["git", "fetch"], returncode=1, stdout="",
             stderr="GITHUB_TOKEN missing",
@@ -3634,7 +3642,7 @@ def _authed_fetch(
             **os.environ,
             **_GIT_NO_PROMPT_ENV,
             "GIT_ASKPASS": str(askpass),
-            "GIT_TOKEN": config.GITHUB_TOKEN,
+            "GIT_TOKEN": token,
             "GIT_AUTHOR_NAME": config.AGENT_GIT_NAME,
             "GIT_AUTHOR_EMAIL": config.AGENT_GIT_EMAIL,
             "GIT_COMMITTER_NAME": config.AGENT_GIT_NAME,
