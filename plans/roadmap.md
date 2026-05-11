@@ -1,264 +1,251 @@
-# Agent Orchestrator MVP — Implementation Plan
-
-## Status as of 2026-05-03
-
-**Self-bootstrap path is shipped, with the full lifecycle now wired.** The scaffold, polling loop, codex/claude invocation, hardened push, PR open, and the (no label → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `done`/`rejected`) state machine all exist on `main` (commits `eb87246` … `029b08f`, plus the decomposition stage). The orchestrator can be pointed at `geserdugarov/agent-orchestrator` and run end-to-end against any bootstrap or oversized test issue.
-
-Done:
-
-- `orchestrator/{__init__,main,workflow,github,agents,config}.py`, `pyproject.toml`, `.env.example`, `.gitignore`, `run.sh` — all in place.
-- Polling loop with `--once`, `SIGTERM`/`SIGINT`-clean shutdown, ancestry-aware self-update detection (`main.py` exits when `origin/<BASE_BRANCH>` advances past the running HEAD with changes under `orchestrator/`).
-- `run.sh` self-restart wrapper that pulls the same `BASE_BRANCH` the Python code uses.
-- `GitHubClient`: list issues, workflow-label r/w, post comment, pinned-state JSON r/w, open/find PR, idempotent label bootstrap (graceful on under-scoped PAT).
-- Pinned-state JSON comment with `<!--orchestrator-state ...-->` marker (note: differs slightly from the original plan's `<!-- orchestrator-state -->` plus fenced JSON — the marker is now inline with the JSON payload).
-- `run_codex` against `codex exec` and `codex exec resume`, `--dangerously-bypass-approvals-and-sandbox`, `--json`, `-o <last-message-file>`. Session ID parsed by walking JSONL events for any UUID-shaped value at `session_id`/`conversation_id`/etc.
-- `_handle_implementing` covers: fresh run, resume on human follow-up, timeout → park on `awaiting_human`, no-commits-but-message → park as question, commits + clean tree → push + open PR + flip to `in_review`, commits + dirty tree → park (refuse to push partial branch), push failure → park.
-- Worktrees at `WORKTREES_DIR/issue-<N>` (default `../wt-orchestrator/issue-<N>`), reused when prior commits remain unpushed so a crash between commit and push doesn't burn another codex run.
-- Multi-handle HITL mentions via comma-separated `HITL_HANDLE` (commits `34853f9`, `b8e5fb2`).
-- `tests/test_config.py` covers HITL handle parsing.
-
-Done beyond the original plan (security hardening from review iterations):
-
-- **PAT never leaves orchestrator-controlled surfaces.** The agent's environment is scrubbed of `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_TOKEN`/`GITHUB_PAT`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`/`GH_HOST` (`agents.py`). The orchestrator owns all GitHub writes; the agent has no path to push or call the API as us.
-- **PAT cannot live in `REPO_ROOT/.env`** (which is agent-readable via relative path from the worktree). `config._load_dotenv` actively rejects secret keys found there with a clear stderr message. Token must come from the process environment or a file outside `REPO_ROOT` — default `~/.config/<owner>/<repo>/token`, derived from `REPO` (commit `06c7ea2`).
-- **Hardened `git push`**: askpass tempscript reads token from env (token never in argv / `/proc/<pid>/cmdline`); `core.hooksPath=/dev/null`, `credential.helper=`, `core.fsmonitor=`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` to defeat agent-planted hooks, helpers, fsmonitor programs, and `~/.gitconfig` `url.insteadOf` rewrites that could redirect the auth URL. Also refuses to push when the local config carries `url.*.insteadOf`/`pushInsteadOf` rules. Push errors are logged with the token scrubbed (commits `c9f1bb1`, `26d9a1f`).
-- **Refuse incomplete branches**: `_worktree_dirty_files` blocks the push when codex committed only part of its work, parks on `awaiting_human` instead of publishing a misleading PR.
-- **Idempotent PR open**: `find_open_pr` recovers when a previous tick crashed between `create_pull` and the relabel — reuses the existing open PR rather than 422-ing.
-- **Idempotent label bootstrap**: `ensure_workflow_labels` swallows 403s with an actionable message so the loop keeps running while the PAT is being fixed.
-
-Open items from the Day-1 checklist:
-
-1. **Codex flag name & JSON output shape** — resolved during Day 2 (`--dangerously-bypass-approvals-and-sandbox`, `--json`, last-message-via-`-o`, UUID walker for session ID).
-2. **Commit identity for agent commits** — resolved in `7f9c6e2`. `agents._agent_env` injects `GIT_AUTHOR_*` / `GIT_COMMITTER_*` from `AGENT_GIT_NAME` / `AGENT_GIT_EMAIL` (default `agent-orchestrator <agent-orchestrator@users.noreply.github.com>`) into every spawn, overriding any `~/.gitconfig` without touching it.
-3. **HITL @mention handle** — resolved as a configurable list (`HITL_HANDLE`, default `geserdugarov`).
-
-Done in Day 4–5 (post-original-plan, shipped together as `7f9c6e2`):
-
-- **Per-issue retry budget.** `MAX_RETRIES_PER_DAY` (default 3, `0` = unbounded) caps fresh implementing-codex spawns within a 24h window opened at the first counted attempt; resumes on human reply and recovered-worktree pushes don't count. Pinned state grew `retry_window_start` + `retry_count`. Forward progress (`_on_commits`) resets the budget.
-- **Agent commit identity stamped via env.** See Day-1 item 2 above.
-- **Fake-`Github` test harness landed.** `tests/fakes.py` (199 lines) plus a 700-line expansion of `tests/test_workflow.py` cover state transitions, the resume-on-human-reply path, retry-budget gating, and the new agent-identity env stamping. The original-plan TODO for `tests/test_workflow.py` is no longer outstanding.
-
-Done in Day 6 (validating stage):
-
-- `validating` stage as a review loop. Every PR opened by the implementer enters `validating`. A fresh reviewer-agent session (`run_agent(config.REVIEW_AGENT, ...)`) reviews `git diff origin/<base>...HEAD` against the issue and emits `VERDICT: APPROVED` / `VERDICT: CHANGES_REQUESTED`. On approval the label flips to `in_review` and humans take over. On changes requested the dev session is resumed (on whichever backend started the issue) with the feedback, the fix is pushed, and the review re-runs. Capped at `MAX_REVIEW_ROUNDS` (default 3) before parking on `awaiting_human`.
-- Review feedback and approval comments go to the **PR** via `pr.create_issue_comment` (`gh.pr_comment`). HITL pings (timeouts, cap reached, malformed verdict) stay on the issue.
-- Pinned state gained `review_round`, `last_review_session_id`, `last_review_at`, plus `review_agent` (which backend ran the review) added with the configurable-backend rollout in `8f91df5`.
-- `tests/test_workflow.py` covers `_parse_review_verdict` against APPROVED / CHANGES_REQUESTED / inline marker / case-insensitive / last-marker-wins / missing-marker / empty input.
-- `_park_awaiting_human` extracted from the existing inline parking blocks; `_resume_developer_on_human_reply` extracted so both `implementing` and `validating` share the human-reply resume path.
-- **Configurable dev/review backends (`8f91df5`).** `DEV_AGENT` (default `claude`) and `REVIEW_AGENT` (default `codex`) route each spawn through `run_agent` to either `_run_codex` or `_run_claude`; both backends return a unified `AgentResult` (with `CodexResult` kept as a one-release alias). Both values are validated at config load — a typo aborts startup. `CLAUDE_BIN` is no longer dormant. Pinned state grew `dev_agent` + `dev_session_id` (replacing `codex_session_id`); the legacy key is still honored on read and treated as codex, so in-flight issues stay locked to whichever backend started them across a `DEV_AGENT` flip.
-
-Done in Day 9–10 (in_review terminals + auto-merge):
-
-- `_handle_in_review` covers the four terminal arcs out of `in_review`: PR merged externally → `done` (issue closed, `merged_at` stamped); PR closed without merge → `rejected` (issue closed, `closed_without_merge_at` stamped); PR open with new comments past a 10-minute debounce → resume the dev's locked-backend session on the comment text, push the fix, bounce the issue back to `validating` so the reviewer re-runs, reset `review_round`; PR open with no comments + `AUTO_MERGE=on` + reviewer-approved-on-current-head + GitHub-mergeable + green CI → SHA-pinned `pr.merge()` → `done`. Park awaiting human on unmergeable / failed checks / failed push / missing pr_number.
-- Polling switched from `list_open_issues` to `list_pollable_issues`, which also yields closed issues still labeled `in_review`. Without that, an external manual merge (which auto-closes the linked issue via `Resolves #N`) would never reach `_handle_in_review` and the issue would stay closed-but-`in_review` forever.
-- `GitHubClient` extended with `get_pr`, `pr_state`, `pr_is_mergeable` (refresh-once on a None mergeable; treats None as "still computing"), `pr_combined_check_state` (combines legacy combined-status + check-runs APIs), `pr_is_approved(pr, *, head_sha=...)` (only counts reviews submitted on the *current* head SHA so a stale human approval cannot let later commits auto-merge), `merge_pr` (sha-pinned, returns False on 405/409/422 instead of raising), and split comment-watermark methods `pr_conversation_comments_after` / `pr_inline_comments_after` (issue+PR-conversation comments share an id space; inline review comments live in a separate id space, so the orchestrator tracks two independent watermarks).
-- New env knobs: `AUTO_MERGE` (default `off`; truthy spellings 1/true/on/yes; typo defaults safely to off) and `IN_REVIEW_DEBOUNCE_SECONDS` (default 600s, matches `docs/workflow.md:142`).
-- Pinned state grew `pr_last_comment_id` (issue + PR-conversation high-watermark, seeded at the validating → in_review handoff so the orchestrator's own automated comments don't replay as fresh PR feedback once the debounce expires; bumped past any park comment in `_handle_in_review` so an HITL ping doesn't replay either), `pr_last_review_comment_id` (separate watermark for inline review comments since their ids live in a different namespace), `agent_approved_sha` (the head SHA the reviewer agent OK'd, used by the AUTO_MERGE gate since the agent posts an issue comment rather than a real PR review and `pr_is_approved` alone would never fire for the agent flow), `merged_at`, `closed_without_merge_at`.
-- `_resume_dev_with_text` extracted from `_resume_developer_on_human_reply` so the in_review path can resume on PR-comment text without overloading the issue-only helper. `_bump_in_review_watermarks` ratchets the in_review comment watermarks forward whenever the handler parks, so the next tick does not see the orchestrator's own park comment as fresh PR feedback.
-- `tests/fakes.py` extended with `FakePR` PR-state surface (merged / state / mergeable / head.sha / approved / approval_head_sha / check_state / issue_comments / review_comments) plus `FakePRRef`; `FakeIssue` learned `closed` + `edit(state="closed")`; `FakeGitHubClient` got `add_pr` / `get_pr` / `pr_state` / `pr_is_mergeable` / `pr_is_approved(pr, *, head_sha)` / `pr_combined_check_state` / `merge_pr` / `pr_conversation_comments_after` / `pr_inline_comments_after`; `list_open_issues` renamed to `list_pollable_issues` (closed-in_review sweep included).
-- 13 base `_handle_in_review` cases plus follow-ups for closed-issue external-merge finalization, stale-human-approval gating, park-comment replay prevention, and split-watermark comment routing in `tests/test_workflow.py`; 7 new `tests/test_config.py` cases for `AUTO_MERGE` / `IN_REVIEW_DEBOUNCE_SECONDS`.
-
-Done in Day 11–12 (decomposing stage):
-
-- `_handle_decomposing` drives a fresh decomposer agent on its own configurable backend (`DECOMPOSE_AGENT`, default `claude`, validated at config load even when the kill switch is off). The agent reads the issue read-only and emits a fenced ` ```orchestrator-manifest ` JSON block. `_parse_manifest` accepts `decision=single` (parent flips to `ready` with the rationale surfaced as a comment) or `decision=split` with up to 10 children, structurally validated for shape, dependency indexes, self-dependencies, and cycles (DFS for back-edges). Invalid manifests park awaiting human with the parse error and the agent's last message quoted; absent manifests park as a question mirroring `_on_question`.
-- `_handle_ready` is the entry point for both single-decision parents and auto-created children. It seeds `pickup_comment_id` + `created_at` when missing (so the in_review legacy migration has its anchor), flips the label to `implementing`, and falls into `_handle_implementing` on the same tick.
-- `_handle_blocked` polls each child's current label: any `rejected` child parks the parent awaiting human; all `done` flips parent → `ready` with a summary comment; otherwise the dep-graph walk relabels any `blocked` child whose dependencies are all `done` to `ready`. The dep graph is stored in the parent's pinned state under `dep_graph: {child_idx_str: [child_idx, ...]}` because GitHub has no first-class blocks-issue relation.
-- `GitHubClient` gained `get_issue` and `create_child_issue`. The latter prepends a `Parent: #<n>` line to the body and deliberately does NOT use `Resolves` keywords, so a merged child PR cannot auto-close the parent before `_handle_blocked` aggregates across siblings.
-- Pinned-state grew `decomposer_agent` + `decomposer_session_id` (parent only; same lock-on-first-spawn semantics as `dev_agent`), `children` (parent only), `dep_graph` (parent only), `decomposed_at`. The retry budget (`MAX_RETRIES_PER_DAY`) is shared between implementing and decomposing on the same issue — both consume the same daily counter.
-- New env knobs: `DECOMPOSE_AGENT` (default `claude`, validated even when `DECOMPOSE=off`) and `DECOMPOSE` (default `on`, strict-truthy parser like `AUTO_MERGE`; off reverts to the legacy direct-to-`implementing` pickup so operators can disable decomposition without redeploying).
-- 9 manifest-parser tests + 8 `_handle_decomposing` tests + 5 `_handle_blocked` tests + 2 `_handle_ready` tests + 1 `create_child_issue` regression + 9 new `tests/test_config.py` cases for `DECOMPOSE` / `DECOMPOSE_AGENT`. `tests/fakes.py` extended with `get_issue`, `create_child_issue`, and a `created_child_issues` recorder.
-
-Done (conflict resolution stage):
-
-- New `resolving_conflict` workflow label and `_handle_resolving_conflict` handler. Under `AUTO_MERGE=on`, an approved-but-unmergeable PR (a sibling decomposed PR landed first → this PR is no longer mergeable; PyGithub does not distinguish content conflicts from out-of-date base, so any unmergeable PR past the approval gates is eligible) no longer parks awaiting human in `_handle_in_review`. Instead the orchestrator posts a notice on the PR, seeds `conflict_round=0` (only when absent — re-entries preserve the cap counter so a perpetually-unmergeable PR cannot loop forever), flips the label to `resolving_conflict`, and lets the dedicated handler take over on the next tick. Under `AUTO_MERGE=off` the legacy unmergeable park is preserved (humans drive the merge in that mode).
-- `_handle_resolving_conflict` runs the auto-resolution loop: ensure a PR-aware worktree (`_ensure_pr_worktree` restores from `origin/<branch>` so the PR's commits are not silently discarded by an `_ensure_worktree`-style rebuild from `origin/<base>`), refresh both `origin/<branch>` and `origin/<base>` over the same hardened authenticated channel `_push_branch` uses, then `git merge --no-edit origin/<base>` under `_git_hardened` (drops global/system git config, disables hooks/fsmonitor/credential helpers — the agent owns the worktree and could otherwise plant a hook to execute attacker code mid-merge). Clean merge → if HEAD did not move (already up-to-date — nothing to push) just flip back to `validating` with `review_round=0`; if HEAD moved (whether by fast-forward or by a real merge commit) push first and then flip. Real conflicts → resume the dev session on the locked backend with a conflict-resolution prompt that names up to 20 conflicted paths and instructs the agent to commit the merge (do not push); on a successful resolved commit, push and flip to `validating`.
-- Merge over rebase by design: rebase rewrites every commit's SHA, which would invalidate the stored `agent_approved_sha` snapshot and force the reviewer agent to re-approve the entire branch even when only the base content changed.
-- `MAX_CONFLICT_ROUNDS` (default 3, env-tunable) caps how many auto-resolution attempts the orchestrator will spend before parking awaiting human. The counter increments on every clean push **and** every no-op already-up-to-date merge (HEAD unchanged), so a PR that is unmergeable purely due to branch protection / required reviewers cannot ping-pong between `in_review` and `resolving_conflict` forever — the situation surfaces to the operator within `MAX_CONFLICT_ROUNDS` ticks. The post-agent `_post_conflict_resolution_result` helper increments the counter only on the success path so timeout / dirty / push-fail does not eat a slot from the cap.
-- Crash recovery: an in-sync ahead-of-`origin/<branch>` worktree (a previous tick committed a conflict resolution but crashed before `_push_branch` returned) is treated as recovered work — push, increment `conflict_round`, flip to `validating`. A diverged worktree (`behind > 0` against `origin/<branch>`) parks awaiting human rather than risk clobbering the real PR head with a force-push.
-- Awaiting-human resume path mirrors the implementing/in_review pattern: a parked round can be unstuck by a human comment that triggers `_resume_dev_with_text` on the in-progress merge worktree. The dirty-tree / question / push-fail park messages explicitly invite that flow.
-- Pinned state grew `conflict_round` (the cap counter) and `last_conflict_resolved_at`. `list_pollable_issues` extended to also yield closed-but-`resolving_conflict` issues so a manually-merged PR mid-stage finalizes to `done` cleanly (mirrors the closed-`in_review` sweep).
-- `GitHubClient` / push-path additions: `_authed_fetch` (the same hardened envelope as `_push_branch` for fetches inside agent-writable worktrees — refuses url-rewrite rules, drops global/system git config, askpass-tempfile auth so GIT_TOKEN never lands in argv) and `_git_hardened` (local-only `git merge` with the same hooks/fsmonitor/url-rewrite hardening).
-- Tests: dedicated `_handle_resolving_conflict` suite covers the merge / push / cap / resume / recovery / dirty-tree / fetch-fail / diverged-worktree / closed-issue paths; `_handle_in_review` gained cases for the AUTO_MERGE-on routing to `resolving_conflict`, the `conflict_round` preservation on re-entry, and the AUTO_MERGE-off legacy-park behavior; `tests/fakes.py` and `tests/test_workflow.py` extended for the new label, the dispatcher routing, the closed-issue sweep, and the hardened-fetch/merge subprocess shape.
-
-Done (multi-repo support, issue #6 + children #8/#9/#10):
-
-- New `RepoSpec(slug, target_root, base_branch)` dataclass in `config.py` and `default_repo_specs()` accessor. Threaded through every workflow handler (`tick(gh, spec)`, `_handle_*`, `_ensure_worktree`, `_ensure_pr_worktree`, `_push_branch`, `_squash_and_force_push`, `_first_commit_subject`, `_branch_ahead_behind`, `_cleanup_merged_branch`, `_decompose_*`, …) so all `git worktree add` / `git fetch origin <base>` / token-resolution / PR-base reads pull from the active spec instead of module-level `config.REPO` / `config.TARGET_REPO_ROOT` / `config.BASE_BRANCH` globals. `GitHubClient` accepts `repo_spec=` and resolves the per-slug GitHub token via `config._resolve_github_token(spec.slug)` so a deployment with one PAT file per repo at `~/.config/<owner>/<repo>/token` picks up the right token for each spec; the legacy `repo_slug=` shortcut still works for tests and single-repo callers.
-- Per-issue worktrees are namespaced by repo slug: `WORKTREES_DIR/<owner>__<name>/issue-N` (and the `decompose-N` scratch sibling), via `_sanitize_slug` + `_repo_worktrees_root`. Two repos that share an issue number can no longer collide on disk, and the orchestrator's own checkout is still untouched while the agent edits its worktree.
-- New `REPOS` env var parses `owner/name|target_root|base_branch` entries separated by newlines or `;` (the latter so the value fits on one `.env` line, since the simple `_load_dotenv` parser can't represent multi-line values). Validation runs at import: malformed entries, slugs that aren't exactly `owner/name`, empty `target_root`, empty `base_branch`, duplicate slugs, and a `REPOS` value that yields zero entries all abort startup with `SystemExit`. A `target_root` that does not exist on disk is warned to stderr but does not abort, so a freshly-cloned host can still start the orchestrator and surface the misconfiguration on the first tick. When `REPOS` is unset the legacy single-repo trio still works unchanged (`default_repo_specs()` collapses to a one-element list).
-- `main._run_tick` iterates every `(spec, GitHubClient)` pair on every tick and calls `workflow.tick(gh, spec)` once per repo. A per-repo exception is `log.exception`-logged and skipped so one wedged repo cannot stop the others from advancing this tick. `ensure_workflow_labels` is called once per spec at startup so a fresh target repo bootstraps its labels on first connect.
-- Tests: `tests/test_main.py` covers the `--once` per-repo fan-out, the per-repo exception isolation, and the legacy single-repo fallback. `tests/test_config.py::MultiRepoConfigTest` covers `REPOS` parsing, both separators, the legacy fallback, the `REPOS`-overrides-legacy precedence, every abort branch (duplicate slug, malformed entry, empty/extra slug components, empty base/target, all-comments REPOS), and the warn-but-don't-abort path for a missing `target_root`. `tests/test_workflow.py` exercises the `spec`-threaded handlers (alternative `RepoSpec`s for `_first_commit_subject` against a non-`main` base, per-spec push-token resolution, and the slug-namespaced worktree paths).
-- README's "Managing multiple repositories" section and the multi-line `REPOS=` block in `.env.example` document the operator-facing UX, including per-slug token files and the on-disk worktree layout.
-
-Not yet done:
-
-- Dockerfile / systemd / GitHub App migration.
-
-## Context
-
-The goal documented in `docs/workflow.md` is an "orchestrator": a long-running process that watches GitHub Issues, drives them through a fixed 4-stage workflow (Decompose → Implement → Validate → Accept), and uses local AI coding-agent CLIs (`codex`, `claude`) to do the actual work. State lives in GitHub Issues themselves (one label per issue, plus pinned JSON state in a comment) so the orchestrator stays stateless and the user can watch progress on github.com.
-
-The driver of this plan is the user's twin constraint: **2-week total budget** and "switch to self-development as soon as possible" — i.e. the orchestrator has to become useful for resolving issues in *its own repo* well before the 2 weeks are up, so the rest of the build can itself be done by the orchestrator (compiler-bootstrap principle). The intended outcome is a self-bootstrap milestone by **Day 3** that handles the (no-label → implementing → in_review) happy path end-to-end against this very repo, with the documented `decomposing` and `validating` stages added in the second week.
-
-User-confirmed decisions: **aggressive scope cut** for the bootstrap milestone, **Python 3.12**, **fine-grained PAT scoped to this repo only** for GitHub auth.
-
-## Bootstrap milestone scope (Day 1–3)
-
-Ship only the critical path; everything else is iteration:
-
-- New issue with no label → orchestrator picks it up → labels `implementing` → spawns `codex` in a worktree → pushes branch → opens PR → labels `in_review`. **`decomposing` and `validating` stages are skipped entirely at this stage.**
-- Human reviews PR on github.com and merges manually. No auto-merge initially.
-- HITL: when codex output indicates it's blocked / needs input, the orchestrator posts the question as an issue comment, leaves the issue at `implementing`, and waits for a fresh human comment before resuming the codex session.
-- Concurrency: **one agent at a time** (a `Lock` in `main.py`). Issues queue.
-
-Defer to Week 2 (Day 6–14): ~~`validating` stage with claude PR review~~ (now done as a codex-on-codex loop), auto-merge on approve+green-CI, comment debounce, `decomposing`, `blocked`/`rejected` flows, parallel agents, container isolation, VPS deploy, GitHub App migration.
-
-## Tech stack
-
-- **Python 3.12** (already on host).
-- One dependency: **PyGithub**. No `gh` CLI install; `requests`/`httpx`/`octokit` not needed.
-- Standard library `subprocess`, `pathlib`, `json`, `logging`, `signal`, `time`. No `python-dotenv` — read `.env` manually in `config.py`.
-- Tests: stdlib `unittest` against a faked `Github` object. No mocking of `codex`/`claude` — those are integration-tested via the bootstrap issue.
-
-## File layout
-
-Flat package, ~5 files for the bootstrap milestone. No premature abstraction. Current shape on disk:
-
-```
-/home/geserdugarov/git/agent-orchestrator/
-├── README.md
-├── docs/workflow.md                (Russian-language source of truth for label/stage semantics)
-├── orchestrator/
-│   ├── __init__.py
-│   ├── main.py                     # polling loop, --once, --log-level, SIGTERM/SIGINT, ancestry-aware self-update detection
-│   ├── workflow.py                 # state machine + worktree mgmt + hardened push (state machine core)
-│   ├── github.py                   # PyGithub wrapper: issues, labels, comments, pinned-state JSON, open/find PR, label bootstrap
-│   ├── agents.py                   # codex spawn/resume, session-ID walker, env scrub, last-message capture
-│   └── config.py                   # .env loader (rejects secrets), token resolution from env or ~/.config/<owner>/<repo>/token, HITL parsing
-├── pyproject.toml                  # PEP 621, deps = ["PyGithub>=2.1"]
-├── run.sh                          # self-restart wrapper, BASE_BRANCH-aware pull
-├── .env.example                    # REPO, POLL_INTERVAL, AGENT_TIMEOUT, HITL_HANDLE, *_BIN (no GITHUB_TOKEN — banned from .env)
-├── .gitignore                      # .env, __pycache__, .venv, .codex/, .claude/, …
-└── tests/
-    ├── __init__.py
-    └── test_config.py              # HITL handle parsing
-                                    # test_workflow.py — TODO (Day 4)
-```
-
-## State machine (bootstrap milestone)
-
-| From label | Trigger | To label | Handler |
-|---|---|---|---|
-| (none) | issue is open & unlabeled | `implementing` | `handle_pickup`: post "starting work" comment, create branch `orchestrator/issue-<N>` in a fresh worktree at `../wt-issue-<N>`, set label, hand off to `handle_implement` |
-| `implementing` | no agent currently running for this issue & no "awaiting human" marker | (stays) | `handle_implement`: spawn `codex exec` with issue title+body+comments, on success push branch and open PR, persist `codex_session_id` + `branch` + `pr_number` into pinned-state JSON comment |
-| `implementing` | codex returned a blocked/question signal | (stays) | post the question as a normal comment, write `awaiting_human=true` into pinned-state, do nothing further this tick |
-| `implementing` (awaiting_human) | new human comment arrived after agent's last action | (stays) | `codex resume --session <id>` with the new comment text, clear `awaiting_human` |
-| `implementing` | PR opened successfully | `in_review` | flip label, post comment with PR link |
-| `in_review` | (bootstrap) | (terminal) | wait for human to merge or close manually; orchestrator does nothing |
-
-Defer to Week 2 transitions: `(none) → decomposing`, `decomposing → ready/blocked`, `ready → implementing` (split out from pickup), `implementing → validating`, `validating → in_review` / `validating → ready`, `in_review → done` (auto-merge), `in_review → rejected`.
-
-Pinned-state comment shape (one per issue, found by the marker `<!--orchestrator-state` and parsed via `PINNED_STATE_RE`):
-
-```
-<!--orchestrator-state {"dev_agent":"claude","dev_session_id":"…","review_agent":"codex","last_review_session_id":"…","last_review_at":"…","branch":"orchestrator/issue-7","pr_number":42,"review_round":0,"retry_window_start":"…","retry_count":1,"awaiting_human":false,"last_action_comment_id":1234567,"created_at":"…","last_agent_action_at":"…"}-->
-```
-
-The orchestrator-owned keys today: `dev_agent`, `dev_session_id`, `review_agent`, `last_review_session_id`, `last_review_at`, `branch`, `pr_number`, `review_round`, `retry_window_start`, `retry_count`, `awaiting_human`, `last_action_comment_id`, `created_at`, `last_agent_action_at`. Issues created before the configurable-backend rollout still carry the legacy `codex_session_id`; readers fall back to it and treat it as a codex session.
-
-## Polling loop
-
-**Polling, not webhooks.** Single Linux/WSL2 host has no public endpoint; polling is one process, no inbound networking, easy to debug. Cost is negligible (~1 GET per minute, well under PyGithub's rate limit handling).
-
-Tick (every 60s, configurable via `POLL_INTERVAL`):
-
-1. `repo.get_issues(state="open", since=last_tick - 5min, sort="updated", direction="desc")` — only changed issues.
-2. For each issue, read its current label, dispatch via `workflow.py` to the matching handler. Each handler re-reads the issue + pinned state immediately before acting (read-modify-write inside one tick) to avoid races with human comments.
-3. `last_tick = now`; sleep `POLL_INTERVAL`.
-
-`main.py` exposes `--once` (single tick then exit, used in dev/tests) and traps `SIGTERM`/`SIGINT` so the loop can shut down cleanly between ticks.
-
-## Agent invocation
-
-`agents.py` initially exposes one function: `run_codex(prompt: str, cwd: Path, resume_session_id: str | None) -> CodexResult`.
-
-```
-codex exec \
-  --dangerously-bypass-approvals-and-sandbox \
-  --cd <worktree path> \
-  --json \
-  "<prompt>"        # or: codex resume --session <id> "<follow-up>"
-```
-
-Implementation (current state in `agents.py` / `workflow.py`):
-- `subprocess.run(..., timeout=AGENT_TIMEOUT)` with `AGENT_TIMEOUT=1800` (30 min hard cap). **Done.**
-- Parse JSON-lines output to capture the session ID. **Done** — `parse_session_id` walks JSONL events for any UUID at `session_id`/`conversation_id`/`thread_id`/`session`/`id` (or anywhere nested).
-- Detect "blocked / needs human input" by a simple heuristic: agent finishes without committing changes. **Done** — implemented as `not _has_new_commits(wt)` after the codex run. The final message captured via `-o <last-message-file>` is quoted into the HITL comment as the question text.
-- On timeout: kill the subprocess, post `<HITL mention> agent timed out…`, park on `awaiting_human=true`, do not retry until a human comments. **Done.**
-- Per-issue retry budget in pinned state, hard cap `MAX_RETRIES_PER_DAY`/day (default 3); over the cap → park on `awaiting_human` with a HITL ping. **Done in `7f9c6e2`** (24h fixed window per issue, opened on first counted attempt; resumes don't count; `_on_commits` resets it).
-- Agent commit identity. **Done in `7f9c6e2`** via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env injection from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` on every spawn — overrides any `git config user.{name,email}` without needing per-worktree config and leaves the host `~/.gitconfig` untouched.
-
-**Worktrees** are mandatory for self-bootstrap safety: `git worktree add ../wt-issue-<N> -b orchestrator/issue-<N> origin/main`. The orchestrator's own checkout (which is also the running process's source code) is never touched while codex edits files. After PR open, the worktree can be removed lazily on next pickup of the same issue, or kept until merge.
-
-## Self-modification safety (R2 in agent's risk list)
-
-Because the orchestrator is editing its own code, when a self-touching PR merges to `main` the running process is stale. Bootstrap-milestone mitigation:
-
-- Detect "self-touching merge" by checking if the merged PR modified any file under `orchestrator/`.
-- On such a merge being detected at the start of a tick, log "exiting for self-update" and `sys.exit(0)`.
-- Run the orchestrator under a shell wrapper: `while true; do python -m orchestrator.main; sleep 1; done`. Replace with `systemd Restart=always` when moving to VPS in Week 3.
-
-## GitHub auth
-
-- **Fine-grained PAT scoped to `geserdugarov/agent-orchestrator` only**, with read/write on Contents, Issues, Pull requests, Metadata.
-- **Token storage (revised from original plan).** The PAT is **not** stored in `.env` — that file is reachable from the agent's worktree via relative path. It must come from either the orchestrator's process environment (`GITHUB_TOKEN=…` exported before launch) or a file outside `REPO_ROOT`. Default file path is `~/.config/<owner>/<repo>/token`, derived from `REPO`; override with `ORCHESTRATOR_TOKEN_FILE`. `config._load_dotenv` actively rejects `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_TOKEN`/etc. found in `.env` with a clear stderr message.
-- `config.py` reads `.env` manually (no dep). The agent process never receives `GITHUB_TOKEN` (or any `GH_*` / `GIT_TOKEN` synonym) — `agents.run_codex` strips them from the inherited environment.
-- The orchestrator does the `git push` itself via an askpass tempscript (token in env, never in argv) and does the PR open via PyGithub. The agent only edits files and commits inside its worktree. See "Done beyond the original plan" above for the full list of push hardening.
-- Agent API keys (Anthropic / OpenAI): the orchestrator does **not** hold these. It relies on the user's existing global `claude` and `codex` CLI logins on this host.
-
-## Phased rollout
-
-| Days | Milestone | Status |
-|---|---|---|
-| **Day 1** | Scaffold + read-only GitHub | ✅ Done. `pyproject.toml`, `orchestrator/{__init__,main,github,config}.py`, `.env.example`, `.gitignore`, PAT all in place. |
-| **Day 2** | Agent invocation works | ✅ Done. `agents.run_codex(...)` confirmed, codex flags verified, askpass-based push and PyGithub PR open both wired up. |
-| **Day 3** | **Self-bootstrap milestone.** Polling loop end-to-end. | ✅ Done. Polling loop, signal handling, ancestry-aware self-update detection, and `run.sh` wrapper all merged (eb87246, 9e5eac6). |
-| **Day 4–5** | HITL + harden | 🟢 Done. Question detection (no-commits heuristic), resume on human follow-up, pinned-state JSON, dirty-tree refusal, push-failure parking, comprehensive HITL mention plumbing all in place; per-issue retry budget (`MAX_RETRIES_PER_DAY`, 24h window) and agent commit-identity stamping landed in `7f9c6e2`; `tests/fakes.py` + an expanded `tests/test_workflow.py` now cover state transitions against an in-memory fake `Github`. |
-| **Day 6–8** | `validating` stage | 🟢 Done. `_handle_validating` runs a fresh review, posts feedback to the PR, resumes the dev session for fixes, re-reviews, and caps at `MAX_REVIEW_ROUNDS` rounds before parking on `awaiting_human`. Transitions to `in_review` on `VERDICT: APPROVED`. The dev/review backend split is now config-driven (`DEV_AGENT` / `REVIEW_AGENT`), defaults to claude implements + codex reviews, and `CLAUDE_BIN` is no longer dormant. The dev backend for an in-flight issue is locked in pinned state (`dev_agent`/`dev_session_id`, with legacy `codex_session_id` falling back to codex). |
-| **Day 9–10** | Auto-merge + `rejected` | 🟢 Done. `_handle_in_review` covers merged → `done`, closed-unmerged → `rejected`, PR-comment-past-debounce → resume dev + bounce to `validating`, and `AUTO_MERGE`-gated SHA-pinned merge on approved + mergeable + green CI. Park awaiting human on unmergeable / failed checks / push fail / missing pr_number. New `GitHubClient` PR helpers, new pinned-state keys (`pr_last_comment_id`, `merged_at`, `closed_without_merge_at`), 13 new workflow + 7 new config tests. |
-| **Day 11–12** | `decomposing` stage | 🟢 Done. `_handle_decomposing` drives a fresh decomposer agent (`DECOMPOSE_AGENT`, default `claude`); manifest is a fenced ` ```orchestrator-manifest ` JSON block with a `decision: single | split` schema (max 10 children, dep-cycle DFS). `single` → parent `ready`, `split` → child issues created via `gh.create_child_issue` (prepends `Parent: #<n>`, no `Resolves` keyword) with `ready`/`blocked` labels by dep, parent → `blocked`. `_handle_blocked` aggregates child labels per tick: all `done` → parent `ready`, any `rejected` → park HITL, otherwise dep-graph walk unblocks middle children. `_handle_ready` seeds the in_review-migration anchor and falls into `_handle_implementing`. Kill switch via `DECOMPOSE=off` reverts to the legacy direct-to-`implementing` pickup. |
-| **Day 13** | VPS prep | ⬜ Not started. Dockerfile, systemd unit (`Restart=always` replaces `run.sh`), GitHub App migration to drop the PAT, structured logging, `--status` CLI flag listing in-flight issues. |
-| **Day 14** | Buffer / dogfood / docs | ⬜ Not started. Update `docs/workflow.md` to reflect what actually shipped (incl. the inline pinned-state marker change and the new token-storage rules). |
-
-## Verification
-
-**Bootstrap test issue** (file by hand on Day 3 morning):
-
-> **Title:** Add a `hello()` function to the orchestrator package
-> **Body:** Add `hello()` to `orchestrator/__init__.py` returning the literal string `"hello, world"`. Add `tests/test_hello.py` asserting the return value. Don't change anything else.
-
-This exercises the entire bootstrap path: pickup → branch → codex run → push → PR → human merge. It edits the orchestrator's own code (true self-bootstrap), is too small to need decomposition, and is trivially verifiable.
-
-**End-to-end test sequence:**
-
-1. **Day 3 acceptance:** file the hello issue, run `python -m orchestrator.main`, walk away. Within 10 minutes: issue label transitions to `implementing` then `in_review`; a PR is open with the function + passing test; merging the PR works without breaking the running orchestrator (or it self-restarts cleanly via the wrapper). Pass criterion: PR exists and is mergeable.
-2. **Day 5 acceptance:** file an issue that intentionally requires clarification ("Add a CLI flag — let me know what to name it"). Pass criterion: orchestrator posts the question as a comment, waits, and on a follow-up comment ("call it `--quiet`") completes the work and opens the PR.
-3. **Day 9 acceptance:** file a "rename `hello()` to `greet()`" issue. Pass criterion: orchestrator opens PR and *auto-merges* once the user clicks Approve (no manual merge needed).
-4. **Day 12 acceptance:** file a deliberately oversized issue ("Add `status`, `pause`, `resume` CLI subcommands"). Pass criterion: orchestrator creates 3 sub-issues linked to the parent and labels them `ready` / parent `blocked`.
-
-**Unit tests** (Day 4 — **done in `7f9c6e2`**): `tests/test_workflow.py` drives state transitions against an in-memory fake `Github` (`tests/fakes.py`, ~200 lines); covers pickup, implementing-with-resume, retry-budget gating, agent-identity env stamping, validating round-trips, and pinned-state JSON shape. `tests/test_config.py` covers HITL handle parsing, retry-cap parsing, and agent-identity env defaults. `tests/test_agents.py` covers the per-backend dispatch added in `8f91df5`.
-
-## Open items from Day-1 checklist
-
-1. **Codex flag name & JSON output shape.** ✅ Resolved during Day 2: `codex exec [-C <cwd>] --dangerously-bypass-approvals-and-sandbox --json -o <last-message-file> "<prompt>"` (resume variant: `codex exec resume <session-id> "<follow-up>"` — does **not** accept `-C`, so we rely on `subprocess` cwd).
-2. **Commit identity for agent commits.** ✅ Resolved in `7f9c6e2` via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env injection from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` (default `agent-orchestrator <agent-orchestrator@users.noreply.github.com>`). Env vars beat `git config user.{name,email}` at every scope, so the host's `~/.gitconfig` and the per-worktree config are both left untouched.
-3. **HITL @mention handle.** ✅ Resolved as a configurable comma-separated list (`HITL_HANDLE`); current default is `geserdugarov`.
-
-## Risks (carry-over from agent design)
-
-- **R1 — Codex/Claude CLI output format drift.** Isolate parsing in `agents.parse_session_id()` with a fixture-backed unit test; fail loudly with a clear error if the shape changes.
-- **R2 — Self-mutation while running.** Mitigated by the worktree + self-update wrapper above.
-- **R3 — Runaway agent loops / token cost.** 30-min wall-clock timeout per invocation; max 3 retries per issue per day in pinned-state.
-- **R4 — Host sleep on WSL2.** Acceptable for Week 1; Day 13 moves to VPS.
-- **R5 — GitHub rate limits.** PyGithub handles backoff; 60s ticks are well under 5000 req/hr.
-- **R6 — Race between human comments and orchestrator action.** Re-fetch issue + pinned-state immediately before each transition; treat any human comment newer than agent's last action as a pause signal.
-- **R7 — Decomposition criteria unsolved in the design doc.** Don't try to solve at the bootstrap stage. Day 11–12 uses an "ask the LLM, take its word" heuristic.
+# Agent Orchestrator — Roadmap
+
+## Status as of 2026-05-11
+
+The full label lifecycle (no label → `decomposing` → `ready` / `blocked` /
+`umbrella` → `implementing` → `validating` → `in_review` → `resolving_conflict`
+optional detour → `done` / `rejected`) is wired end-to-end. The orchestrator
+runs as a single long-lived Python process (`python -m orchestrator.main`,
+wrapped by `run.sh` for self-restart), polls one or more configured repos,
+and delegates the actual coding to `codex` / `claude` CLI subprocesses
+running in per-issue git worktrees. State lives in GitHub Issues themselves
+(one workflow label plus one pinned JSON comment), so the loop stays
+stateless and progress is observable on github.com.
+
+See `docs/workflow.md` for the design and stage semantics and
+`docs/architecture.md` for the implementation walk-through. This file
+tracks what shipped, what is intentionally deferred, and what is still
+open.
+
+## Shipped
+
+**Bootstrap path.** Polling loop with `--once`, SIGINT/SIGTERM-clean
+shutdown, and ancestry-aware self-update detection (exit on the wrapper's
+behalf when `origin/<ORCHESTRATOR_BASE_BRANCH>` advances past the running
+HEAD with changes under `orchestrator/`). `run.sh` self-restart wrapper
+fast-forwards the same branch on every restart. `GitHubClient` thin
+PyGithub wrapper handles issues, labels, pinned-state JSON comments, PR
+open / find / merge, idempotent workflow-label bootstrap (graceful on
+under-scoped PATs).
+
+**Agent invocation.** `agents.run_agent(backend, ...)` dispatches to
+`_run_codex` or `_run_claude`, both returning a unified `AgentResult`.
+Codex via `codex exec [-C cwd | resume <sid>] --dangerously-bypass-
+approvals-and-sandbox --json -o <tempfile>`. Claude via `claude -p
+--dangerously-skip-permissions --output-format stream-json
+--include-partial-messages --verbose` with `--resume <sid>` for resumes.
+Session id is harvested by walking JSONL events for any UUID-shaped value
+at `session_id` / `conversation_id` / etc. (shared between both backends).
+`DEV_AGENT` / `REVIEW_AGENT` / `DECOMPOSE_AGENT` independently configurable
+and validated at import; default split is claude implements + codex
+reviews + claude decomposes. The backend for an in-flight issue is locked
+in pinned state (`dev_agent` / `dev_session_id`, with legacy
+`codex_session_id` falling back to codex), so flipping `DEV_AGENT` does
+not migrate in-flight work. `AGENT_TIMEOUT` / `REVIEW_TIMEOUT` hard
+wall-clock caps; reaper kills agent grandchildren on timeout.
+`MAX_RETRIES_PER_DAY` (default 3, 0 = unbounded) per-issue fresh-spawn
+budget over a 24h window shared between implementing and decomposing.
+
+**Security hardening.** PAT never reaches the agent: `agents._agent_env`
+strips `GITHUB_TOKEN` / `GH_TOKEN` / `GIT_TOKEN` / `GITHUB_PAT` /
+`GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN` / `GH_HOST` from the
+inherited environment. PAT is rejected if found in `REPO_ROOT/.env`
+(`config._load_dotenv`); the token must come from the process environment
+or a file outside `REPO_ROOT` (default `~/.config/<owner>/<repo>/token`
+derived from `REPO`, overridable via `ORCHESTRATOR_TOKEN_FILE`).
+Hardened `git push`: token via `GIT_ASKPASS` tempfile (never argv),
+`core.hooksPath=/dev/null`, `credential.helper=`, `core.fsmonitor=`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`,
+`GIT_CONFIG_NOSYSTEM=1`, refuses to push when the local config carries
+`url.*.insteadOf` / `pushInsteadOf` rewrites, pushes via explicit refspec
+`HEAD:refs/heads/<branch>` (no upstream stored). `_authed_fetch` and
+`_git_hardened` reuse the same envelope for fetches and merges inside
+agent-writable worktrees. Agent commit identity is stamped via
+`GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars (`AGENT_GIT_NAME` /
+`AGENT_GIT_EMAIL`, default `agent-orchestrator
+<agent-orchestrator@users.noreply.github.com>`), overriding any host
+`~/.gitconfig` without touching it.
+
+**Decomposing stage.** `_handle_decomposing` drives a fresh decomposer
+session on `DECOMPOSE_AGENT` (default `claude`). The agent emits a fenced
+` ```orchestrator-manifest ` JSON block; `_parse_manifest` accepts
+`decision=single` (parent flips to `ready` with the rationale surfaced as
+a comment) or `decision=split` with up to 10 children, structurally
+validated for shape, dependency indexes, self-deps, and DFS-detected
+cycles. The optional `umbrella` boolean on a `split` decision routes the
+parent to `umbrella` instead of `blocked`; an umbrella parent has no
+implementation of its own and `_handle_umbrella` closes it to `done` once
+every child resolves. Invalid manifests park awaiting human; absent
+manifests park as a question. `_handle_blocked` aggregates child labels
+per tick: all-done → parent `ready`, any rejected → park HITL, otherwise
+the dep-graph walk unblocks middle children. `gh.create_child_issue`
+prepends `Parent: #<n>` and deliberately avoids `Resolves` keywords so a
+merged child PR does not auto-close the parent. `DECOMPOSE=off` reverts
+to the legacy direct-to-`implementing` pickup and applies mid-flight to
+issues already labeled `decomposing`. Pickup is also gated by
+`ALLOWED_ISSUE_AUTHORS` (comma-separated logins): when set, unlabeled
+issues from outside the list are silently skipped.
+
+**Implementing stage.** `_handle_implementing` ensures a per-issue
+worktree at `<WORKTREES_DIR>/<owner>__<name>/issue-<n>` from
+`origin/<spec.base_branch>` in `spec.target_root` (slug subdir keeps two
+repos with the same issue number isolated on disk; worktrees with
+unpushed commits are reused for crash recovery). Branches: timeout →
+park; new commits + clean tree → push, open PR (or reuse via
+`find_open_pr`), comment `:sparkles: PR opened: #N`, set label
+`validating`, reset `review_round=0` and `retry_count=0`; new commits +
+dirty tree → park (refuse partial branch); no new commits → park as a
+question. Awaiting-human reply branch resumes the dev session on its
+locked backend with the new comment text. PR titles and commit messages
+follow Conventional Commits: the implementer prompt instructs the agent
+to inspect `git log --oneline -20` and emit subject-only commits with no
+`Co-Authored-By:` trailer; `_pr_title_from_commit_or_issue` reuses the
+agent's first commit subject when conformant, otherwise falls back to
+`<type>: <issue title>` (`fix` for bug-labeled issues, `feat` everywhere
+else).
+
+**Validating stage.** `_handle_validating` spawns a fresh reviewer
+session on `REVIEW_AGENT` against `git diff origin/<base>...HEAD` and
+parses the last `VERDICT:` marker (`_parse_review_verdict`). On
+`APPROVED`, snapshot `agent_approved_sha`, optionally squash the dev's
+commits into one (`_squash_and_force_push`, gated by
+`SQUASH_ON_APPROVAL`, default `on`; subject reuses the first commit when
+already conventional-commit-shaped, otherwise `feat: <issue title>`; body
+lists the original subjects; force-pushed with `--force-with-lease`
+against the pre-squash SHA) and flip the label to `in_review`. On
+`CHANGES_REQUESTED`, post the feedback to the PR, resume the dev's
+locked-backend session with the fix prompt, push, and increment
+`review_round` for the next tick. `MAX_REVIEW_ROUNDS` (default 3) caps
+review/fix iterations before parking. Reviewer-side human nudges route
+to the reviewer; silent reviewer crashes are tagged transient so the
+next tick retries instead of parking on stale state.
+
+**In-review terminals and auto-merge.** `_handle_in_review` covers:
+PR merged externally → `done` (issue closed, `merged_at` stamped,
+`_cleanup_merged_branch` removes worktree + local + remote branch);
+PR closed without merge → `rejected` (issue closed,
+`closed_without_merge_at` stamped); PR open with new comments past the
+`IN_REVIEW_DEBOUNCE_SECONDS` (default 600s) quiet window → resume the
+dev's locked-backend session on the quoted comments, push, bounce back
+to `validating` with `review_round=0`; PR open with no comments +
+`AUTO_MERGE=on` + (agent-approved-on-current-head OR
+`pr_is_approved(head_sha=)`) + no standing human `CHANGES_REQUESTED` veto
++ `pr_is_mergeable=True` + green CI → SHA-pinned `gh.merge_pr(pr,
+sha=head_sha)` → `done`, close, cleanup branch. PR-feedback is read from
+four sources tracked under three independent watermarks
+(`pr_last_comment_id`, `pr_last_review_comment_id`,
+`pr_last_review_summary_id`) so the IssueComment / PullRequestComment /
+PullRequestReview id namespaces never bleed into each other. Park
+branches bump the watermarks past the orchestrator's own park comment via
+`_bump_in_review_watermarks` so an HITL ping does not replay as fresh
+feedback.
+
+**Conflict resolution stage.** Under `AUTO_MERGE=on` an approved-but-
+unmergeable PR routes to `resolving_conflict` instead of parking.
+`_handle_resolving_conflict` refreshes `origin/<branch>` and
+`origin/<base>` via `_authed_fetch`, runs `git merge --no-edit
+origin/<base>` under `_git_hardened`, and flips back to `validating` on
+either an already-up-to-date no-op or a clean merge (push first if HEAD
+moved). Real conflicts resume the dev session on the locked backend with
+a conflict-resolution prompt that names up to 20 conflicted paths;
+on a clean resolved commit, push and flip. `MAX_CONFLICT_ROUNDS`
+(default 3) caps auto-resolution attempts; the counter increments on
+every clean push and every no-op already-up-to-date merge (so a PR that
+is unmergeable purely due to branch protection cannot ping-pong forever).
+Merge over rebase by design so the stored `agent_approved_sha` snapshot
+stays valid. Awaiting-human resume mirrors the implementing pattern; a
+diverged worktree (`behind > 0`) parks rather than risk clobbering the
+PR head. Closed-`resolving_conflict` issues are swept the same way
+closed-`in_review` ones are.
+
+**Multi-repo support.** `RepoSpec(slug, target_root, base_branch)` is
+threaded through every workflow handler. `REPOS` env var
+(`owner/name|target_root|base_branch`, `;`- or newline-separated) drives
+the multi-repo loop; legacy single-repo mode collapses to a
+one-element list when `REPOS` is unset. Validation runs at import:
+malformed entries, slugs that are not exactly `owner/name`, empty
+`target_root` / `base_branch`, duplicate slugs, and a `REPOS` value that
+yields zero entries all abort startup with `SystemExit`. A `target_root`
+that does not exist is warned to stderr but does not abort. Per-issue
+worktrees are namespaced by repo slug
+(`WORKTREES_DIR/<owner>__<name>/issue-N`) so two repos with the same
+issue number cannot collide. Each tick `main._run_tick` iterates every
+`(spec, GitHubClient)` pair; a per-repo exception is logged and skipped
+so one wedged repo cannot stop the others from advancing. Per-slug token
+resolution: `GitHubClient` reads `GITHUB_TOKEN` from env first, then
+falls back to `~/.config/<owner>/<repo>/token` derived from the spec's
+slug. `ORCHESTRATOR_BASE_BRANCH` is decoupled from `BASE_BRANCH` so the
+target repo can have a different default branch (e.g. `master`) without
+breaking self-update detection on `orchestrator/`. `TARGET_REPO_ROOT`
+decouples the orchestrator's own checkout from the target repo's clone.
+
+**Tests.** `tests/test_workflow.py` is large (≈400k) and covers every
+stage handler, the manifest parser, the watermark / debounce logic, the
+auto-merge gate sequence, the squash-on-approval path, the
+resolving-conflict suite (merge / push / cap / resume / recovery /
+dirty-tree / fetch-fail / diverged-worktree / closed-issue), the
+umbrella handler, the multi-repo dispatcher fan-out, and the
+park-comment-replay-prevention path. `tests/fakes.py` exposes an
+in-memory `FakeGitHubClient` plus `FakePR` / `FakePRRef` / `FakeIssue`.
+`tests/test_config.py` covers env parsing for every knob.
+`tests/test_agents.py` covers per-backend dispatch and the unified
+`AgentResult`. `tests/test_main.py` covers per-repo fan-out, exception
+isolation, and the legacy single-repo fallback.
+
+## Known gaps
+
+Behaviors `docs/workflow.md` prescribes that the code does not yet do:
+
+1. **Project tests/linters during `validating`.** `_handle_validating`
+   only spawns the reviewer agent; there is no `pytest` / `ruff` /
+   `mypy` / project-script invocation before the `validating → in_review`
+   flip. Project-level checks happen externally via PR CI and are only
+   consulted at the AUTO_MERGE gate (`pr_combined_check_state`), not as
+   a precondition for the transition.
+
+## Future work
+
+- **Dockerfile / systemd / GitHub App migration.** The current deployment
+  is a `run.sh` wrapper around `python -m orchestrator.main` on a single
+  host. The design doc flags container / VM isolation as an open
+  question. Moving to a long-running VPS deployment also lets `systemd
+  Restart=always` replace the `run.sh` self-restart wrapper, and the
+  GitHub App migration lets the orchestrator drop the per-repo PAT in
+  favor of an installation token.
+- **Parallel implementers and pick-best / merge.** `docs/workflow.md`
+  flags this as Week-2 / future: spawn several agents on the same issue,
+  pick the best of N solutions, or merge them together. Out of scope
+  for the first version (one solution per issue).
+- **Architectural review at `validating`.** `docs/workflow.md` flags
+  this as optional: a reviewer pass that flags structural issues (e.g.
+  oversized files that should be split). Not yet implemented.
+- **Documentation stage.** `docs/workflow.md` lists this under "Next
+  steps": an extra stage that keeps `docs/` in sync as code changes
+  land.
+- **Dynamic workflow.** `docs/workflow.md` lists this under
+  "Alternatives": a planner agent ahead of execution that picks the
+  stages a given issue needs (extra architectural exploration, skip
+  acceptance for trivial fixes, etc.). Judged excessive for the original
+  2-week budget; revisit once the static flow is fully dogfooded.
+
+## Risks
+
+- **R1 — Codex/Claude CLI output format drift.** Isolated in
+  `agents.parse_session_id()` and the per-backend last-message capture;
+  failure modes surface as `session_id=None` (logged, agent still runs)
+  or empty `last_message` (the orchestrator parks with the agent's
+  stderr quoted via `_format_stderr_diagnostics`).
+- **R2 — Self-mutation while running.** Mitigated by per-issue worktrees
+  + ancestry-aware self-update detection in
+  `main._self_modifying_merge_happened` + the `run.sh` self-restart
+  wrapper.
+- **R3 — Runaway agent loops / token cost.** Wall-clock timeouts
+  (`AGENT_TIMEOUT`, `REVIEW_TIMEOUT`), per-issue retry budget
+  (`MAX_RETRIES_PER_DAY`), review/fix cap (`MAX_REVIEW_ROUNDS`), and
+  conflict-resolution cap (`MAX_CONFLICT_ROUNDS`).
+- **R4 — GitHub rate limits.** PyGithub handles backoff; 60s ticks are
+  well under the 5000 req/hr limit.
+- **R5 — Race between human comments and orchestrator action.**
+  Re-fetch issue + pinned-state immediately before each transition; any
+  comment newer than the recorded watermark is treated as a pause signal
+  that drives the awaiting-human resume branch.
