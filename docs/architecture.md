@@ -1,6 +1,6 @@
 # Architecture of the Current Implementation
 
-Single-process **polling orchestrator** that drives GitHub issues through a label-based state machine, delegating the actual coding work to a configurable coding-agent CLI (`codex` or `claude`) running as a subprocess in isolated git worktrees. The dev/review/decompose backends are picked independently via `DEV_AGENT` / `REVIEW_AGENT` / `DECOMPOSE_AGENT` (default: claude decomposes, claude implements, codex reviews) and validated at config load. New unlabeled issues route through a `decomposing` stage that asks the decomposer agent for a structured manifest: `decision=single` flips the issue to `ready` and the implementer takes over; `decision=split` creates child issues, persists the dep graph, and parks the parent on `blocked` until `_handle_blocked` walks the children. Once the reviewer approves and the PR is mergeable with green CI, the orchestrator can merge it itself (gated by `AUTO_MERGE`, default off) and close the issue with `done`; an approved-but-unmergeable PR detours through a `resolving_conflict` stage that auto-merges `origin/<base>` (capped by `MAX_CONFLICT_ROUNDS`) before bouncing back to `validating`; PRs closed without merge land on `rejected`. Decomposition can be disabled with `DECOMPOSE=off`, which reverts to the legacy direct-to-`implementing` pickup.
+Single-process **polling orchestrator** that drives GitHub issues through a label-based state machine, delegating the actual coding work to a configurable coding-agent CLI (`codex` or `claude`) running as a subprocess in isolated git worktrees. The dev/review/decompose backends are picked independently via `DEV_AGENT` / `REVIEW_AGENT` / `DECOMPOSE_AGENT` (default: claude decomposes, claude implements, codex reviews) and validated at config load. New unlabeled issues route through a `decomposing` stage that asks the decomposer agent for a structured manifest: `decision=single` flips the issue to `ready` and the implementer takes over; `decision=split` creates child issues, persists the dep graph, and parks the parent on `blocked` (or `umbrella` when the manifest's `umbrella` flag is true — a parent with no implementation of its own that `_handle_umbrella` closes to `done` once every child resolves) until the matching handler walks the children. Once the reviewer approves and the PR is mergeable with green CI, the orchestrator can merge it itself (gated by `AUTO_MERGE`, default off) and close the issue with `done`; an approved-but-unmergeable PR detours through a `resolving_conflict` stage that auto-merges `origin/<base>` (capped by `MAX_CONFLICT_ROUNDS`) before bouncing back to `validating`; PRs closed without merge land on `rejected`. Decomposition can be disabled with `DECOMPOSE=off`, which reverts to the legacy direct-to-`implementing` pickup.
 
 ## Top-level layout
 
@@ -19,7 +19,7 @@ There is **only one long-lived process**: `python -m orchestrator.main`. It is w
 
 - **Trigger**: started manually (or by a wrapper). Optional `--once` for a single tick.
 - **Tick cadence**: every `POLL_INTERVAL` seconds (default 60).
-- **Self-restart guard** (`main.py:46`): each tick fetches `origin/main`; if it advanced past the process's startup SHA *and* the new commits touch `orchestrator/`, the loop exits 0 so the wrapper can re-exec the new code.
+- **Self-restart guard** (`main._self_modifying_merge_happened`): each tick fetches `origin/<ORCHESTRATOR_BASE_BRANCH>` (default `main`); if it advanced past the process's startup SHA *and* the new commits touch `orchestrator/`, the loop exits 0 so the wrapper can re-exec the new code. The branch is decoupled from `BASE_BRANCH` so a target repo with a different default branch does not interfere with self-update detection.
 - **Signals**: SIGINT/SIGTERM set a flag; the current tick finishes, then the loop exits.
 
 The coding agent runs as a **transient child subprocess**, not a daemon — spawned per tick when work is needed.
@@ -32,17 +32,17 @@ Inside `workflow.tick(gh, spec)`, `gh.list_pollable_issues()` yields all open no
 
 For every yielded issue:
 
-1. Read its workflow label (one of `decomposing/ready/blocked/implementing/validating/in_review/resolving_conflict/done/rejected`).
-2. Dispatch by label. The full lifecycle (no label → `decomposing` → `ready`/`blocked` → `implementing` → `validating` → `in_review` → `resolving_conflict` (optional detour) → `done`/`rejected`) is implemented; `done` and `rejected` are terminal no-ops, every other label routes to its handler. Every handler receives the active `RepoSpec`, so `git worktree add`, `git fetch origin <base>`, push-token resolution (`config._resolve_github_token(spec.slug)`), and PR-base selection all flow from the spec rather than module-level `config.REPO` / `config.TARGET_REPO_ROOT` / `config.BASE_BRANCH` reads.
+1. Read its workflow label (one of `decomposing/ready/blocked/umbrella/implementing/validating/in_review/resolving_conflict/done/rejected`).
+2. Dispatch by label. The full lifecycle (no label → `decomposing` → `ready`/`blocked`/`umbrella` → `implementing` → `validating` → `in_review` → `resolving_conflict` (optional detour) → `done`/`rejected`) is implemented; `done` and `rejected` are terminal no-ops, every other label routes to its handler. Every handler receives the active `RepoSpec`, so `git worktree add`, `git fetch origin <base>`, push-token resolution (`config._resolve_github_token(spec.slug)`), and PR-base selection all flow from the spec rather than module-level `config.REPO` / `config.TARGET_REPO_ROOT` / `config.BASE_BRANCH` reads.
 
-Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!--orchestrator-state {...json...}-->`), holding `dev_agent` + `dev_session_id` (the backend that handled this issue and its session), `review_agent`, `decomposer_agent` + `decomposer_session_id` (parents only; same lock-on-first-spawn semantics as `dev_agent`), `children` (parents only — child issue numbers, used by `_handle_blocked`), `dep_graph` (parents only — `{child_idx_str: [child_idx, ...]}` because GitHub has no first-class blocks-issue relation), `decomposed_at`, `pickup_comment_id`, `branch`, `pr_number`, `review_round`, `retry_window_start` + `retry_count` (per-issue 24h fresh-spawn budget; shared between implementing and decomposing), `awaiting_human`, `last_action_comment_id`, `pr_last_comment_id` (in_review high-watermark across the issue thread + PR conversation comments, which share the IssueComment id space; seeded at validating → in_review handoff so the orchestrator's own automated comments don't replay as fresh feedback, and bumped past any park comment so an HITL ping doesn't replay either), `pr_last_review_comment_id` (separate watermark for inline PR review comments, which live in their own id space), `pr_last_review_summary_id` (separate watermark in the PullRequestReview id space, distinct from both IssueComment and PullRequestComment ids; the watermark *only* advances from review IDs that survived `gh.pr_reviews_after`'s state/body filter — non-empty `CHANGES_REQUESTED` or `COMMENTED` — so `APPROVED`, `DISMISSED`, `PENDING`, and empty-body reviews **never** bump it. `_bump_in_review_watermarks` mirrors the same filter and advances strictly from the filtered list. This is safe because the same filter runs on every scan, so an `APPROVED` review id sitting above the watermark is harmlessly re-skipped each tick rather than re-forwarded), `agent_approved_sha` (the head SHA the reviewer agent OK'd; `_handle_in_review` keys AUTO_MERGE on this since the agent posts an issue comment, not a real PR review), `merged_at` / `closed_without_merge_at` (terminal stamps), etc. (`github.py:99`). The legacy `codex_session_id` key written before the configurable-backend rollout is still honored on read and treated as codex.
+Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!--orchestrator-state {...json...}-->`), holding `dev_agent` + `dev_session_id` (the backend that handled this issue and its session), `review_agent`, `decomposer_agent` + `decomposer_session_id` (parents only; same lock-on-first-spawn semantics as `dev_agent`), `children` (parents only — child issue numbers, used by `_handle_blocked`), `dep_graph` (parents only — `{child_idx_str: [child_idx, ...]}` because GitHub has no first-class blocks-issue relation), `decomposed_at`, `pickup_comment_id`, `branch`, `pr_number`, `review_round`, `retry_window_start` + `retry_count` (per-issue 24h fresh-spawn budget; shared between implementing and decomposing), `awaiting_human`, `last_action_comment_id`, `pr_last_comment_id` (in_review high-watermark across the issue thread + PR conversation comments, which share the IssueComment id space; seeded at validating → in_review handoff so the orchestrator's own automated comments don't replay as fresh feedback, and bumped past any park comment so an HITL ping doesn't replay either), `pr_last_review_comment_id` (separate watermark for inline PR review comments, which live in their own id space), `pr_last_review_summary_id` (separate watermark in the PullRequestReview id space, distinct from both IssueComment and PullRequestComment ids; the watermark *only* advances from review IDs that survived `gh.pr_reviews_after`'s state/body filter — non-empty `CHANGES_REQUESTED` or `COMMENTED` — so `APPROVED`, `DISMISSED`, `PENDING`, and empty-body reviews **never** bump it. `_bump_in_review_watermarks` mirrors the same filter and advances strictly from the filtered list. This is safe because the same filter runs on every scan, so an `APPROVED` review id sitting above the watermark is harmlessly re-skipped each tick rather than re-forwarded), `agent_approved_sha` (the head SHA the reviewer agent OK'd; `_handle_in_review` keys AUTO_MERGE on this since the agent posts an issue comment, not a real PR review), `merged_at` / `closed_without_merge_at` (terminal stamps), etc. (see `github.PINNED_STATE_MARKER` / `PINNED_STATE_RE` and `read_pinned_state` / `write_pinned_state`). The legacy `codex_session_id` key written before the configurable-backend rollout is still honored on read and treated as codex.
 
 ## Stage handlers
 
 ### `_handle_pickup` (no label → `decomposing` or `implementing`)
 - **Trigger**: open issue with no workflow label.
-- **Input**: issue title/body/comments; `config.DECOMPOSE` (default on).
-- **Action**: posts a "picking this up" comment, anchors `pickup_comment_id` for the in_review legacy migration, then routes:
+- **Input**: issue title/body/comments; `config.DECOMPOSE` (default on); `config.ALLOWED_ISSUE_AUTHORS` (default empty → allow all).
+- **Action**: when `ALLOWED_ISSUE_AUTHORS` is set, an issue authored by anyone outside the list is silently skipped (log only); otherwise post a "picking this up" comment, anchor `pickup_comment_id` for the in_review legacy migration, then route:
   - `DECOMPOSE=on` → label `decomposing`, fall into `_handle_decomposing`.
   - `DECOMPOSE=off` → label `implementing`, fall into `_handle_implementing` (legacy bootstrap path).
 
@@ -59,10 +59,10 @@ Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!
      - **invalid manifest** → park awaiting human with the parse error and the agent's last message quoted (same recovery as a malformed reviewer verdict).
      - **no fenced block** → treat as a question; park with the message quoted (mirrors `_on_question` from implementing).
      - **decision == "single"** → post a one-line "fits in one context" comment with the rationale, set label `ready`, stamp `decomposed_at`. `_handle_ready` picks it up next tick.
-     - **decision == "split"** → crash-safe creation in three phases. (a) For each child call `gh.create_child_issue(...)` (which prepends `Parent: #<n>` to the body, no auto-close keyword) with label `blocked` regardless of dependencies, and seed the child's pinned state with `parent_number`; child-state seeding is mandatory — failure persists the partial `children` list and parks awaiting human (no orphan child is left runnable). (b) Persist `children` and `dep_graph` (`{child_idx_str: [child_idx, ...]}`) on the parent, post the summary comment, set parent label `blocked`, stamp `decomposed_at`. (c) Activate no-dep children by flipping their label `blocked` → `ready`; this is best-effort because `_handle_blocked`'s walk also treats no-dep children as deps-satisfied, so a crashed activation step is recovered on the next tick.
-- **Pre-flight (half-finished recovery)**: if `children` is already set on the parent but the label is still `decomposing`, a prior tick crashed between child creation and the parent label flip. Re-running the decomposer would create duplicates, so the handler short-circuits: when not awaiting_human, flip the parent to `blocked` and let `_handle_blocked` activate children; when awaiting_human (parent state was parked mid-creation), hold and require manual intervention.
+     - **decision == "split"** → crash-safe creation in three phases. (a) For each child call `gh.create_child_issue(...)` (which prepends `Parent: #<n>` to the body, no auto-close keyword) with label `blocked` regardless of dependencies, and seed the child's pinned state with `parent_number`; child-state seeding is mandatory — failure persists the partial `children` list and parks awaiting human (no orphan child is left runnable). (b) Persist `children`, `dep_graph` (`{child_idx_str: [child_idx, ...]}`), and `umbrella` (from the manifest's optional boolean, default false) on the parent, post the summary comment, set parent label `umbrella` when the flag is true and otherwise `blocked`, stamp `decomposed_at`. (c) Activate no-dep children by flipping their label `blocked` → `ready`; this is best-effort because `_handle_blocked`'s / `_handle_umbrella`'s walk also treats no-dep children as deps-satisfied, so a crashed activation step is recovered on the next tick.
+- **Pre-flight (half-finished recovery)**: if `children` is already set on the parent but the label is still `decomposing`, a prior tick crashed between child creation and the parent label flip. Re-running the decomposer would create duplicates, so the handler short-circuits: when not awaiting_human, flip the parent to `umbrella` (when the persisted `umbrella` flag is true) or `blocked` and let the matching handler activate children; when awaiting_human (parent state was parked mid-creation), hold and require manual intervention.
 - **Pre-flight (DECOMPOSE kill switch, mid-flight)**: if `config.DECOMPOSE` is off when this handler runs (operator restarted with the rollout disabled while the issue was already labeled `decomposing` or parked there), bail out before any decomposer spawn: post a routing comment, clear the decomposer-side `awaiting_human`/`park_reason` so the legacy implementing flow doesn't trip its resume branch on stale state, flip the label to `implementing`, and fall into `_handle_implementing`. The half-finished recovery above runs first and is unaffected — abandoning orphan children that already exist on GitHub just because new decompositions are now disabled is not what a kill switch should do.
-- **Output**: parent label moved to `ready` / `blocked`, OR a HITL park.
+- **Output**: parent label moved to `ready` / `blocked` / `umbrella`, OR a HITL park.
 
 ### `_handle_ready` (label `ready` → `implementing`)
 - **Trigger**: each tick while the label is `ready`. Reached by either a `single`-decision parent or by a freshly-created child.
@@ -80,6 +80,12 @@ Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!
   6. If every child is `done` → post a summary comment, flip parent → `ready`. The next tick `_handle_ready` picks it up and the implementer takes over.
   7. Otherwise walk children: any `blocked` child whose recorded dependencies are all `done` gets relabeled `ready`. A child with no recorded deps is also flipped (vacuous all-done over an empty list) — this recovers no-dep children that the decomposer's same-tick activation step left as `blocked`. This walk both unblocks middle-of-the-graph children and rescues stuck activations without waiting on the parent.
 - **Output**: parent → `ready` (all done), OR a sibling unblocked, OR a HITL park (rejected child, manually-closed child, or unattributed `blocked`), OR a no-op for a child still waiting on its dependencies.
+
+### `_handle_umbrella` (label `umbrella`)
+- **Trigger**: each tick while the label is `umbrella` (only ever a parent — set by the decomposer when the manifest's `umbrella` boolean is true).
+- **Input**: pinned `children` and optional `dep_graph` on the parent.
+- **Internal flow**: mirrors `_handle_blocked` for the rejected / manually-closed checks and the dep-graph activation walk; the only difference is the all-done terminal. An umbrella parent has no implementation work of its own — its purpose is purely aggregation — so when every child reaches `done`, the handler posts a checkmark comment, stamps `umbrella_resolved_at`, sets label `done`, and closes the issue (no flip back through `ready`/`implementing`). A `children`-less umbrella is treated as corrupt state and parks awaiting human.
+- **Output**: terminal `done` (all children resolved, issue closed), OR a sibling unblocked, OR a HITL park, OR a no-op.
 
 ### `_handle_implementing` (label `implementing`)
 - **Trigger**: each tick while the label is `implementing`.
@@ -103,12 +109,12 @@ Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!
 - **Internal flow**:
   1. Awaiting-human path: same resume mechanic as implementing (resume on the dev's locked backend); on a successful pushed fix, bump `review_round` and stay in `validating` so the reviewer runs next tick.
   2. If `review_round >= MAX_REVIEW_ROUNDS` (default 3), park awaiting human.
-  3. Otherwise spawn a **fresh reviewer session** via `run_agent(config.REVIEW_AGENT, ...)` with the **reviewer prompt** (read-only: `git log` / `git diff origin/main...HEAD`, must end with `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`); persist `review_agent` for traceability.
+  3. Otherwise spawn a **fresh reviewer session** via `run_agent(config.REVIEW_AGENT, ...)` with the **reviewer prompt** (read-only: `git log` / `git diff origin/<spec.base_branch>...HEAD`, must end with `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`); persist `review_agent` for traceability.
   4. Parse last `VERDICT:` marker (`_parse_review_verdict`):
-     - `approved` → comment `:white_check_mark:` on the PR, set label `in_review`.
+     - `approved` → in this order: (a) post `:white_check_mark: codex review approved.` on the PR (so the comment exists even when squash later fails); (b) when `SQUASH_ON_APPROVAL` is on (default), call `_squash_and_force_push` to collapse the dev's commits into one (subject reuses the first commit when already conventional-commit-shaped, otherwise `feat: <issue title>`; body lists the original subjects; pushed with `--force-with-lease` against the pre-squash SHA). On squash or force-push failure, **park awaiting human and stay on `validating`** (no relabel) so the original commits remain on the branch for manual triage — the approval comment has already landed on the PR. (c) On success, if `squashed_count > 1` post `:package: squashed N commits to 1 after approval` to the PR before seeding the in_review watermarks, so the seed walks past it. (d) Snapshot `agent_approved_sha` from the **local SHA the reviewer (or the squash) produced** — explicitly *not* the current remote PR head; if the remote moves out from under us, `agent_approved_sha != pr.head.sha` in the auto-merge gate and AUTO_MERGE waits for a fresh review round. With `SQUASH_ON_APPROVAL=off`, the snapshot is the pre-review local HEAD (`reviewed_sha` captured before `run_agent`). (e) Seed the in_review comment watermarks, then set label `in_review`.
      - `unknown` (no marker) → park.
      - `changes_requested` → post the feedback to the PR, then **resume the developer's session** on its locked backend with the fix prompt; if it produces a new commit on a clean tree, push and increment `review_round` for next tick.
-- **Output**: label moved to `in_review` (approval) OR a new fix commit + bumped round OR a HITL park.
+- **Output**: label moved to `in_review` (approval, squash succeeded or disabled) OR a new fix commit + bumped round OR a HITL park (squash/force-push failure stays on `validating` with the approval comment already on the PR; every other park branch keeps the existing label).
 
 ### `_handle_in_review` (label `in_review`)
 - **Trigger**: each tick while label is `in_review` (set by `_handle_validating` after `VERDICT: APPROVED`). Also runs on closed-`in_review` issues yielded by the closed-issue sweep, so an external manual merge gets finalized to `done` even when `Resolves #N` already closed the issue.
@@ -119,9 +125,9 @@ Per-issue durable state lives in a single **"pinned" comment** on the issue (`<!
      - `merged` → set label `done`, stamp `merged_at`, write pinned state, then `issue.edit(state="closed")`. (Pinned-state write before close so PyGithub caching cannot serve a stale issue body to the writer.)
      - `closed` (without merge) → set label `rejected`, stamp `closed_without_merge_at`, write state, close.
      - `open` → fall through.
-  3. **PR-comment debounce → dev resume → bounce back to validating.** Read four sources independently, one per id namespace: `gh.comments_after(issue, pr_last_comment_id)` (issue thread), `gh.pr_conversation_comments_after(pr, pr_last_comment_id)` (PR conversation; shares id space with the issue thread, so one watermark suffices), `gh.pr_inline_comments_after(pr, pr_last_review_comment_id)` (inline review comments), and `gh.pr_reviews_after(pr, pr_last_review_summary_id)` (PR review summary bodies submitted with `CHANGES_REQUESTED` or `COMMENTED` — `APPROVED` bodies are filtered out as informational, dismissed/pending never count, empty bodies are dropped). Without the `pr_reviews_after` surface, a "Comment" review with a request in the body would be silently ignored (and may be auto-merged over), and a `CHANGES_REQUESTED` review with body but no inline comments would block merge via `pr_has_changes_requested` without ever reaching the dev agent. If any source is newer than its watermark and the most recent one is older than `IN_REVIEW_DEBOUNCE_SECONDS` (default 600s, matches `docs/workflow.md:147`), build a follow-up prompt that quotes them and call `_resume_dev_with_text` on the dev's locked backend. On a successful pushed commit (clean tree + push ok), bump each watermark to the newest seen in its own id space, reset `review_round=0`, and flip the label back to `validating` so the reviewer agent re-runs on the new diff next tick. If still inside the debounce window, return — the human may still be typing.
+  3. **PR-comment debounce → dev resume → bounce back to validating.** Read four sources independently, one per id namespace: `gh.comments_after(issue, pr_last_comment_id)` (issue thread), `gh.pr_conversation_comments_after(pr, pr_last_comment_id)` (PR conversation; shares id space with the issue thread, so one watermark suffices), `gh.pr_inline_comments_after(pr, pr_last_review_comment_id)` (inline review comments), and `gh.pr_reviews_after(pr, pr_last_review_summary_id)` (PR review summary bodies submitted with `CHANGES_REQUESTED` or `COMMENTED` — `APPROVED` bodies are filtered out as informational, dismissed/pending never count, empty bodies are dropped). Without the `pr_reviews_after` surface, a "Comment" review with a request in the body would be silently ignored (and may be auto-merged over), and a `CHANGES_REQUESTED` review with body but no inline comments would block merge via `pr_has_changes_requested` without ever reaching the dev agent. If any source is newer than its watermark and the most recent one is older than `IN_REVIEW_DEBOUNCE_SECONDS` (default 600s, matches the debounce documented in `docs/workflow.md`'s Acceptance section), build a follow-up prompt that quotes them and call `_resume_dev_with_text` on the dev's locked backend. On a successful pushed commit (clean tree + push ok), bump each watermark to the newest seen in its own id space, reset `review_round=0`, and flip the label back to `validating` so the reviewer agent re-runs on the new diff next tick. If still inside the debounce window, return — the human may still be typing.
   4. **Auto-merge gate** (only reached when there are no new comments to act on). Off unless `AUTO_MERGE=on`. Sequence: **standing CHANGES_REQUESTED veto** — `gh.pr_has_changes_requested(pr, head_sha=head_sha)` runs *before* the approval check and silently returns on True, so a human `CHANGES_REQUESTED` review on the current head SHA blocks merge even when `agent_approved_sha == head_sha`, the PR is mergeable, and checks are green (the agent's APPROVED would otherwise short-circuit `pr_is_approved`); approval check (either `agent_approved_sha == pr.head.sha`, snapshotted by validating when the reviewer agent emitted `VERDICT: APPROVED`, OR `gh.pr_is_approved(pr, head_sha=pr.head.sha)` — only counts human/bot reviews submitted on the *current* head SHA, so a stale APPROVED from before a later push does not unlock auto-merge); `pr_is_mergeable` (`None` means GitHub still computing — try next tick; `False` with `AUTO_MERGE=on` does NOT park anymore — it routes the issue to the new `resolving_conflict` stage (post a notice on the PR, seed `conflict_round=0` only when absent so a re-entry preserves the cap counter, flip the label, return), where `_handle_resolving_conflict` attempts the auto-merge of `origin/<base>` on the next tick. Under `AUTO_MERGE=off` the legacy unmergeable park still fires here); `pr_combined_check_state` (`success` proceeds; `pending` waits; `failure`/`none` parks awaiting human — `none` means no checks at all, ambiguous). Finally `gh.merge_pr(pr, sha=head_sha)` — pinned to the *captured* `head_sha` from the start of the gate sequence, **not** `pr.head.sha`. `pr_is_mergeable` calls `pr.update()` to resolve a `None` mergeable, which can refresh `pr.head.sha`; the explicit `head_sha` pin (combined with the earlier `pr.head.sha != head_sha` bail) ensures a commit landing during the refresh either bails the tick or causes GitHub to return 409/422 rather than merge an unreviewed head. PyGithub's 405/409/422 are returned as `False` and the next tick retries.
-  5. On a successful merge, set label `done`, stamp `merged_at`, write pinned state, close the issue.
+  5. On a successful merge, set label `done`, stamp `merged_at`, write pinned state, close the issue, then call `_cleanup_merged_branch` (best-effort: remove the per-issue worktree, delete the local branch, and call `gh.delete_remote_branch`). The cleanup is also run on the external-merge terminal so a human-merged PR does not leave a stale branch on the remote.
   6. Every park inside this handler bumps the in_review watermarks past the orchestrator's own park comment via `_bump_in_review_watermarks`, so the next tick does not see the HITL ping as fresh PR feedback and resume the dev agent against it.
 - **Output**: label moved to `done` / `rejected` (terminal) OR a fix push and label bounce to `validating` OR a relabel to `resolving_conflict` (under `AUTO_MERGE=on` when the PR is unmergeable past the approval gates) OR a HITL park OR a no-op tick.
 
@@ -205,7 +211,8 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │              config.default_repo_specs() and ensure_workflow_labels  │
    │              once per spec                                           │
    │     loop every POLL_INTERVAL s:                                      │
-   │       1. self-restart check (origin/main moved & touches orch/?)     │
+   │       1. self-restart check                                          │
+   │          (origin/<ORCHESTRATOR_BASE_BRANCH> moved & touches orch/?)   │
    │       2. for (spec, gh) in clients: workflow.tick(gh, spec)          │
    │          (per-repo exception logged + skipped, never aborts the tick)│
    │                    │                                                 │
@@ -213,6 +220,7 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │   workflow.tick(gh, spec) → for each open issue → dispatch by label: │
    │                                                                      │
    │     (no label) ──► _handle_pickup                            │       │
+   │                       ├─ ALLOWED_ISSUE_AUTHORS skip?         │       │
    │                       ├─ DECOMPOSE=on  ─► decomposing        │       │
    │                       └─ DECOMPOSE=off ─► implementing       │       │
    │                                                              │       │
@@ -222,7 +230,9 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │                       ├─ run_agent(DECOMPOSE_AGENT, prompt)  │       │
    │                       ├─ decision=single ─► label=ready      │       │
    │                       ├─ decision=split  ─► create children  │       │
-   │                       │     parent=blocked, child=blocked,   │       │
+   │                       │     parent=blocked (or `umbrella`    │       │
+   │                       │     when manifest umbrella=true),    │       │
+   │                       │     child=blocked,                   │       │
    │                       │     no-dep child ─► child=ready      │       │
    │                       └─ invalid / question / dirty ─► park  │       │
    │                                                              │       │
@@ -230,6 +240,12 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │                                                              │       │
    │     blocked ──► _handle_blocked                              │       │
    │                       ├─ all children done ─► parent=ready   │       │
+   │                       ├─ any child rejected ─► park HITL     │       │
+   │                       └─ unblock siblings (dep_graph walk)   │       │
+   │                                                              │       │
+   │     umbrella ──► _handle_umbrella                            │       │
+   │                       ├─ all children done ─► parent=done,   │       │
+   │                       │     close issue (no implementation)  │       │
    │                       ├─ any child rejected ─► park HITL     │       │
    │                       └─ unblock siblings (dep_graph walk)   │       │
    │                                                              │       │
@@ -259,7 +275,8 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │     in_review ──► _handle_in_review                             │    │
    │                       │                                         │    │
    │                       ├─ pr merged externally ─► label=done,    │    │
-   │                       │     stamp merged_at, close issue        │    │
+   │                       │     stamp merged_at, close issue,       │    │
+   │                       │     _cleanup_merged_branch              │    │
    │                       ├─ pr closed unmerged ─► label=rejected,  │    │
    │                       │     stamp closed_without_merge_at,      │    │
    │                       │     close issue                         │    │
@@ -269,7 +286,8 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
    │                       │     label=validating, review_round=0         │
    │                       ├─ AUTO_MERGE on, approved, mergeable,         │
    │                       │   green checks ─► merge_pr (sha pin),        │
-   │                       │   label=done, close                          │
+   │                       │   label=done, close,                         │
+   │                       │   _cleanup_merged_branch                     │
    │                       ├─ AUTO_MERGE on, approved, unmergeable        │
    │                       │   ─► label=resolving_conflict (seed          │
    │                       │      conflict_round=0 if absent)             │
@@ -370,7 +388,8 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
 
    decomposing flavors:
      decision='single'  ─► label=ready  (parent itself implements)
-     decision='split'   ─► create children, parent=blocked,
+     decision='split'   ─► create children, parent=blocked
+                           (or `umbrella` when manifest umbrella=true),
                            child[i] = ready if no deps else blocked
      manifest invalid / question / timeout ─► park HITL
 
@@ -379,8 +398,14 @@ The orchestrator (not the agent) pushes. The push is hardened against the agent-
      any child = rejected ─► park HITL on parent
      dep_graph walk: any blocked child with all deps=done ─► child=ready
 
+   umbrella transitions (per tick):
+     all children = done ─► parent=done, issue closed (no implementation)
+     any child = rejected ─► park HITL on parent
+     dep_graph walk: any blocked child with all deps=done ─► child=ready
+
    in_review terminals:
-     pr merged (externally or by AUTO_MERGE) ─► done   (issue closed)
+     pr merged (externally or by AUTO_MERGE) ─► done (issue closed,
+                                                _cleanup_merged_branch)
      pr closed without merge                  ─► rejected (issue closed)
 
    resolving_conflict (AUTO_MERGE only, capped by MAX_CONFLICT_ROUNDS):

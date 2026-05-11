@@ -72,9 +72,9 @@ That seems excessive for our task. The project deadline is tight. First we imple
 
 # Labels
 
-An issue must have at most 1 label. It is essentially the task status.
+An issue must carry at most 1 *workflow* label at a time. Non-workflow labels (`bug`, `enhancement`, etc.) are preserved untouched — the orchestrator's label writes only swap labels from its own set. The workflow label is essentially the task status.
 
-* no label — needs to start being decomposed
+* no workflow label — needs to start being decomposed
 * `decomposing` — applied to issues currently being decomposed
 * `ready` — applied to decomposed issues ready for development
 * `blocked` — applied to decomposed issues that are blocked by other tasks
@@ -83,12 +83,12 @@ An issue must have at most 1 label. It is essentially the task status.
 * `validating` — applied to issues going through automated validation
 * `in_review` — applied to issues for which a PR is ready
 * `resolving_conflict` — auto-resolving merge conflicts after a sibling PR landed first
-* `done` — terminal status for completed issues whose code is merged into `main` (+ the issue must be closed)
+* `done` — terminal status for completed issues. For a leaf issue: the PR merged into the target's base branch. For an `umbrella` parent: every child resolved, so the parent closed without code of its own merging. Either way the issue must be closed.
 * `rejected` — status for issues that were declined (+ the issue must be closed)
 
 # Decomposition
 
-The orchestrator must notice that a new open issue without labels has appeared, attach the `decomposing` label, and start decomposing it.
+The orchestrator must notice that a new open issue without a workflow label has appeared (any non-workflow labels like `bug` or `enhancement` are ignored — they don't block pickup), attach the `decomposing` label, and start decomposing it. Pickup is gated by the `ALLOWED_ISSUE_AUTHORS` allowlist (comma-separated GitHub logins): when set, issues without a workflow label from anyone outside the list are silently skipped so random users on a public repo cannot spend agent budget on useless tasks. The guard only fires at pickup — a maintainer can still drive an outsider's issue by hand-labeling it.
 
 The orchestrator must study the task context in the GitHub Issue and gather the missing information by interacting in the comments
 of the issue with a human.
@@ -110,12 +110,11 @@ Tasks that are ready to implement and have no blockers get the `ready` label.
 
 When implementation begins, the bot must remove the `ready` label and apply `implementing`. It posts a comment that it has started work.
 
-Review the comments in the issue. If session identifiers are already present in the comments, resume the existing session with its context. Read new comments into the context.
+Read the new human comments on the *issue* into the agent's prompt via `_recent_comments_text` — that helper is issue-only, so PR-side feedback is not visible during `implementing` / `validating`. PR feedback (issue thread, PR conversation, inline review comments, PR review summaries) is consumed later, inside `_handle_in_review`, via per-namespace watermarks and the `IN_REVIEW_DEBOUNCE_SECONDS` debounce; that handler is what bounces the issue back to `validating` so the next implementer run sees the PR-side text.
 
-If a PR has already been created, read the active discussions from it.
+Per-issue session identifiers are not stored in visible issue comments — they live in the pinned-state JSON comment (`<!--orchestrator-state ...-->`) under `dev_session_id` / `decomposer_session_id` (the legacy `codex_session_id` key is still honored on read and treated as codex). The orchestrator uses those to resume the existing session via `codex exec resume <id>` or `claude --resume <id>`, locking the in-flight issue to whichever backend wrote the id; flipping `DEV_AGENT` does not migrate in-flight issues.
 
-After implementation finishes, the bot must create a PR with the changes. Leave a comment on the issue with the session identifiers so that
-we can return to those sessions with context if needed via `codex resume` or `claude resume`.
+After implementation finishes, the bot must create a PR with the changes. The only visible comment posted on the issue at this point is `:sparkles: PR opened: #N`; session ids stay in the pinned state and are not surfaced in plain comments, so a stale session id cannot mislead a future tick.
 
 PR titles and commit messages follow the repository's existing Conventional Commits style — `<type>: <subject>` with `feat:` / `fix:` / `docs:` / `chore:` / `refactor:` / `test:` etc. The implementer prompt instructs the agent to inspect `git log --oneline -20` and follow the same convention; commit messages must be subject-only (no body, no `Co-Authored-By:` trailer). When opening the PR, `_pr_title_from_commit_or_issue` reuses the agent's first commit subject if it is already conformant, otherwise falls back to `<type>: <issue title>` (`fix` for bug-labelled issues, `feat` everywhere else). Issue traceability stays via the `Resolves #<n>` line in the PR body, so the title stays clean.
 
@@ -152,11 +151,13 @@ A PR can reach two terminals — merge (issue → `done`) or close without merge
 
 A background process monitors for new comments or reviews on the PR. There are four sources, but only three *high-watermarks* in pinned state — one per id namespace in the GitHub REST API: `pr_last_comment_id` covers both the issue thread *and* PR conversation comments (both live in the shared IssueComment id space, so a single watermark suffices), `pr_last_review_comment_id` — inline review comments (PullRequestComment id space), `pr_last_review_summary_id` — PR review bodies in the PullRequestReview id space; the code only forwards bodies from `CHANGES_REQUESTED` and `COMMENTED` reviews to the implementer, **`APPROVED` is excluded as informational** (filter in `gh.pr_reviews_after`); empty bodies and dismissed/pending reviews are also dropped. If there are new comments and more than `IN_REVIEW_DEBOUNCE_SECONDS` (default 600 s) has passed since the most recent of them, the orchestrator resumes the implementer's session (the same backend that wrote the code) with the new comments quoted, pushes a fix, and moves the issue back into `validating` (not `ready`!) — there the reviewer will run again on the new diff. If the debounce window has not yet elapsed — wait for the next tick, the human may still be typing.
 
-When changes are merged into `main`, the agent should walk the related tasks and, where possible, update their status from `blocked` to `ready`.
+After any merge terminal (auto-merge or external) the orchestrator calls `_cleanup_merged_branch`: best-effort remove the per-issue worktree, delete the local branch, and call `gh.delete_remote_branch` so a stale ref does not linger in the GitHub branch list. Each step swallows its own error — by the time we reach here the issue has already flipped to `done`, so a leftover branch is tidiness, not correctness.
+
+When changes are merged into the target repo's base branch (`origin/<spec.base_branch>` — `main` by default, but per-repo configurable via `BASE_BRANCH` / `REPOS`), the agent should walk the related tasks and, where possible, update their status from `blocked` to `ready`.
 
 # Conflict resolution
 
-When several sibling PRs decompose from one umbrella issue, the first one to merge updates `main` and may leave its siblings no longer mergeable. The orchestrator must not dump every such PR onto a human — under `AUTO_MERGE=on` it gets up to `MAX_CONFLICT_ROUNDS` (default 3) supervised auto-resolution attempts before parking.
+When several sibling PRs decompose from one umbrella issue, the first one to merge updates `origin/<base>` (the target repo's configured base branch) and may leave its siblings no longer mergeable. The orchestrator must not dump every such PR onto a human — under `AUTO_MERGE=on` it gets up to `MAX_CONFLICT_ROUNDS` (default 3) supervised auto-resolution attempts before parking.
 
 Trigger: `_handle_in_review` reaches its auto-merge gate with the PR approved (agent or human, on the *current* head SHA), no standing human `CHANGES_REQUESTED`, but `pr_is_mergeable=False`. PyGithub does not distinguish a content conflict from branch protection / out-of-date base, so any unmergeable PR that passes the approval gates is eligible. Under `AUTO_MERGE=off` this branch does not fire — the orchestrator parks awaiting human as before, since humans drive the merge in that mode.
 
