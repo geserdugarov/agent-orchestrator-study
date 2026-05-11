@@ -99,6 +99,8 @@ If a task can be implemented within a single agent context, then no subtasks nee
 
 The decomposer returns a structured response — a single fenced JSON block `orchestrator-manifest` with schema `decision: "single" | "split"`, an optional `children` list, an optional `depends_on` (an array of 0-indexed references between children, with no cycles or self-dependencies, no more than 10 children), and an optional `umbrella` boolean (default false). The `_parse_manifest` parser rejects malformed manifests and moves the issue into `awaiting_human` for triage.
 
+On a `split` decision, the decomposer prompt requires the LAST child to be a documentation-update task that refreshes the relevant docs (README, `docs/`, `plans/`) to reflect the changes made by the preceding children. The docs child's `depends_on` should list every preceding child index so it lands after the code changes it describes.
+
 When `umbrella` is true on a `split` decision, the parent has no implementation work of its own — its only purpose is to aggregate the children. The orchestrator labels it `umbrella` instead of `blocked`, and `_handle_umbrella` auto-resolves it to `done` (closing the issue) once every child reaches `done`. A non-umbrella decomposed parent goes through `blocked` and re-enters implementation once its children resolve.
 
 **TODO:** refine the criteria (file threshold, layer-based splitting) as we accumulate experience.
