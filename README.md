@@ -1,5 +1,7 @@
 # Agent orchestration
 
+[![CI](https://github.com/geserdugarov/agent-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/geserdugarov/agent-orchestrator/actions/workflows/ci.yml)
+
 Orchestrator for automatic issues resolving utilizing agents.
 
 The orchestrator watches GitHub Issues, drives them through a label-based state machine, and spawns local CLI agents (`codex`, `claude`) to implement them and open PRs. State lives in GitHub Issues themselves (one workflow label + one pinned JSON comment), so the orchestrator stays stateless and progress is observable on github.com.
@@ -116,6 +118,10 @@ Pinned in [`pyproject.toml`](pyproject.toml):
 - `./run.sh` — production: continuous polling with auto-restart on self-modifying merges
 - `python -m orchestrator.main --once` — single tick then exit, useful for testing
 - `python -m orchestrator.main --log-level DEBUG` — verbose logs
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `ruff check` and `pytest` on Python 3.12 for every push to `main` and every pull request. Lint rules are configured in [`pyproject.toml`](pyproject.toml) under `[tool.ruff.lint]`.
 
 ## Configuration reference
 
