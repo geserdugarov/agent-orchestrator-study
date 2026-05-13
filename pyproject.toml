@@ -8,3 +8,11 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = ["PyGithub>=2.1"]
+
+[tool.ruff.lint]
+# `l` is used pervasively as a loop variable over GitHub labels; banning it
+# would force noise-only renames across the codebase.
+ignore = ["E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_workflow.py" = ["F401", "F541", "F821", "F841"]
