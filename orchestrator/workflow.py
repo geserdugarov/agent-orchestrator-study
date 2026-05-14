@@ -1040,7 +1040,314 @@ def _recent_comments_text(issue: Issue, max_chars: int = 4000) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
+def _refresh_base_and_worktrees(gh: GitHubClient, spec: RepoSpec) -> None:
+    """Fetch `origin/<base>` once for the spec and bring every existing
+    per-issue worktree up to date.
+
+    Runs at the start of each tick so a base-branch update on the remote
+    propagates into in-flight issue worktrees without waiting for an
+    AUTO_MERGE mergeability check. The per-stage `_ensure_*_worktree`
+    helpers only fetch base on (re)creation, so a worktree that survives
+    across ticks would otherwise stay anchored at whatever `origin/<base>`
+    looked like when it was first added.
+
+    Two paths depending on whether a PR already exists for the issue:
+
+    * **Pre-PR worktrees** (no `pr_number` in pinned state): merge
+      `origin/<base>` directly into the local worktree -- no remote yet,
+      so a local-only merge commit is the right outcome and there is
+      nothing to push.
+
+    * **PR-having worktrees** (validating / in_review): merging locally
+      WITHOUT pushing would diverge local HEAD from `pr.head.sha` and
+      break the validating reviewer (it reads local HEAD, so it would
+      snapshot `agent_approved_sha` to a SHA that isn't on the PR),
+      `_squash_and_force_push`'s `--force-with-lease=<original_head>`
+      (the lease compares against the un-merged remote tip), and
+      AUTO_MERGE's `agent_approved_sha == pr.head.sha` gate. So instead
+      we route the issue to `resolving_conflict`: the existing handler
+      does the merge, pushes, and flips back to `validating` so the
+      reviewer re-runs on the merged head. This works under
+      `AUTO_MERGE=off` too -- `_handle_resolving_conflict` never reads
+      AUTO_MERGE, it just does the merge+push+relabel cycle. Issues
+      already labeled `resolving_conflict` are left alone (the handler
+      runs this tick anyway); other labels are skipped (no PR worktree
+      to refresh in those states).
+
+    Merge over rebase is the codebase's standing contract (see
+    `_handle_resolving_conflict`'s docstring): rebase rewrites every
+    commit's SHA, which would invalidate any stored `agent_approved_sha`
+    in surprising ways and force the reviewer to re-approve the entire
+    branch even when only the base content changed.
+
+    Conflicts on the pre-PR path abort the merge so the worktree stays
+    on its original SHA -- conflict resolution still belongs to
+    `_handle_resolving_conflict`. Dirty worktrees are skipped so a
+    crash-recovered tree with uncommitted edits is never disturbed
+    (mirrors `_on_dirty_worktree`'s rule). All failures are logged at
+    info/warning and swallowed: keeping every issue moving matters more
+    than perfect base sync.
+    """
+    fetch_r = _git(
+        "fetch", "--quiet", "origin", spec.base_branch,
+        cwd=spec.target_root,
+    )
+    if fetch_r.returncode != 0:
+        log.warning(
+            "repo=%s base fetch of origin/%s failed: %s",
+            spec.slug, spec.base_branch, (fetch_r.stderr or "").strip(),
+        )
+        return
+
+    root = _repo_worktrees_root(spec)
+    if not root.exists():
+        return
+
+    for wt in sorted(root.iterdir()):
+        if not wt.is_dir() or not wt.name.startswith("issue-"):
+            continue
+        try:
+            issue_number = int(wt.name[len("issue-"):])
+        except ValueError:
+            continue
+        try:
+            _sync_worktree_with_base(gh, spec, wt, issue_number)
+        except Exception:
+            log.exception(
+                "repo=%s issue=#%d base sync failed; continuing",
+                spec.slug, issue_number,
+            )
+
+
+# Workflow labels the pre-tick refresh is willing to detour into
+# `resolving_conflict` when the PR worktree is behind base. Validating and
+# in_review are the long-lived PR-stage labels: validating may run the
+# reviewer again, in_review is parked waiting for AUTO_MERGE / human merge.
+# `resolving_conflict` itself is excluded -- the handler runs this tick
+# regardless and will do the merge anyway. Other labels mean either no PR
+# yet (pre-PR path applies instead) or terminal (done/rejected, nothing to
+# refresh).
+_PR_REFRESH_DETOUR_LABELS = frozenset({"validating", "in_review"})
+
+
+def _sync_worktree_with_base(
+    gh: GitHubClient, spec: RepoSpec, worktree: Path, issue_number: int,
+) -> None:
+    """Bring a single per-issue worktree up to date with `origin/<base>`.
+
+    Pre-PR: merge `origin/<base>` directly. PR-having + behind base +
+    label in {validating, in_review}: detour the issue to
+    `resolving_conflict` so the existing handler does merge + push +
+    relabel-to-validating in one consistent flow. Skips a dirty worktree
+    or a worktree already up to date (no pre-PR merge attempted, no PR
+    detour fired). On a pre-PR content conflict, aborts the merge so the
+    worktree stays on its pre-merge SHA -- conflict resolution lives in
+    `_handle_resolving_conflict`, not here.
+    """
+    try:
+        issue = gh.get_issue(issue_number)
+    except Exception:
+        log.debug(
+            "issue=#%d not retrievable; skipping base sync", issue_number,
+        )
+        return
+    state = gh.read_pinned_state(issue)
+    pr_number = state.get("pr_number")
+
+    if _worktree_dirty_files(worktree):
+        log.debug(
+            "issue=#%d skipping base sync: worktree has uncommitted changes",
+            issue_number,
+        )
+        return
+
+    base_ref = f"origin/{spec.base_branch}"
+    behind_r = _git(
+        "rev-list", "--count", f"HEAD..{base_ref}", cwd=worktree,
+    )
+    if behind_r.returncode != 0:
+        log.debug(
+            "issue=#%d skipping base sync: rev-list failed: %s",
+            issue_number, (behind_r.stderr or "").strip(),
+        )
+        return
+    try:
+        behind = int((behind_r.stdout or "0").strip() or "0")
+    except ValueError:
+        return
+    if behind == 0:
+        return
+
+    if pr_number is not None:
+        _route_pr_worktree_to_resolving_conflict(
+            gh, spec, issue, state, int(pr_number), behind,
+        )
+        return
+
+    succeeded, conflicted = _merge_base_into_worktree(spec, worktree)
+    if succeeded:
+        log.info(
+            "issue=#%d merged %s into worktree (was %d commit(s) behind)",
+            issue_number, base_ref, behind,
+        )
+        return
+
+    abort = _git_hardened("merge", "--abort", cwd=worktree)
+    if abort.returncode != 0:
+        log.warning(
+            "issue=#%d base merge failed and abort failed: %s",
+            issue_number, (abort.stderr or "").strip(),
+        )
+    if conflicted:
+        log.info(
+            "issue=#%d base merge has %d conflict(s); aborted -- "
+            "resolving_conflict will handle it once a PR exists",
+            issue_number, len(conflicted),
+        )
+    else:
+        log.warning(
+            "issue=#%d base merge failed without conflicted files; aborted",
+            issue_number,
+        )
+
+
+def _route_pr_worktree_to_resolving_conflict(
+    gh: GitHubClient,
+    spec: RepoSpec,
+    issue: Issue,
+    state: PinnedState,
+    pr_number: int,
+    behind: int,
+) -> None:
+    """Flip a behind-base PR-having issue to `resolving_conflict`.
+
+    Mirrors `_handle_in_review`'s unmergeable detour, just driven by a
+    base advance instead of a PyGithub `mergeable=False`. The handler
+    then runs `git merge origin/<base>` in the worktree, pushes, and
+    relabels to `validating` so the reviewer re-runs on the merged head
+    -- the only safe pattern for PR-having worktrees, since a local-only
+    merge commit would diverge local HEAD from `pr.head.sha` and break
+    every downstream gate that compares the two. Works under both
+    AUTO_MERGE on (replaces the unmergeable trigger) and AUTO_MERGE off
+    (the only auto-rebase path under that mode -- `_handle_in_review`'s
+    AUTO_MERGE-off path otherwise just sits in `in_review`).
+
+    Skips the detour when:
+
+    * The label is not one this refresh knows how to drive into
+      `resolving_conflict` (only `validating` / `in_review`); the
+      `resolving_conflict` label itself is also skipped because the
+      handler runs this tick anyway and will do the merge regardless.
+
+    * `awaiting_human=True`. `_handle_resolving_conflict`'s awaiting-human
+      branch returns early without merging unless a new human comment
+      arrived; relabeling here would just hide the existing park behind a
+      `resolving_conflict` label without making any progress, including
+      the documented `AUTO_MERGE=off` unmergeable park path. The park
+      already invites the human to comment, and once they do, the existing
+      handler's resume-on-human-reply branch picks the work up. Auto-
+      unparking here would also undermine `_handle_validating`'s
+      `MAX_REVIEW_ROUNDS` / `_handle_resolving_conflict`'s
+      `MAX_CONFLICT_ROUNDS` caps, which exist precisely to require human
+      intervention after repeated failures.
+
+    * The PR is no longer open. A merged PR advances `origin/<base>`, so
+      the still-validating / still-in_review worktree pointed at the now-
+      stale branch is naturally behind base; without this gate the detour
+      would post an "auto-resolution" notice and relabel to
+      `resolving_conflict` on a PR the next handler call would finalize to
+      `done`. Same for closed-without-merge if base advanced concurrently
+      (handler would finalize to `rejected`). Leave terminal PR state to
+      the existing stage logic. A `gh.get_pr` failure is treated as
+      "leave it alone" -- the handler can retry on the next tick from a
+      stable label rather than racing a half-known PR state from refresh.
+
+    The watermark bump in `_handle_in_review`'s analogous detour is
+    deliberately NOT replicated here. That bump is safe in_review-side
+    because `_handle_in_review` has already scanned new comments before
+    the relabel (anything past the watermark has been consumed by the
+    fix-loop or filtered as orchestrator-authored). The refresh-time
+    detour runs BEFORE any handler scans comments, so `latest_comment_id`
+    may include unread human "do not merge" / fix-request comments;
+    advancing the watermark here would silently mark them consumed and
+    later validation / merge would skip them. The orchestrator's own
+    PR notice we just posted is filtered out via `orchestrator_comment_ids`
+    on the next `_handle_in_review` scan, so leaving the watermark alone
+    does not cause the orchestrator to "see" its own message as fresh
+    feedback.
+    """
+    label = gh.workflow_label(issue)
+    if label not in _PR_REFRESH_DETOUR_LABELS:
+        log.debug(
+            "issue=#%d behind origin/%s by %d but label=%r; not detouring",
+            issue.number, spec.base_branch, behind, label,
+        )
+        return
+
+    if state.get("awaiting_human"):
+        log.debug(
+            "issue=#%d behind origin/%s by %d but awaiting_human=True; "
+            "leaving park intact rather than relabeling without progress",
+            issue.number, spec.base_branch, behind,
+        )
+        return
+
+    try:
+        pr = gh.get_pr(pr_number)
+    except Exception:
+        log.debug(
+            "issue=#%d could not fetch PR #%d for refresh detour; "
+            "leaving label alone, handler will retry next tick",
+            issue.number, pr_number,
+        )
+        return
+    pr_status = gh.pr_state(pr)
+    if pr_status != "open":
+        # Merged / closed PR: the next handler call finalizes to done /
+        # rejected. The base advance that put us "behind" is exactly the
+        # merge that closed this PR -- there is nothing to auto-resolve.
+        log.debug(
+            "issue=#%d PR #%d is %s; not detouring (handler will finalize)",
+            issue.number, pr_number, pr_status,
+        )
+        return
+
+    log.info(
+        "issue=#%d behind origin/%s by %d commit(s); routing %r -> "
+        "resolving_conflict so the handler can merge, push, and re-review",
+        issue.number, spec.base_branch, behind, label,
+    )
+
+    # Match `_handle_in_review`'s seeding: only initialize `conflict_round`
+    # when absent, so a re-entry preserves the cap counter and a
+    # perpetually-stuck PR can't ping-pong between handlers indefinitely.
+    if state.get("conflict_round") is None:
+        state.set("conflict_round", 0)
+
+    try:
+        _post_pr_comment(
+            gh, pr_number, state,
+            f":mag: PR is {behind} commit(s) behind `origin/{spec.base_branch}`; "
+            "orchestrator is attempting auto-resolution by merging it into "
+            "the branch (label: `resolving_conflict`).",
+        )
+    except Exception:
+        log.exception(
+            "issue=#%s could not post auto-rebase notice to PR #%s",
+            issue.number, pr_number,
+        )
+
+    gh.set_workflow_label(issue, "resolving_conflict")
+    gh.write_pinned_state(issue, state)
+
+
 def tick(gh: GitHubClient, spec: RepoSpec) -> None:
+    try:
+        _refresh_base_and_worktrees(gh, spec)
+    except Exception:
+        log.exception(
+            "repo=%s pre-tick base refresh failed; continuing", spec.slug,
+        )
     for issue in gh.list_pollable_issues():
         try:
             _process_issue(gh, spec, issue)
